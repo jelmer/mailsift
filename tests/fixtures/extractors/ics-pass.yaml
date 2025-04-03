@@ -1,2 +1,4 @@
 name: fixture-ics-pass
 order: 50
+requires:
+  - "attachment:text/calendar"
