@@ -67,7 +67,7 @@ fn main() -> Result<()> {
             } else {
                 format!("replay {}", path.display())
             };
-            pipeline::run(&raw, &source, &extractors, &sink, dry_run)
+            pipeline::run(&raw, &source, &extractors, &sink, &[], dry_run)
         }
     }
 }

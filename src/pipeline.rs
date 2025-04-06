@@ -20,6 +20,7 @@ pub fn run(
     source: &str,
     extractors_dir: &Path,
     event_sink: &EventSinkKind,
+    trusted_forwarders: &[String],
     _dry_run: bool,
 ) -> Result<()> {
     let extractors = extractor::discover(extractors_dir)
@@ -28,6 +29,16 @@ pub fn run(
         warn!("no extractors configured; nothing to do");
         return Ok(());
     }
+
+    // If the message is a forward from a trusted sender, swap `raw`
+    // for the inner RFC822 bytes so prefilter matching and extractor
+    // stdin all see the original vendor mail. The `_unwrapped`
+    // binding keeps the inner bytes alive for the rest of `run`.
+    let _unwrapped = crate::unforward::try_unwrap_forwarded(raw, trusted_forwarders);
+    let raw: &[u8] = match _unwrapped.as_deref() {
+        Some(inner) => inner,
+        None => raw,
+    };
 
     // Parse headers once for the prefilter; if parsing fails we treat
     // them as empty and let each downstream check degrade gracefully.
