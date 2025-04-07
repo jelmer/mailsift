@@ -1,0 +1,10 @@
+From: noreply@dkim-required.fixture.test
+To: jelmer@example.org
+Subject: fixture-dkim signed
+Date: Mon, 1 Mar 2026 10:00:00 +0000
+Message-ID: <fixture-dkim-signed@dkim-required.fixture.test>
+Authentication-Results: example.org; dkim=pass header.d=dkim-required.fixture.test header.i=@dkim-required.fixture.test
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+A legitimately signed DKIM-required message.

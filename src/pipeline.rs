@@ -6,8 +6,23 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::artifacts::{Artifact, Kind};
+use crate::dkim;
 use crate::extractor;
 use crate::targets::{EventSink, EventSinkKind, FileOutcome, split_calendar};
+
+/// Whether to enforce `require_dkim` constraints declared in extractor
+/// manifests.
+#[derive(Clone, Copy, Debug)]
+pub enum DkimPolicy {
+    /// Honour each extractor's `require_dkim`. Used for replay,
+    /// imap-scan, and maildir-watch; modes where the message has
+    /// already passed through our MTA's DKIM check and the topmost
+    /// `Authentication-Results` header is trustworthy.
+    Enforce,
+    /// Skip DKIM checks entirely. Used by the milter front-end, which
+    /// sees mail before our MTA has authenticated it.
+    Skip,
+}
 
 const DEFAULT_EXTRACTOR_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -21,6 +36,7 @@ pub fn run(
     extractors_dir: &Path,
     event_sink: &EventSinkKind,
     trusted_forwarders: &[String],
+    dkim_policy: DkimPolicy,
     _dry_run: bool,
 ) -> Result<()> {
     let extractors = extractor::discover(extractors_dir)
@@ -47,6 +63,11 @@ pub fn run(
         .unwrap_or_default();
     let (from_domain, subject) = parse_match_headers_from_parsed(&parsed_headers);
 
+    let dkim_domains = match dkim_policy {
+        DkimPolicy::Enforce => dkim::passing_dkim_domains(&parsed_headers),
+        DkimPolicy::Skip => Default::default(),
+    };
+
     // Walk the MIME tree once and build a body-shape summary so each
     // extractor's `requires:` can be checked without forking its
     // subprocess. If parsing fails (truncated/garbled message) we skip
@@ -72,6 +93,18 @@ pub fn run(
             debug!(
                 extractor = %ex.name,
                 "skipping: message body shape doesn't satisfy extractor's `requires:`"
+            );
+            continue;
+        }
+
+        if !ex.require_dkim.is_empty()
+            && matches!(dkim_policy, DkimPolicy::Enforce)
+            && !dkim::satisfies(&ex.require_dkim, &dkim_domains)
+        {
+            debug!(
+                extractor = %ex.name,
+                required = ?ex.require_dkim,
+                "skipping: message lacks a passing DKIM signature from a required domain"
             );
             continue;
         }

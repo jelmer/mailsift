@@ -1,0 +1,11 @@
+From: noreply@dkim-required.fixture.test
+To: jelmer@example.org
+Subject: fixture-dkim spoofed
+Date: Mon, 1 Mar 2026 10:00:00 +0000
+Message-ID: <fixture-dkim-spoofed@example.org>
+Authentication-Results: example.org; dkim=none
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+A message claiming to be from dkim-required.fixture.test but with
+no passing DKIM signature.

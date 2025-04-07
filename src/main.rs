@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use mailsift::pipeline;
+use mailsift::pipeline::{self, DkimPolicy};
 use mailsift::targets::EventSinkKind;
 
 #[derive(Parser)]
@@ -67,7 +67,15 @@ fn main() -> Result<()> {
             } else {
                 format!("replay {}", path.display())
             };
-            pipeline::run(&raw, &source, &extractors, &sink, &[], dry_run)
+            pipeline::run(
+                &raw,
+                &source,
+                &extractors,
+                &sink,
+                &[],
+                DkimPolicy::Enforce,
+                dry_run,
+            )
         }
     }
 }

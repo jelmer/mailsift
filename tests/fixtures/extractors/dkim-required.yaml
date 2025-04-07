@@ -1,0 +1,7 @@
+name: fixture-dkim-required
+order: 50
+from_domains:
+  - dkim-required.fixture.test
+subject_regex: "(?i)^fixture-dkim"
+require_dkim:
+  - dkim-required.fixture.test

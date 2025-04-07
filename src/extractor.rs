@@ -39,6 +39,18 @@ pub struct Manifest {
     pub subject_regex: Option<String>,
     #[serde(default)]
     pub requires: Vec<String>,
+    /// Only run this extractor when the message has a passing DKIM
+    /// signature from one of these domains, per the topmost
+    /// `Authentication-Results` header. When the message lacks the
+    /// header entirely the extractor is skipped.
+    ///
+    /// An entry starting with `.` is a suffix match against the
+    /// signing domain: `.myshopify.com` matches `xyz.myshopify.com`
+    /// but not the bare `myshopify.com` itself. Useful for SaaS
+    /// platforms (Shopify, Mailgun, ...) where every tenant's
+    /// notifications are DKIM-signed under a shared parent zone.
+    #[serde(default)]
+    pub require_dkim: Vec<String>,
 }
 
 fn default_order() -> i32 {
@@ -49,6 +61,7 @@ pub struct Extractor {
     pub name: String,
     pub script: PathBuf,
     pub order: i32,
+    pub require_dkim: Vec<String>,
     /// Compiled `from_domains` patterns (lowercased). Empty means
     /// "match any sender".
     from_domains: Vec<FromDomainPattern>,
@@ -367,10 +380,19 @@ pub fn discover(dir: &Path) -> Result<Vec<Extractor>> {
             })
             .collect::<Result<_>>()?;
 
+        // Lowercase `require_dkim` once at load time so the hot-path
+        // `dkim::satisfies` comparison doesn't have to.
+        let require_dkim = manifest
+            .require_dkim
+            .into_iter()
+            .map(|d| d.to_ascii_lowercase())
+            .collect();
+
         out.push(Extractor {
             name: manifest.name,
             script: script_path,
             order: manifest.order,
+            require_dkim,
             from_domains,
             subject_regex,
             body_requirements,
@@ -469,6 +491,7 @@ mod tests {
             name: "t".into(),
             script: PathBuf::from("/bin/true"),
             order: 100,
+            require_dkim: Vec::new(),
             from_domains: from_domains.into_iter().map(parse_from_domain).collect(),
             subject_regex: subject_regex.map(|s| regex::Regex::new(s).unwrap()),
             body_requirements,
