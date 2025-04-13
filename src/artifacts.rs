@@ -7,12 +7,14 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     Event,
+    Reservation,
 }
 
 impl Kind {
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Event => "event",
+            Kind::Reservation => "reservation",
         }
     }
 }
@@ -103,7 +105,10 @@ pub fn scan(dir: &Path) -> Result<(ScanResult, Vec<PathBuf>)> {
 
 /// Parse a filename into (kind, slug, ext).
 fn classify(name: &str) -> Option<(Kind, String, String)> {
-    for (suffix, kind, ext) in [(".event.ics", Kind::Event, "ics")] {
+    for (suffix, kind, ext) in [
+        (".event.ics", Kind::Event, "ics"),
+        (".reservation.json", Kind::Reservation, "json"),
+    ] {
         if let Some(stem) = name.strip_suffix(suffix) {
             if stem.is_empty() {
                 return None;

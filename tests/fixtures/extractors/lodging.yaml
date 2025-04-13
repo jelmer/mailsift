@@ -1,0 +1,5 @@
+name: fixture-lodging
+order: 50
+from_domains:
+  - lodging.fixture.test
+subject_regex: "(?i)^fixture-lodging"

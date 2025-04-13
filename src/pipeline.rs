@@ -125,6 +125,11 @@ pub fn run(
                         filed += 1;
                     }
                 }
+                Kind::Reservation => {
+                    if file_reservation_artifact(&run.extractor, artifact, event_sink) {
+                        filed += 1;
+                    }
+                }
             }
         }
     }
@@ -134,6 +139,57 @@ pub fn run(
     }
 
     Ok(())
+}
+
+/// File a `reservation` artifact: parse the schema.org JSON, convert
+/// to a single VEVENT, and file via the event sink.
+fn file_reservation_artifact(
+    extractor: &str,
+    artifact: &Artifact,
+    event_sink: &EventSinkKind,
+) -> bool {
+    let events = match crate::reservation::convert_file(&artifact.path) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %artifact.path.display(),
+                error = format!("{e:#}"),
+                "failed to convert reservation JSON"
+            );
+            return false;
+        }
+    };
+    if events.is_empty() {
+        warn!(
+            extractor,
+            path = %artifact.path.display(),
+            "reservation JSON yielded no events (unknown @type or missing fields)"
+        );
+        return false;
+    }
+    let mut any_filed = false;
+    for event in &events {
+        match event_sink.file(event) {
+            Ok(FileOutcome::Created(label)) => {
+                info!(extractor, uid = %event.uid, target = %label, "reservation filed");
+                any_filed = true;
+            }
+            Ok(FileOutcome::Updated(label)) => {
+                info!(extractor, uid = %event.uid, target = %label, "reservation updated");
+                any_filed = true;
+            }
+            Err(e) => {
+                warn!(
+                    extractor,
+                    uid = %event.uid,
+                    error = format!("{e:#}"),
+                    "failed to file reservation"
+                );
+            }
+        }
+    }
+    any_filed
 }
 
 fn file_event_artifact(extractor: &str, artifact: &Artifact, event_sink: &EventSinkKind) -> bool {

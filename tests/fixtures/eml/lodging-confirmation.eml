@@ -1,0 +1,10 @@
+From: bookings@lodging.fixture.test
+To: jelmer@example.org
+Subject: fixture-lodging confirmation
+Date: Mon, 1 Mar 2026 10:00:00 +0000
+Message-ID: <fixture-lodging-1@lodging.fixture.test>
+Authentication-Results: example.org; dkim=pass header.d=lodging.fixture.test header.i=@lodging.fixture.test
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Your stay at Fixture Inn is confirmed for 10-12 April 2026.
