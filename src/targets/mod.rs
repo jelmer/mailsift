@@ -3,6 +3,7 @@ pub mod http_auth;
 pub mod http_client;
 pub mod local_events;
 pub mod sink;
+pub mod webdav;
 
 use std::path::PathBuf;
 
