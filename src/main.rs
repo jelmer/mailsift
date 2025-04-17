@@ -69,6 +69,18 @@ impl EventTargetArgs {
     }
 }
 
+/// Firefly III bill-registration flags. When both are set, every
+/// filed bill is also registered with Firefly III.
+#[derive(Args, Clone, Default)]
+struct FireflyArgs {
+    /// Base URL of a Firefly III instance.
+    #[arg(long)]
+    firefly_url: Option<String>,
+    /// File containing a Firefly Personal Access Token.
+    #[arg(long)]
+    firefly_token_file: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Run the pipeline against a saved .eml file.
@@ -80,10 +92,34 @@ enum Command {
         extractors: PathBuf,
         #[command(flatten)]
         target: EventTargetArgs,
+        /// Directory under which to file `bill` artifacts.
+        #[arg(long)]
+        bills_dir: Option<PathBuf>,
+        #[command(flatten)]
+        firefly: FireflyArgs,
         /// Don't actually file artifacts; just report what would happen.
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+fn build_firefly(
+    cli: &FireflyArgs,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<mailsift::targets::firefly::FireflySink>> {
+    match (&cli.firefly_url, &cli.firefly_token_file) {
+        (Some(url), Some(token_file)) => {
+            let token = read_secret_file(token_file)?;
+            Ok(Some(mailsift::targets::firefly::FireflySink::new(
+                url.clone(),
+                token,
+                runtime.clone(),
+            )?))
+        }
+        (None, None) => Ok(None),
+        (Some(_), None) => anyhow::bail!("--firefly-url set without a token file"),
+        (None, Some(_)) => anyhow::bail!("--firefly-token-file set without a URL"),
+    }
 }
 
 fn main() -> Result<()> {
@@ -113,9 +149,12 @@ fn main() -> Result<()> {
             path,
             extractors,
             target,
+            bills_dir,
+            firefly,
             dry_run,
         } => {
             let sink = target.build_sink(runtime.handle())?;
+            let firefly = build_firefly(&firefly, runtime.handle())?;
             let raw = if path == Path::new("-") {
                 let mut buf = Vec::new();
                 use std::io::Read;
@@ -137,6 +176,8 @@ fn main() -> Result<()> {
                 &source,
                 &extractors,
                 &sink,
+                bills_dir.as_deref(),
+                firefly.as_ref(),
                 &[],
                 DkimPolicy::Enforce,
                 dry_run,

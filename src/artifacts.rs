@@ -8,6 +8,7 @@ use serde::Deserialize;
 pub enum Kind {
     Event,
     Reservation,
+    Bill,
 }
 
 impl Kind {
@@ -15,6 +16,7 @@ impl Kind {
         match self {
             Kind::Event => "event",
             Kind::Reservation => "reservation",
+            Kind::Bill => "bill",
         }
     }
 }
@@ -108,6 +110,7 @@ fn classify(name: &str) -> Option<(Kind, String, String)> {
     for (suffix, kind, ext) in [
         (".event.ics", Kind::Event, "ics"),
         (".reservation.json", Kind::Reservation, "json"),
+        (".bill.json", Kind::Bill, "json"),
     ] {
         if let Some(stem) = name.strip_suffix(suffix) {
             if stem.is_empty() {

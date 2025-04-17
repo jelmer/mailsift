@@ -1,6 +1,9 @@
+pub mod bills;
 pub mod caldav;
+pub mod firefly;
 pub mod http_auth;
 pub mod http_client;
+pub mod json_target;
 pub mod local_events;
 pub mod sink;
 pub mod webdav;

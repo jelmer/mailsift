@@ -35,6 +35,8 @@ pub fn run(
     source: &str,
     extractors_dir: &Path,
     event_sink: &EventSinkKind,
+    bills_dir: Option<&Path>,
+    firefly: Option<&crate::targets::firefly::FireflySink>,
     trusted_forwarders: &[String],
     dkim_policy: DkimPolicy,
     _dry_run: bool,
@@ -130,6 +132,19 @@ pub fn run(
                         filed += 1;
                     }
                 }
+                Kind::Bill => match bills_dir {
+                    Some(dir) => {
+                        if file_bill_artifact(&run.extractor, artifact, dir, firefly) {
+                            filed += 1;
+                        }
+                    }
+                    None => {
+                        warn!(
+                            extractor = %run.extractor,
+                            "no bills dir configured; dropping bill artifact"
+                        );
+                    }
+                },
             }
         }
     }
@@ -190,6 +205,29 @@ fn file_reservation_artifact(
         }
     }
     any_filed
+}
+
+fn file_bill_artifact(
+    extractor: &str,
+    artifact: &Artifact,
+    dir: &Path,
+    firefly: Option<&crate::targets::firefly::FireflySink>,
+) -> bool {
+    match crate::targets::bills::file_bill(&artifact.path, dir, firefly) {
+        Ok(FileOutcome::Created(label) | FileOutcome::Updated(label)) => {
+            info!(extractor, target = %label, "bill filed");
+            true
+        }
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %artifact.path.display(),
+                error = format!("{e:#}"),
+                "failed to file bill"
+            );
+            false
+        }
+    }
 }
 
 fn file_event_artifact(extractor: &str, artifact: &Artifact, event_sink: &EventSinkKind) -> bool {
