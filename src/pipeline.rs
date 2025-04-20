@@ -36,7 +36,9 @@ pub fn run(
     extractors_dir: &Path,
     event_sink: &EventSinkKind,
     bills_dir: Option<&Path>,
+    parcels_dir: Option<&Path>,
     firefly: Option<&crate::targets::firefly::FireflySink>,
+    trackers: Option<&crate::targets::trackers::Trackers>,
     trusted_forwarders: &[String],
     dkim_policy: DkimPolicy,
     _dry_run: bool,
@@ -145,6 +147,19 @@ pub fn run(
                         );
                     }
                 },
+                Kind::Parcel => match parcels_dir {
+                    Some(dir) => {
+                        if file_parcel_artifact(&run.extractor, artifact, dir, trackers) {
+                            filed += 1;
+                        }
+                    }
+                    None => {
+                        warn!(
+                            extractor = %run.extractor,
+                            "no parcels dir configured; dropping parcel artifact"
+                        );
+                    }
+                },
             }
         }
     }
@@ -205,6 +220,29 @@ fn file_reservation_artifact(
         }
     }
     any_filed
+}
+
+fn file_parcel_artifact(
+    extractor: &str,
+    artifact: &Artifact,
+    dir: &Path,
+    trackers: Option<&crate::targets::trackers::Trackers>,
+) -> bool {
+    match crate::targets::parcels::file_parcel(&artifact.path, dir, trackers) {
+        Ok(FileOutcome::Created(label) | FileOutcome::Updated(label)) => {
+            info!(extractor, target = %label, "parcel filed");
+            true
+        }
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %artifact.path.display(),
+                error = format!("{e:#}"),
+                "failed to file parcel"
+            );
+            false
+        }
+    }
 }
 
 fn file_bill_artifact(

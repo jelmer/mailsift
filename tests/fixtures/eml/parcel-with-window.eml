@@ -1,0 +1,10 @@
+From: shipments@window.fixture.test
+To: jelmer@example.org
+Subject: fixture-parcel-window
+Date: Sat, 7 Feb 2026 09:00:00 +0000
+Message-ID: <fixture-parcel-window@window.fixture.test>
+Authentication-Results: example.org; dkim=pass header.d=window.fixture.test header.i=@window.fixture.test
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Your parcel will be delivered on Monday between 13:40 and 14:40.

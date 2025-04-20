@@ -1,0 +1,5 @@
+name: fixture-parcel-status
+order: 50
+from_domains:
+  - parcel.fixture.test
+subject_regex: "(?i)^fixture-parcel:"

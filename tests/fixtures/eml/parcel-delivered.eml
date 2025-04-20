@@ -1,0 +1,10 @@
+From: shipments@parcel.fixture.test
+To: jelmer@example.org
+Subject: fixture-parcel: Delivered
+Date: Tue, 2 Feb 2026 14:00:00 +0000
+Message-ID: <fixture-parcel-3@parcel.fixture.test>
+Authentication-Results: example.org; dkim=pass header.d=parcel.fixture.test header.i=@parcel.fixture.test
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Your parcel has been delivered.

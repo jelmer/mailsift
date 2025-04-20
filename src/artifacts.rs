@@ -9,6 +9,7 @@ pub enum Kind {
     Event,
     Reservation,
     Bill,
+    Parcel,
 }
 
 impl Kind {
@@ -17,6 +18,7 @@ impl Kind {
             Kind::Event => "event",
             Kind::Reservation => "reservation",
             Kind::Bill => "bill",
+            Kind::Parcel => "parcel",
         }
     }
 }
@@ -111,6 +113,7 @@ fn classify(name: &str) -> Option<(Kind, String, String)> {
         (".event.ics", Kind::Event, "ics"),
         (".reservation.json", Kind::Reservation, "json"),
         (".bill.json", Kind::Bill, "json"),
+        (".parcel.json", Kind::Parcel, "json"),
     ] {
         if let Some(stem) = name.strip_suffix(suffix) {
             if stem.is_empty() {

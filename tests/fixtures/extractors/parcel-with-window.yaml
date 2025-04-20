@@ -1,0 +1,5 @@
+name: fixture-parcel-with-window
+order: 50
+from_domains:
+  - window.fixture.test
+subject_regex: "(?i)^fixture-parcel-window"

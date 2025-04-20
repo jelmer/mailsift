@@ -4,8 +4,12 @@ pub mod firefly;
 pub mod http_auth;
 pub mod http_client;
 pub mod json_target;
+pub mod karrio;
 pub mod local_events;
+pub mod parcels;
+pub mod seventeentrack;
 pub mod sink;
+pub mod trackers;
 pub mod webdav;
 
 use std::path::PathBuf;

@@ -81,6 +81,37 @@ struct FireflyArgs {
     firefly_token_file: Option<PathBuf>,
 }
 
+/// Parcel-tracker-registration flags.
+#[derive(Args, Clone, Default)]
+struct TrackerArgs {
+    /// Base URL of a Karrio instance.
+    #[arg(long)]
+    karrio_url: Option<String>,
+    /// File containing the Karrio API token.
+    #[arg(long)]
+    karrio_token_file: Option<PathBuf>,
+    /// File containing a 17track API token.
+    #[arg(long)]
+    seventeentrack_token_file: Option<PathBuf>,
+}
+
+fn build_trackers(
+    cli: &TrackerArgs,
+    runtime: &tokio::runtime::Handle,
+) -> Result<mailsift::targets::trackers::Trackers> {
+    use mailsift::targets::{karrio::KarrioClient, seventeentrack::SeventeenTrackClient};
+    let mut trackers = mailsift::targets::trackers::Trackers::new();
+    if let (Some(url), Some(token_file)) = (&cli.karrio_url, &cli.karrio_token_file) {
+        let token = read_secret_file(token_file)?;
+        trackers.push(KarrioClient::new(url.clone(), token, runtime.clone())?);
+    }
+    if let Some(token_file) = &cli.seventeentrack_token_file {
+        let token = read_secret_file(token_file)?;
+        trackers.push(SeventeenTrackClient::new(token, runtime.clone())?);
+    }
+    Ok(trackers)
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Run the pipeline against a saved .eml file.
@@ -95,8 +126,13 @@ enum Command {
         /// Directory under which to file `bill` artifacts.
         #[arg(long)]
         bills_dir: Option<PathBuf>,
+        /// Directory under which to file `parcel` artifacts.
+        #[arg(long)]
+        parcels_dir: Option<PathBuf>,
         #[command(flatten)]
         firefly: FireflyArgs,
+        #[command(flatten)]
+        trackers: TrackerArgs,
         /// Don't actually file artifacts; just report what would happen.
         #[arg(long)]
         dry_run: bool,
@@ -150,11 +186,14 @@ fn main() -> Result<()> {
             extractors,
             target,
             bills_dir,
+            parcels_dir,
             firefly,
+            trackers,
             dry_run,
         } => {
             let sink = target.build_sink(runtime.handle())?;
             let firefly = build_firefly(&firefly, runtime.handle())?;
+            let trackers = build_trackers(&trackers, runtime.handle())?;
             let raw = if path == Path::new("-") {
                 let mut buf = Vec::new();
                 use std::io::Read;
@@ -177,7 +216,9 @@ fn main() -> Result<()> {
                 &extractors,
                 &sink,
                 bills_dir.as_deref(),
+                parcels_dir.as_deref(),
                 firefly.as_ref(),
+                (!trackers.is_empty()).then_some(&trackers),
                 &[],
                 DkimPolicy::Enforce,
                 dry_run,
