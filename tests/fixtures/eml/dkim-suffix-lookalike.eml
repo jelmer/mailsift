@@ -1,0 +1,11 @@
+From: shop@evil-tenant.fixture.test
+To: jelmer@example.org
+Subject: Order #ORD-42 confirmed
+Date: Fri, 1 May 2026 12:00:00 +0000
+Message-ID: <fixture-suffix-lookalike@evil-tenant.fixture.test>
+Authentication-Results: example.org; dkim=pass header.d=evil-tenant.fixture.test header.i=@evil-tenant.fixture.test
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+A message DKIM-signed by evil-tenant.fixture.test, which must not
+satisfy the literal-dot ".tenant.fixture.test" suffix.

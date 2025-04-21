@@ -129,6 +129,26 @@ enum Command {
         /// Directory under which to file `parcel` artifacts.
         #[arg(long)]
         parcels_dir: Option<PathBuf>,
+        /// Directory under which to file `receipt` artifacts. Mutually
+        /// exclusive with `--receipts-webdav-url` and
+        /// `--receipts-forward-to`.
+        #[arg(long)]
+        receipts_dir: Option<PathBuf>,
+        /// WebDAV collection URL to PUT `receipt` artifacts to.
+        #[arg(long)]
+        receipts_webdav_url: Option<String>,
+        /// Password file for the receipts WebDAV target.
+        #[arg(long)]
+        receipts_webdav_password_file: Option<PathBuf>,
+        /// Mailbox to forward receipt-emitting messages to.
+        #[arg(long, value_delimiter = ',')]
+        receipts_forward_to: Vec<String>,
+        /// `From:` mailbox to put on forwarded receipt mails.
+        #[arg(long)]
+        receipts_forward_from: Option<String>,
+        /// Path to a sendmail binary.
+        #[arg(long)]
+        receipts_forward_sendmail: Option<PathBuf>,
         #[command(flatten)]
         firefly: FireflyArgs,
         #[command(flatten)]
@@ -137,6 +157,51 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+fn build_receipts_sink(
+    receipts_dir: Option<PathBuf>,
+    webdav_url: Option<String>,
+    webdav_password_file: Option<PathBuf>,
+    forward_to: Vec<String>,
+    forward_from: Option<String>,
+    forward_sendmail: Option<PathBuf>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<mailsift::targets::receipts::ReceiptSink>> {
+    use mailsift::targets::receipts::ReceiptSink;
+    let count =
+        receipts_dir.is_some() as u8 + webdav_url.is_some() as u8 + (!forward_to.is_empty()) as u8;
+    if count > 1 {
+        anyhow::bail!(
+            "specify at most one of --receipts-dir, --receipts-webdav-url, --receipts-forward-to"
+        );
+    }
+    if let Some(dir) = receipts_dir {
+        return Ok(Some(ReceiptSink::LocalDir(dir)));
+    }
+    if let Some(url) = webdav_url {
+        let CaldavTarget { url, user } = parse_caldav_url(&url)?;
+        let password = webdav_password_file
+            .as_deref()
+            .map(read_secret_file)
+            .transpose()?;
+        let sink =
+            mailsift::targets::webdav::WebdavSink::new(url, user, password, runtime.clone())?;
+        return Ok(Some(ReceiptSink::Webdav(sink)));
+    }
+    if !forward_to.is_empty() {
+        let from = forward_from.ok_or_else(|| {
+            anyhow!("--receipts-forward-from required with --receipts-forward-to")
+        })?;
+        let fwd = mailsift::targets::mail_forward::MailForwarder::sendmail(
+            &from,
+            forward_to,
+            forward_sendmail.as_ref().map(|p| p.display().to_string()),
+            runtime.clone(),
+        )?;
+        return Ok(Some(ReceiptSink::Forward(fwd)));
+    }
+    Ok(None)
 }
 
 fn build_firefly(
@@ -187,6 +252,12 @@ fn main() -> Result<()> {
             target,
             bills_dir,
             parcels_dir,
+            receipts_dir,
+            receipts_webdav_url,
+            receipts_webdav_password_file,
+            receipts_forward_to,
+            receipts_forward_from,
+            receipts_forward_sendmail,
             firefly,
             trackers,
             dry_run,
@@ -194,6 +265,15 @@ fn main() -> Result<()> {
             let sink = target.build_sink(runtime.handle())?;
             let firefly = build_firefly(&firefly, runtime.handle())?;
             let trackers = build_trackers(&trackers, runtime.handle())?;
+            let receipts = build_receipts_sink(
+                receipts_dir,
+                receipts_webdav_url,
+                receipts_webdav_password_file,
+                receipts_forward_to,
+                receipts_forward_from,
+                receipts_forward_sendmail,
+                runtime.handle(),
+            )?;
             let raw = if path == Path::new("-") {
                 let mut buf = Vec::new();
                 use std::io::Read;
@@ -217,6 +297,7 @@ fn main() -> Result<()> {
                 &sink,
                 bills_dir.as_deref(),
                 parcels_dir.as_deref(),
+                receipts.as_ref(),
                 firefly.as_ref(),
                 (!trackers.is_empty()).then_some(&trackers),
                 &[],

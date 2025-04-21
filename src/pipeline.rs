@@ -37,6 +37,7 @@ pub fn run(
     event_sink: &EventSinkKind,
     bills_dir: Option<&Path>,
     parcels_dir: Option<&Path>,
+    receipts: Option<&crate::targets::receipts::ReceiptSink>,
     firefly: Option<&crate::targets::firefly::FireflySink>,
     trackers: Option<&crate::targets::trackers::Trackers>,
     trusted_forwarders: &[String],
@@ -160,6 +161,19 @@ pub fn run(
                         );
                     }
                 },
+                Kind::Receipt => match receipts {
+                    Some(sink) => {
+                        if file_receipt_artifact(&run.extractor, artifact, raw, sink) {
+                            filed += 1;
+                        }
+                    }
+                    None => {
+                        warn!(
+                            extractor = %run.extractor,
+                            "no receipts target configured; dropping receipt artifact"
+                        );
+                    }
+                },
             }
         }
     }
@@ -220,6 +234,29 @@ fn file_reservation_artifact(
         }
     }
     any_filed
+}
+
+fn file_receipt_artifact(
+    extractor: &str,
+    artifact: &Artifact,
+    raw: &[u8],
+    sink: &crate::targets::receipts::ReceiptSink,
+) -> bool {
+    match sink.file_receipt(&artifact.path, raw) {
+        Ok(FileOutcome::Created(label) | FileOutcome::Updated(label)) => {
+            info!(extractor, target = %label, "receipt filed");
+            true
+        }
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %artifact.path.display(),
+                error = format!("{e:#}"),
+                "failed to file receipt"
+            );
+            false
+        }
+    }
 }
 
 fn file_parcel_artifact(

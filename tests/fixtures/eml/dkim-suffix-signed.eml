@@ -1,0 +1,10 @@
+From: shop@tenant.fixture.test
+To: jelmer@example.org
+Subject: Order #ORD-42 confirmed
+Date: Fri, 1 May 2026 12:00:00 +0000
+Message-ID: <fixture-suffix-signed@tenant.fixture.test>
+Authentication-Results: example.org; dkim=pass header.d=alpha.tenant.fixture.test header.i=@alpha.tenant.fixture.test
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Your order ORD-42 is confirmed.

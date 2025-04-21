@@ -1,0 +1,4 @@
+name: fixture-dkim-suffix-required
+order: 50
+require_dkim:
+  - ".tenant.fixture.test"

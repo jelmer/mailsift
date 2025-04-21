@@ -10,12 +10,17 @@ license = "GPL-3.0-or-later"
 # (CalDAV/WebDAV). The auth code already cfg-gates on this flag; the
 # library and feature lookups land in follow-up commits.
 gssapi = []
+# SMTP submission for the receipts forwarder. Without it the sendmail
+# pipe transport still works. Pulls in `lettre`'s MIME / encoding /
+# TLS dep tree.
+smtp = ["lettre/smtp-transport", "lettre/tokio1-rustls-tls"]
 
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 clap = { version = "4", features = ["derive"] }
 icalendar = "0.16"
+lettre = { version = "0.11", default-features = false, features = ["builder", "tokio1", "sendmail-transport"] }
 libc = "0.2"
 mailparse = "0.16.1"
 percent-encoding = "2"
