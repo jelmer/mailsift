@@ -11,6 +11,8 @@ pub mod parcels;
 pub mod receipts;
 pub mod seventeentrack;
 pub mod sink;
+pub mod subscriptions;
+pub mod tickets;
 pub mod trackers;
 pub mod webdav;
 

@@ -37,7 +37,9 @@ pub fn run(
     event_sink: &EventSinkKind,
     bills_dir: Option<&Path>,
     parcels_dir: Option<&Path>,
+    subscriptions_dir: Option<&Path>,
     receipts: Option<&crate::targets::receipts::ReceiptSink>,
+    tickets: Option<&crate::targets::tickets::TicketSink>,
     firefly: Option<&crate::targets::firefly::FireflySink>,
     trackers: Option<&crate::targets::trackers::Trackers>,
     trusted_forwarders: &[String],
@@ -174,6 +176,33 @@ pub fn run(
                         );
                     }
                 },
+                Kind::Subscription => match subscriptions_dir {
+                    Some(dir) => {
+                        if file_subscription_artifact(&run.extractor, artifact, dir) {
+                            filed += 1;
+                        }
+                    }
+                    None => {
+                        warn!(
+                            extractor = %run.extractor,
+                            "no subscriptions dir configured; dropping subscription artifact"
+                        );
+                    }
+                },
+                Kind::Ticket => match tickets {
+                    Some(sink) => {
+                        let year = current_year();
+                        if file_ticket_artifact(&run.extractor, artifact, year, sink) {
+                            filed += 1;
+                        }
+                    }
+                    None => {
+                        warn!(
+                            extractor = %run.extractor,
+                            "no tickets target configured; dropping ticket artifact"
+                        );
+                    }
+                },
             }
         }
     }
@@ -234,6 +263,52 @@ fn file_reservation_artifact(
         }
     }
     any_filed
+}
+
+fn current_year() -> i32 {
+    use chrono::Datelike;
+    chrono::Utc::now().year()
+}
+
+fn file_subscription_artifact(extractor: &str, artifact: &Artifact, dir: &Path) -> bool {
+    match crate::targets::subscriptions::file_subscription(&artifact.path, dir) {
+        Ok(FileOutcome::Created(label) | FileOutcome::Updated(label)) => {
+            info!(extractor, target = %label, "subscription filed");
+            true
+        }
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %artifact.path.display(),
+                error = format!("{e:#}"),
+                "failed to file subscription"
+            );
+            false
+        }
+    }
+}
+
+fn file_ticket_artifact(
+    extractor: &str,
+    artifact: &Artifact,
+    year: i32,
+    sink: &crate::targets::tickets::TicketSink,
+) -> bool {
+    match sink.file_ticket(&artifact.path, &artifact.slug, &artifact.ext, year) {
+        Ok(FileOutcome::Created(label) | FileOutcome::Updated(label)) => {
+            info!(extractor, target = %label, "ticket filed");
+            true
+        }
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %artifact.path.display(),
+                error = format!("{e:#}"),
+                "failed to file ticket"
+            );
+            false
+        }
+    }
 }
 
 fn file_receipt_artifact(

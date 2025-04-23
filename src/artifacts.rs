@@ -11,6 +11,8 @@ pub enum Kind {
     Bill,
     Parcel,
     Receipt,
+    Ticket,
+    Subscription,
 }
 
 impl Kind {
@@ -21,6 +23,8 @@ impl Kind {
             Kind::Bill => "bill",
             Kind::Parcel => "parcel",
             Kind::Receipt => "receipt",
+            Kind::Ticket => "ticket",
+            Kind::Subscription => "subscription",
         }
     }
 }
@@ -117,6 +121,7 @@ fn classify(name: &str) -> Option<(Kind, String, String)> {
         (".bill.json", Kind::Bill, "json"),
         (".parcel.json", Kind::Parcel, "json"),
         (".receipt.json", Kind::Receipt, "json"),
+        (".subscription.json", Kind::Subscription, "json"),
     ] {
         if let Some(stem) = name.strip_suffix(suffix) {
             if stem.is_empty() {
@@ -125,6 +130,18 @@ fn classify(name: &str) -> Option<(Kind, String, String)> {
             return Some((kind, stem.to_string(), ext.to_string()));
         }
     }
+
+    // For tickets, anything after the `.ticket.` marker is the real
+    // extension (`.pdf`, `.pkpass`, image formats, etc.).
+    if let Some(idx) = name.find(".ticket.") {
+        let stem = &name[..idx];
+        let ext = &name[idx + ".ticket.".len()..];
+        if stem.is_empty() || ext.is_empty() || ext.contains('/') {
+            return None;
+        }
+        return Some((Kind::Ticket, stem.to_string(), ext.to_string()));
+    }
+
     None
 }
 

@@ -149,6 +149,12 @@ enum Command {
         /// Path to a sendmail binary.
         #[arg(long)]
         receipts_forward_sendmail: Option<PathBuf>,
+        /// Directory under which to file `ticket` artifacts.
+        #[arg(long)]
+        tickets_dir: Option<PathBuf>,
+        /// Directory under which to file `subscription` artifacts.
+        #[arg(long)]
+        subscriptions_dir: Option<PathBuf>,
         #[command(flatten)]
         firefly: FireflyArgs,
         #[command(flatten)]
@@ -258,6 +264,8 @@ fn main() -> Result<()> {
             receipts_forward_to,
             receipts_forward_from,
             receipts_forward_sendmail,
+            tickets_dir,
+            subscriptions_dir,
             firefly,
             trackers,
             dry_run,
@@ -274,6 +282,7 @@ fn main() -> Result<()> {
                 receipts_forward_sendmail,
                 runtime.handle(),
             )?;
+            let tickets = tickets_dir.map(mailsift::targets::tickets::TicketSink::LocalDir);
             let raw = if path == Path::new("-") {
                 let mut buf = Vec::new();
                 use std::io::Read;
@@ -297,7 +306,9 @@ fn main() -> Result<()> {
                 &sink,
                 bills_dir.as_deref(),
                 parcels_dir.as_deref(),
+                subscriptions_dir.as_deref(),
                 receipts.as_ref(),
+                tickets.as_ref(),
                 firefly.as_ref(),
                 (!trackers.is_empty()).then_some(&trackers),
                 &[],
