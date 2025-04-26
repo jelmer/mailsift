@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 
-use mailsift::cli::{CaldavTarget, parse_caldav_url};
+use mailsift::cli::{CaldavTarget, default_config_path, parse_caldav_url};
+use mailsift::config::Config;
 use mailsift::pipeline::{self, DkimPolicy};
 use mailsift::targets::{EventSinkKind, caldav};
 
@@ -18,6 +19,10 @@ fn read_secret_file(path: &Path) -> Result<String> {
 #[derive(Parser)]
 #[command(name = "mailsift", version, about)]
 struct Cli {
+    /// TOML config file with defaults for the CLI flags. Defaults to
+    /// `$XDG_CONFIG_HOME/mailsift/config.toml` when present.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -246,6 +251,19 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    let config = match &cli.config {
+        Some(path) => Config::load(path)?,
+        None => match default_config_path() {
+            Some(path) if path.exists() => Config::load(&path)?,
+            _ => Config::default(),
+        },
+    };
+    // Trusted forwarders is the one config field we currently consume
+    // automatically; per-target defaults (caldav, bills_dir, ...) will
+    // wire in as the per-target overrides land.
+    let trusted_forwarders = config.trusted_forwarders.clone();
+    let _ = config; // suppress unused warning until more fields are consumed
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -311,7 +329,7 @@ fn main() -> Result<()> {
                 tickets.as_ref(),
                 firefly.as_ref(),
                 (!trackers.is_empty()).then_some(&trackers),
-                &[],
+                &trusted_forwarders,
                 DkimPolicy::Enforce,
                 dry_run,
             )

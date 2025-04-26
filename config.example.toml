@@ -1,0 +1,95 @@
+# mailsift config.
+#
+# Loaded automatically from $XDG_CONFIG_HOME/mailsift/config.toml
+# (or ~/.config/mailsift/config.toml) when present. Pass --config
+# <path> to override.
+#
+# Every key here is optional. Command-line flags always win; values set
+# below are used as defaults when a matching flag is not provided.
+
+# Directory containing extractor scripts. Can also be a list of
+# directories: every manifest under each one is discovered, and when
+# two list a manifest with the same `name:` the earlier directory
+# wins (handy for layering personal overrides on top of an
+# upstream-shipped set).
+extractors_dir = "/etc/mailsift/extractors"
+# extractors_dir = ["/home/jelmer/.config/mailsift/extractors", "/etc/mailsift/extractors"]
+
+# Directories under which artifacts of each kind are filed. Each is
+# optional; without one the corresponding artifact kind is dropped with
+# a warning.
+#
+# Layout:
+#   bills_dir:    <year>/<payee-slug>-<invoice-id>.json
+#   parcels_dir:  <tracking-number>.json (merged across messages)
+#   receipts_dir: <year>/<merchant-slug>-<order-id>.json
+#   tickets_dir:  <year>/<slug>.<ext>   (year from sibling event/reservation)
+bills_dir = "/home/jelmer/Documents/bills"
+parcels_dir = "/home/jelmer/Documents/parcels"
+receipts_dir = "/home/jelmer/Documents/receipts"
+tickets_dir = "/home/jelmer/Documents/tickets"
+
+# Where to file `event` artifacts as `<UID>.ics`. Mutually exclusive
+# with [caldav] below.
+# events_dir = "/home/jelmer/Documents/events"
+
+# WebDAV collection for `ticket` artifacts. Mutually exclusive with
+# tickets_dir above. Uses the same Basic / Negotiate auth story as
+# CalDAV; userinfo in the URL is accepted, or supply `user` and
+# `password_file` separately. Omit both to use Kerberos
+# (gssapi feature).
+# [tickets_webdav]
+# url = "https://jelmer@dav.example.org/tickets/"
+# password_file = "/etc/mailsift/dav.pass"
+
+# WebDAV collection for `receipt` artifacts. Mutually exclusive with
+# receipts_dir above AND with [receipts_forward] below.
+# [receipts_webdav]
+# url = "https://jelmer@dav.example.org/receipts/"
+# password_file = "/etc/mailsift/dav.pass"
+
+# Forward receipt-emitting messages by email. Each receipt artifact
+# triggers a forwarded copy of the original RFC822 with the source
+# attached as message/rfc822. Mutually exclusive with receipts_dir and
+# [receipts_webdav]. Pick exactly one of `sendmail` (always available)
+# or `smtp_url` (requires the `smtp` Cargo feature).
+# [receipts_forward]
+# from = "mailsift@example.org"
+# to = ["receipts@example.org"]
+# sendmail = "/usr/sbin/sendmail"
+# # or instead:
+# # smtp_url = "smtps://jelmer@mail.example.org/"
+# # smtp_password_file = "/etc/mailsift/smtp.pass"
+
+# Email addresses we trust to forward vendor mail to us. When the outer
+# `From:` matches one of these AND the mail carries a `message/rfc822`
+# attachment, the pipeline acts on the inner message instead of the
+# forwarder's wrapper. DKIM is rechecked against the inner mail's own
+# `Authentication-Results` header. Empty by default; forwarded mail
+# otherwise flows through the normal pipeline against the outer envelope.
+# trusted_forwarders = ["joe@example.com"]
+
+# CalDAV server for `event` artifacts. Mutually exclusive with
+# events_dir. The username can be embedded in the URL
+# (https://jelmer@cal.example.org/) or supplied separately as `user`.
+# Omit both `user` and `password_file` to use Kerberos (gssapi feature).
+[caldav]
+url = "https://jelmer@cal.example.org/"
+password_file = "/etc/mailsift/caldav.pass"
+
+# Firefly III sink for `bill` artifacts. When set, every filed bill is
+# also registered with Firefly using update-or-create semantics:
+# matching bills (by name == payee) are PUT to refresh the amount and
+# due-date; new ones are POSTed. Failures are best-effort and don't
+# affect the on-disk record.
+# [firefly]
+# url = "https://firefly.example.org/"
+# token_file = "/etc/mailsift/firefly.token"
+
+# 17track tracker registration for `parcel` artifacts. When set, each
+# newly-seen tracking number is POSTed to api.17track.net so 17track
+# polls the carrier for status updates. The token file holds a single
+# 17track API token (get one from your account at https://17track.net/).
+# Carriers without a 17track mapping are skipped silently.
+# [seventeentrack]
+# token_file = "/etc/mailsift/seventeentrack.token"
