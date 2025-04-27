@@ -6,5 +6,6 @@ pub mod extractor;
 pub mod pipeline;
 pub mod reservation;
 pub mod seen;
+pub mod stats;
 pub mod targets;
 pub mod unforward;

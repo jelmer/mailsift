@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand};
 use mailsift::cli::{CaldavTarget, default_config_path, parse_caldav_url};
 use mailsift::config::Config;
 use mailsift::pipeline::{self, DkimPolicy};
+use mailsift::stats;
 use mailsift::targets::{EventSinkKind, caldav};
 
 /// Read a password / API-token file, trim, and return its contents.
@@ -168,6 +169,38 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Aggregate the milter's event log into a per-extractor summary
+    /// (total runs, produced/empty/failed counts, mean wall-clock
+    /// time). Reads the NDJSON log the milter writes to
+    /// `$XDG_STATE_HOME/mailsift/events.ndjson`.
+    Stats {
+        /// Path to the event log. Defaults to the same XDG state path
+        /// the milter writes to.
+        #[arg(long)]
+        log: Option<PathBuf>,
+    },
+}
+
+fn print_stats(stats: &[stats::ExtractorStats]) {
+    if stats.is_empty() {
+        println!("no events recorded");
+        return;
+    }
+    println!(
+        "{:<28} {:>6} {:>9} {:>6} {:>6} {:>7} {:>9}",
+        "extractor", "runs", "produced", "empty", "failed", "skipped", "mean ms"
+    );
+    for s in stats {
+        let mean = match s.mean_duration_ms {
+            Some(m) => format!("{m:.0}"),
+            None => "-".to_string(),
+        };
+        let skipped = s.skipped_headers + s.skipped_body + s.skipped_dkim;
+        println!(
+            "{:<28} {:>6} {:>9} {:>6} {:>6} {:>7} {:>9}",
+            s.name, s.runs, s.produced, s.empty, s.failed, skipped, mean
+        );
+    }
 }
 
 fn build_receipts_sink(
@@ -270,6 +303,24 @@ fn main() -> Result<()> {
         .context("building tokio runtime")?;
 
     match cli.command {
+        Command::Stats { log } => {
+            let log_path = match log {
+                Some(p) => p,
+                None => match stats::Recorder::default_file() {
+                    stats::Recorder::File(p) => p,
+                    stats::Recorder::Disabled => {
+                        anyhow::bail!("no log path: set XDG_STATE_HOME or HOME, or pass --log")
+                    }
+                },
+            };
+            if !log_path.exists() {
+                println!("no events recorded yet at {}", log_path.display());
+                return Ok(());
+            }
+            let stats = stats::aggregate(&log_path)?;
+            print_stats(&stats);
+            Ok(())
+        }
         Command::Replay {
             path,
             extractors,
