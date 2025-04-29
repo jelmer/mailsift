@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -33,7 +33,7 @@ const DEFAULT_EXTRACTOR_TIMEOUT: Duration = Duration::from_secs(10);
 pub fn run(
     raw: &[u8],
     source: &str,
-    extractors_dir: &Path,
+    extractors_dirs: &[PathBuf],
     event_sink: &EventSinkKind,
     bills_dir: Option<&Path>,
     parcels_dir: Option<&Path>,
@@ -46,8 +46,16 @@ pub fn run(
     dkim_policy: DkimPolicy,
     _dry_run: bool,
 ) -> Result<()> {
-    let extractors = extractor::discover(extractors_dir)
-        .with_context(|| format!("discovering extractors in {}", extractors_dir.display()))?;
+    let extractors = extractor::discover(extractors_dirs).with_context(|| {
+        format!(
+            "discovering extractors in {}",
+            extractors_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
     if extractors.is_empty() {
         warn!("no extractors configured; nothing to do");
         return Ok(());

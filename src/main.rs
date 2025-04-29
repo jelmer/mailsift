@@ -126,7 +126,7 @@ enum Command {
         path: PathBuf,
         /// Directory containing extractor scripts.
         #[arg(long)]
-        extractors: PathBuf,
+        extractors: Vec<PathBuf>,
         #[command(flatten)]
         target: EventTargetArgs,
         /// Directory under which to file `bill` artifacts.
@@ -179,6 +179,26 @@ enum Command {
         #[arg(long)]
         log: Option<PathBuf>,
     },
+    /// Validate every discoverable extractor manifest.
+    Check {
+        /// Directory containing extractor scripts.
+        #[arg(long)]
+        extractors: Vec<PathBuf>,
+    },
+    /// Validate every extractor manifest and report every issue at once.
+    Lint {
+        /// Directory containing extractor scripts.
+        #[arg(long)]
+        extractors: Vec<PathBuf>,
+    },
+}
+
+fn render_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn print_stats(stats: &[stats::ExtractorStats]) {
@@ -303,6 +323,39 @@ fn main() -> Result<()> {
         .context("building tokio runtime")?;
 
     match cli.command {
+        Command::Check { extractors } => {
+            let discovered = mailsift::extractor::discover(&extractors).with_context(|| {
+                format!("discovering extractors in {}", render_paths(&extractors))
+            })?;
+            println!(
+                "found {} extractor(s) under {}",
+                discovered.len(),
+                render_paths(&extractors)
+            );
+            for ex in &discovered {
+                println!(
+                    "  {order:>4}  {name:<28}  {script}",
+                    order = ex.order,
+                    name = ex.name,
+                    script = ex.script.display(),
+                );
+            }
+            Ok(())
+        }
+        Command::Lint { extractors } => {
+            let issues = mailsift::extractor::lint(&extractors);
+            if issues.is_empty() {
+                println!("no issues found under {}", render_paths(&extractors));
+                Ok(())
+            } else {
+                for issue in &issues {
+                    println!("{}: {}", issue.source.display(), issue.message);
+                }
+                let n = issues.len();
+                let noun = if n == 1 { "issue" } else { "issues" };
+                anyhow::bail!("{n} {noun} found")
+            }
+        }
         Command::Stats { log } => {
             let log_path = match log {
                 Some(p) => p,
@@ -371,7 +424,7 @@ fn main() -> Result<()> {
             pipeline::run(
                 &raw,
                 &source,
-                &extractors,
+                extractors.as_slice(),
                 &sink,
                 bills_dir.as_deref(),
                 parcels_dir.as_deref(),
