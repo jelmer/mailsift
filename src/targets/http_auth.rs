@@ -15,7 +15,7 @@
 //! - Otherwise return the original 401 to the caller, who decides
 //!   whether to error or accept.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::header::{HeaderMap, WWW_AUTHENTICATE};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 

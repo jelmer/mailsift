@@ -6,10 +6,11 @@ description = "Extracts structured artifacts (events, tickets, parcels, receipts
 license = "GPL-3.0-or-later"
 
 [features]
-# Reserved for SASL `AUTHENTICATE GSSAPI` (IMAP) and HTTP `Negotiate`
-# (CalDAV/WebDAV). The auth code already cfg-gates on this flag; the
-# library and feature lookups land in follow-up commits.
-gssapi = []
+default = ["gssapi"]
+# Kerberos authentication: SASL `AUTHENTICATE GSSAPI` for IMAP and HTTP
+# `Negotiate` for CalDAV. Requires a system GSSAPI library (MIT Kerberos
+# or Heimdal) at link time.
+gssapi = ["dep:base64", "dep:libgssapi", "imap/gssapi"]
 # SMTP submission for the receipts forwarder. Without it the sendmail
 # pipe transport still works. Pulls in `lettre`'s MIME / encoding /
 # TLS dep tree.
@@ -17,6 +18,7 @@ smtp = ["lettre/smtp-transport", "lettre/tokio1-rustls-tls"]
 
 [dependencies]
 anyhow = "1"
+base64 = { version = "0.22", optional = true }
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 clap = { version = "4", features = ["derive"] }
@@ -29,6 +31,7 @@ indicatif = "0.18"
 indymilter = "0.3"
 lettre = { version = "0.11", default-features = false, features = ["builder", "tokio1", "sendmail-transport"] }
 libc = "0.2"
+libgssapi = { version = "0.11", optional = true }
 mailparse = "0.16.1"
 percent-encoding = "2"
 quick-xml = "0.36"

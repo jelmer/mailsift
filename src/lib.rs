@@ -3,6 +3,8 @@ pub mod cli;
 pub mod config;
 pub mod dkim;
 pub mod extractor;
+#[cfg(feature = "gssapi")]
+pub mod gss;
 pub mod imap_scan;
 pub mod milter;
 pub mod pipeline;
