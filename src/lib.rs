@@ -3,6 +3,8 @@ pub mod cli;
 pub mod config;
 pub mod dkim;
 pub mod extractor;
+pub mod imap_scan;
+pub mod milter;
 pub mod pipeline;
 pub mod reservation;
 pub mod seen;
