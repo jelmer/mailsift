@@ -6,7 +6,7 @@ description = "Extracts structured artifacts (events, tickets, parcels, receipts
 license = "GPL-3.0-or-later"
 
 [features]
-default = ["gssapi"]
+default = ["gssapi", "smtp"]
 # Kerberos authentication: SASL `AUTHENTICATE GSSAPI` for IMAP and HTTP
 # `Negotiate` for CalDAV. Requires a system GSSAPI library (MIT Kerberos
 # or Heimdal) at link time.
