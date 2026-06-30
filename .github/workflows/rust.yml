@@ -1,0 +1,35 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install GSSAPI headers
+      run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+    - name: Clippy (default features)
+      run: cargo clippy --all-targets -- -Dwarnings
+    - name: Build (default features)
+      run: cargo build --verbose
+    - name: Test (default features)
+      run: cargo test --verbose
+    - name: Build (no default features)
+      run: cargo build --verbose --no-default-features
+    - name: Test (no default features)
+      run: cargo test --verbose --no-default-features
+    - name: Build (all features)
+      run: cargo build --verbose --all-features
+    - name: Test (all features)
+      run: cargo test --verbose --all-features
