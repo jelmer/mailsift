@@ -15,7 +15,9 @@
 //! - Otherwise return the original 401 to the caller, who decides
 //!   whether to error or accept.
 
-use anyhow::{Context, Result, anyhow};
+#[cfg(feature = "gssapi")]
+use anyhow::anyhow;
+use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, WWW_AUTHENTICATE};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 
