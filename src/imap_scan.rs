@@ -61,12 +61,12 @@ pub enum AuthMethod<'a> {
 /// crate surfaces as a normal `BAD` response.
 ///
 /// [1]: https://developers.google.com/gmail/imap/xoauth2-protocol
-struct XOAuth2Authenticator {
-    user: String,
-    access_token: String,
+struct XOAuth2Authenticator<'a> {
+    user: &'a str,
+    access_token: &'a str,
 }
 
-impl imap::Authenticator for XOAuth2Authenticator {
+impl imap::Authenticator for XOAuth2Authenticator<'_> {
     type Response = String;
 
     fn process(&self, _challenge: &[u8]) -> Self::Response {
@@ -197,10 +197,7 @@ fn connect_and_authenticate(config: &ImapScanConfig<'_>) -> Result<Session<imap:
                 })?
         }
         AuthMethod::XOAuth2 { user, access_token } => {
-            let authenticator = XOAuth2Authenticator {
-                user: user.to_string(),
-                access_token: access_token.to_string(),
-            };
+            let authenticator = XOAuth2Authenticator { user, access_token };
             client
                 .authenticate("XOAUTH2", &authenticator)
                 .map_err(|(e, _)| anyhow::anyhow!("IMAP AUTHENTICATE XOAUTH2: {e}"))?
@@ -574,17 +571,17 @@ fn collect_parts(bs: &imap_proto::BodyStructure<'_>, out: &mut BodyParts) {
             .and_then(|ps| {
                 ps.iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case("filename"))
-                    .map(|(_, v)| v.to_string())
+                    .map(|(_, v)| v.as_ref())
             })
             .or_else(|| {
                 common.ty.params.as_ref().and_then(|ps| {
                     ps.iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case("name"))
-                        .map(|(_, v)| v.to_string())
+                        .map(|(_, v)| v.as_ref())
                 })
             });
 
-        out.push_leaf(&ty, &subtype, filename.as_deref());
+        out.push_leaf(&ty, &subtype, filename);
     }
 
     match bs {
@@ -703,8 +700,8 @@ mod tests {
     fn xoauth2_client_response_format() {
         use imap::Authenticator;
         let auth = XOAuth2Authenticator {
-            user: "someone@example.com".to_string(),
-            access_token: "ya29.a0AfH6SMB".to_string(),
+            user: "someone@example.com",
+            access_token: "ya29.a0AfH6SMB",
         };
         let response = auth.process(b"");
         assert_eq!(
@@ -722,8 +719,8 @@ mod tests {
         // `process` must not vary with the challenge bytes.
         use imap::Authenticator;
         let auth = XOAuth2Authenticator {
-            user: "u@example.com".to_string(),
-            access_token: "tok".to_string(),
+            user: "u@example.com",
+            access_token: "tok",
         };
         assert_eq!(auth.process(b""), auth.process(b"some-error-blob"));
     }

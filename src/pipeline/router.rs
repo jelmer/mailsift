@@ -41,7 +41,16 @@ pub(super) struct Summary {
 
 impl Summary {
     pub(super) fn bump(&mut self, extractor: &str, kind_index: usize) {
-        self.counts.entry(extractor.to_string()).or_default()[kind_index] += 1;
+        // Avoid allocating a new `String` on every bump — only allocate
+        // when this is the first sighting of the extractor. `BTreeMap`
+        // has no `entry_ref`, so we do the two-lookup dance manually.
+        if let Some(counts) = self.counts.get_mut(extractor) {
+            counts[kind_index] += 1;
+        } else {
+            let mut counts = [0u32; 6];
+            counts[kind_index] = 1;
+            self.counts.insert(extractor.to_string(), counts);
+        }
     }
 
     pub(super) fn is_empty(&self) -> bool {
