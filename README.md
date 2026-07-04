@@ -192,6 +192,10 @@ the helper at `extractors/_lib/mailsift_extractor.py`; others just
 parse the message themselves. Exit 0 means "done, look at my output";
 non-zero means "I failed, skip me".
 
+For the full extractor contract - manifest fields, dispatch semantics,
+artifact filenames, and how to test one - see
+[README.extractors.md](README.extractors.md).
+
 ## Development
 
 ```sh
