@@ -157,6 +157,47 @@ constraints (it sees mail before the local MTA's DKIM check has run), so
 it skips that check. Use `replay`/`imap-scan` for retroactive runs that
 do want DKIM enforcement.
 
+### Dovecot Sieve
+
+There is no dedicated Sieve mode: `replay -` already fits the Sieve
+pipe contract (raw RFC822 on stdin, run the pipeline, exit 0). Sieve
+runs during local delivery, after Dovecot has added its
+`Authentication-Results:` header, so unlike the milter this path *does*
+enforce `require_dkim`.
+
+Enable the `sieve_extprograms` plugin and the `pipe` extension:
+
+```
+# dovecot / pigeonhole plugin block
+plugin {
+  sieve_plugins       = sieve_extprograms
+  sieve_extensions    = +vnd.dovecot.pipe
+  sieve_pipe_bin_dir  = /usr/lib/dovecot/sieve-pipe
+}
+```
+
+Programs in `sieve_pipe_bin_dir` are invoked with a fixed argv, so drop
+a wrapper there rather than symlinking the binary directly:
+
+```sh
+# /usr/lib/dovecot/sieve-pipe/mailsift
+#!/bin/sh
+exec /usr/local/bin/mailsift --config /etc/mailsift/config.toml replay -
+```
+
+Then pipe delivered mail through it:
+
+```sieve
+require ["vnd.dovecot.pipe"];
+pipe :copy "mailsift";
+```
+
+The `:copy` modifier is load-bearing. Without it `pipe` counts as the
+message's delivery action and the mail never reaches the mailbox; with
+it mailsift gets a copy and normal delivery proceeds untouched. Put the
+rule in a `sieve_before` script to run it on every delivery ahead of
+users' own filters.
+
 ## Extractors
 
 A collection of ready-to-use extractors lives at
