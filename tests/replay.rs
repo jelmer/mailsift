@@ -46,3 +46,27 @@ END:VCALENDAR\r
 ";
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn replay_fails_with_empty_extractors_dir() {
+    let manifest = manifest_dir();
+    let eml = manifest.join("tests/fixtures/eml/ics-attachment.eml");
+    let empty = tempfile::tempdir().expect("tempdir");
+
+    let output = Command::cargo_bin("mailsift")
+        .expect("binary built")
+        .arg("replay")
+        .arg(&eml)
+        .arg("--extractors")
+        .arg(empty.path())
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(
+        stderr.contains("no extractors found"),
+        "unexpected stderr: {stderr}"
+    );
+}

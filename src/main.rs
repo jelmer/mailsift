@@ -625,6 +625,23 @@ fn resolve_extractors(cli: Option<PathBuf>, config: &Config) -> Vec<PathBuf> {
     vec![PathBuf::from(DEFAULT_EXTRACTORS_DIR)]
 }
 
+/// Discover extractors for a processing command, failing if none were
+/// found. A commonly-mistyped `extractors_dir` still names a real
+/// directory, so discovery succeeds with an empty set; without this
+/// guard the command would silently process nothing. `check` prints
+/// its (possibly empty) result instead of calling this.
+fn discover_required(dirs: &[PathBuf]) -> Result<Vec<mailsift::extractor::Extractor>> {
+    let extractors = mailsift::extractor::discover(dirs)
+        .with_context(|| format!("discovering extractors in {}", render_paths(dirs)))?;
+    if extractors.is_empty() {
+        return Err(anyhow!(
+            "no extractors found under {}; check extractors_dir",
+            render_paths(dirs)
+        ));
+    }
+    Ok(extractors)
+}
+
 /// Print a per-extractor dispatch table from a `replay --explain` run.
 /// Lists every discovered extractor (even those the pipeline never
 /// considered because something earlier short-circuited) so the user
@@ -917,12 +934,7 @@ fn run() -> Result<()> {
         } => {
             let sink = target.build_sink(&config, runtime.handle())?;
             let extractors_dir = resolve_extractors(extractors, &config);
-            let extractors = mailsift::extractor::discover(&extractors_dir).with_context(|| {
-                format!(
-                    "discovering extractors in {}",
-                    render_paths(&extractors_dir)
-                )
-            })?;
+            let extractors = discover_required(&extractors_dir)?;
             let dirs = artifacts.resolve(&config, runtime.handle())?;
             let trackers = build_trackers(&trackers, &config, runtime.handle())?;
             let firefly = build_firefly(&firefly, &config, runtime.handle())?;
@@ -992,12 +1004,7 @@ fn run() -> Result<()> {
         } => {
             let sink = target.build_sink(&config, runtime.handle())?;
             let extractors_dir = resolve_extractors(extractors, &config);
-            let extractors = mailsift::extractor::discover(&extractors_dir).with_context(|| {
-                format!(
-                    "discovering extractors in {}",
-                    render_paths(&extractors_dir)
-                )
-            })?;
+            let extractors = discover_required(&extractors_dir)?;
             let dirs = artifacts.resolve(&config, runtime.handle())?;
             let trackers = build_trackers(&trackers, &config, runtime.handle())?;
             let firefly = build_firefly(&firefly, &config, runtime.handle())?;
@@ -1083,12 +1090,7 @@ fn run() -> Result<()> {
         } => {
             let sink = target.build_sink(&config, runtime.handle())?;
             let extractors_dir = resolve_extractors(extractors, &config);
-            let extractors = mailsift::extractor::discover(&extractors_dir).with_context(|| {
-                format!(
-                    "discovering extractors in {}",
-                    render_paths(&extractors_dir)
-                )
-            })?;
+            let extractors = discover_required(&extractors_dir)?;
             let dirs = artifacts.resolve(&config, runtime.handle())?;
             let tickets_sink = dirs.tickets.map(std::sync::Arc::new);
             let trackers = build_trackers(&trackers, &config, runtime.handle())?;
