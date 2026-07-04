@@ -35,6 +35,22 @@ use crate::pipeline::{self, PipelineTargets};
 /// a comfortable midpoint for typical mail sizes.
 const FETCH_BATCH: usize = 50;
 
+/// The mailbox named on the command line does not exist on the server. A
+/// caller mistake rather than an internal failure, so the CLI reports it
+/// as a plain message without a backtrace.
+#[derive(Debug)]
+pub struct MailboxNotFound {
+    pub mailbox: String,
+}
+
+impl std::fmt::Display for MailboxNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no such mailbox: {}", self.mailbox)
+    }
+}
+
+impl std::error::Error for MailboxNotFound {}
+
 /// How to authenticate to the IMAP server.
 #[derive(Clone, Copy)]
 pub enum AuthMethod<'a> {
@@ -110,9 +126,21 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
     }
 
     let mut session = connect_and_authenticate(&config)?;
-    let mbox = session
-        .examine(config.mailbox)
-        .with_context(|| format!("EXAMINE {}", config.mailbox))?;
+    let mbox = match session.examine(config.mailbox) {
+        Ok(mbox) => mbox,
+        // A NO response to EXAMINE means the server refused to select the
+        // mailbox; for a mailbox the user named, that is almost always
+        // "it doesn't exist". Surface it as such rather than a backtrace.
+        Err(imap::Error::No(_)) => {
+            return Err(MailboxNotFound {
+                mailbox: config.mailbox.to_string(),
+            }
+            .into());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("EXAMINE {}", config.mailbox)));
+        }
+    };
     info!(
         mailbox = config.mailbox,
         exists = mbox.exists,
@@ -781,5 +809,17 @@ mod tests {
                 .any(|(t, s)| t == "text" && s == "calendar")
         );
         assert!(parts.attachment_filenames.iter().any(|f| f == "invite.ics"));
+    }
+
+    #[test]
+    fn mailbox_not_found_survives_anyhow_downcast() {
+        // The CLI recognises this via `err.is::<MailboxNotFound>()` to
+        // print a plain message instead of a backtrace.
+        let err: anyhow::Error = MailboxNotFound {
+            mailbox: "archive".to_string(),
+        }
+        .into();
+        assert!(err.is::<MailboxNotFound>());
+        assert_eq!(err.to_string(), "no such mailbox: archive");
     }
 }
