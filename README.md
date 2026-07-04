@@ -159,6 +159,9 @@ do want DKIM enforcement.
 
 ## Extractors
 
+A collection of ready-to-use extractors lives at
+[mailsift-extractors](https://github.com/jelmer/mailsift-extractors).
+
 Each extractor is a pair: a YAML manifest and an executable script.
 mailsift discovers them by scanning the configured `extractors_dir`
 for `*.yaml`.
