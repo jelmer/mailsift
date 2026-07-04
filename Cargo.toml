@@ -4,13 +4,17 @@ version = "0.0.2"
 edition = "2024"
 description = "Extracts structured artifacts (events, tickets, parcels, receipts, bills) from incoming personal email."
 license = "GPL-3.0-or-later"
+repository = "https://github.com/jelmer/mailsift"
 
 [features]
 default = ["gssapi", "smtp"]
 # Kerberos authentication: SASL `AUTHENTICATE GSSAPI` for IMAP and HTTP
 # `Negotiate` for CalDAV. Requires a system GSSAPI library (MIT Kerberos
 # or Heimdal) at link time.
-gssapi = ["dep:base64", "dep:libgssapi", "imap/gssapi"]
+# NOTE: IMAP GSSAPI (`imap/gssapi`) needs the jelmer/rust-imap fork and is
+# commented out on this release branch so the crate can be published to
+# crates.io with the upstream `imap` crate.
+gssapi = ["dep:base64", "dep:libgssapi"]
 # SMTP submission for the receipts forwarder. Without it the sendmail
 # pipe transport still works. Pulls in `lettre`'s MIME / encoding /
 # TLS dep tree.
@@ -25,7 +29,7 @@ clap = { version = "4", features = ["derive"] }
 # Cross-platform SIGINT/SIGTERM handler for the long-running daemons.
 ctrlc = "3"
 icalendar = "0.16"
-imap = { git = "https://github.com/jelmer/rust-imap", branch = "gssapi", default-features = false, features = ["rustls-tls"] }
+imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
 imap-proto = "0.16"
 indicatif = "0.18"
 indymilter = "0.3"

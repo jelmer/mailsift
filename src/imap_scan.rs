@@ -43,8 +43,10 @@ pub enum AuthMethod<'a> {
     /// SASL `AUTHENTICATE GSSAPI` using credentials from the caller's
     /// Kerberos credential cache. `authzid` is the optional SASL
     /// authorization identity.
-    #[cfg(feature = "gssapi")]
-    Gssapi { authzid: Option<&'a str> },
+    // IMAP GSSAPI needs the jelmer/rust-imap fork; commented out on the
+    // release branch so the crate can build against the upstream imap crate.
+    // #[cfg(feature = "gssapi")]
+    // Gssapi { authzid: Option<&'a str> },
     /// SASL `AUTHENTICATE XOAUTH2` with a Gmail (or other provider)
     /// OAuth2 bearer token. The token is short-lived; obtain a fresh
     /// one before each run (e.g. via `oauth2l` or `gcloud`).
@@ -178,24 +180,26 @@ fn connect_and_authenticate(config: &ImapScanConfig<'_>) -> Result<Session<imap:
             .login(user, password)
             .map_err(|(e, _)| e)
             .context("IMAP LOGIN")?,
-        #[cfg(feature = "gssapi")]
-        AuthMethod::Gssapi { authzid } => {
-            let authenticator = imap::gssapi::GssapiAuthenticator::new(
-                "imap",
-                config.host,
-                authzid.map(str::to_string),
-            )
-            .context("initialising GSSAPI client context")?;
-            client
-                .authenticate("GSSAPI", &authenticator)
-                .map_err(|(e, _)| {
-                    if let Some(detail) = authenticator.last_error() {
-                        anyhow::anyhow!("IMAP AUTHENTICATE GSSAPI: {e} ({detail})")
-                    } else {
-                        anyhow::anyhow!("IMAP AUTHENTICATE GSSAPI: {e}")
-                    }
-                })?
-        }
+        // IMAP GSSAPI needs the jelmer/rust-imap fork; commented out on the
+        // release branch so the crate can build against the upstream imap crate.
+        // #[cfg(feature = "gssapi")]
+        // AuthMethod::Gssapi { authzid } => {
+        //     let authenticator = imap::gssapi::GssapiAuthenticator::new(
+        //         "imap",
+        //         config.host,
+        //         authzid.map(str::to_string),
+        //     )
+        //     .context("initialising GSSAPI client context")?;
+        //     client
+        //         .authenticate("GSSAPI", &authenticator)
+        //         .map_err(|(e, _)| {
+        //             if let Some(detail) = authenticator.last_error() {
+        //                 anyhow::anyhow!("IMAP AUTHENTICATE GSSAPI: {e} ({detail})")
+        //             } else {
+        //                 anyhow::anyhow!("IMAP AUTHENTICATE GSSAPI: {e}")
+        //             }
+        //         })?
+        // }
         AuthMethod::XOAuth2 { user, access_token } => {
             let authenticator = XOAuth2Authenticator { user, access_token };
             client

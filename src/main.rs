@@ -943,7 +943,9 @@ fn main() -> Result<()> {
             url,
             password_file,
             oauth2_token_file,
-            #[cfg_attr(not(feature = "gssapi"), allow(unused_variables))]
+            // Consumed only by the IMAP GSSAPI path, which is commented out on
+            // the release branch (see imap_scan.rs).
+            #[allow(unused_variables)]
             authzid,
             since,
             limit,
@@ -998,11 +1000,13 @@ fn main() -> Result<()> {
                         access_token: tok,
                     }
                 }
-                #[cfg(feature = "gssapi")]
-                (None, None) => imap_scan::AuthMethod::Gssapi {
-                    authzid: authzid.as_deref(),
-                },
-                #[cfg(not(feature = "gssapi"))]
+                // IMAP GSSAPI needs the jelmer/rust-imap fork; commented out on
+                // the release branch (see imap_scan.rs) so the crate can build
+                // against the upstream imap crate.
+                // #[cfg(feature = "gssapi")]
+                // (None, None) => imap_scan::AuthMethod::Gssapi {
+                //     authzid: authzid.as_deref(),
+                // },
                 (None, None) => {
                     anyhow::bail!(
                         "no --password-file or --oauth2-token-file given, and this build has \
