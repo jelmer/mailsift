@@ -101,21 +101,46 @@ credential cache. Without a user in the URL the current OS user is
 used. Selects the mailbox **read-only**: no flags set, nothing
 expunged.
 
-For Gmail (and other XOAUTH2 providers), pass a short-lived OAuth2
-bearer token via `--oauth2-token-file` instead of `--password-file`:
+#### Gmail
+
+Gmail rejects your normal password over IMAP, so you have two ways in.
+
+**App password (simplest).** If the account has 2-Step Verification on,
+create an [app password](https://myaccount.google.com/apppasswords),
+drop it in a file, and use it like any other IMAP password:
 
 ```sh
+mkdir -p ~/.config/mailsift
+(umask 077; cat > ~/.config/mailsift/gmail.pass)   # paste the app password, then Ctrl-D
 mailsift imap-scan imaps://you@imap.gmail.com/INBOX \
-    --oauth2-token-file ~/.cache/mailsift/gmail.token \
-    --since 01-Jan-2026
+    --password-file ~/.config/mailsift/gmail.pass --since 01-Jan-2026
 ```
 
-The token file must contain just the access token (trailing newline is
-trimmed). Obtain one however you like; `oauth2l fetch --type=bearer
---scope=https://mail.google.com/ --output_format=bare > gmail.token`
-works for personal accounts; for workspace accounts use a service
-account with domain-wide delegation. Gmail access tokens expire after
-~1 hour, so refresh before each run.
+Reading the password from a `cat` prompt keeps it out of your shell
+history. Spaces in the pasted app password are fine; `--password-file`
+uses the file verbatim after trimming surrounding whitespace. Workspace
+admins can disable app passwords, in which case use OAuth2 below.
+
+**OAuth2 (XOAUTH2).** Pass a short-lived bearer token via
+`--oauth2-token-file` instead of `--password-file`. The file holds just
+the access token (surrounding whitespace is trimmed):
+
+```sh
+oauth2l fetch --type=bearer \
+    --scope=https://mail.google.com/ \
+    --output_format=bare > ~/.cache/mailsift/gmail.token
+mailsift imap-scan imaps://you@imap.gmail.com/INBOX \
+    --oauth2-token-file ~/.cache/mailsift/gmail.token --since 01-Jan-2026
+```
+
+[`oauth2l`](https://github.com/google/oauth2l) runs the browser consent
+flow the first time and caches a refresh token, so later `fetch` calls
+are non-interactive. Workspace accounts can instead use a service
+account with domain-wide delegation. The token file is read once at
+startup and Gmail access tokens expire after ~1 hour, so refresh it
+before each run. For the same reason a long `--watch` session outlives
+its token; prefer the app-password route (or a cron'd token refresh +
+re-run) if you want to watch Gmail continuously.
 
 A progress bar shows scan progress when stderr is a TTY; one summary
 line per message names the UID, extractor, and what was extracted:
