@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use mailsift::cli::{
@@ -13,6 +13,27 @@ use mailsift::targets::{EventSinkKind, caldav};
 use mailsift::{imap_scan, milter, pipeline};
 
 const DEFAULT_EXTRACTORS_DIR: &str = "extractors";
+
+/// A mistake in how the user invoked us (missing/conflicting flags, an
+/// unparseable URL) rather than an unexpected failure. Reported as a plain
+/// one-line message with no backtrace; genuine errors keep anyhow's default
+/// `Debug` output.
+#[derive(Debug)]
+struct UsageError(String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+macro_rules! usage_error {
+    ($($arg:tt)*) => {
+        anyhow::Error::new(UsageError(format!($($arg)*)))
+    };
+}
 
 /// Read a password / API-token file, trim, and return its contents.
 /// Used by every sink that reads a secret from disk (CalDAV/WebDAV
@@ -67,7 +88,7 @@ impl EventTargetArgs {
         // `--events-dir` on the command line.
         let (events_dir, caldav_url) = match (&self.events_dir, &self.caldav_url) {
             (Some(_), Some(_)) => {
-                return Err(anyhow!(
+                return Err(usage_error!(
                     "specify either --events-dir or a CalDAV target, not both"
                 ));
             }
@@ -80,7 +101,7 @@ impl EventTargetArgs {
         };
 
         match (events_dir, caldav_url) {
-            (Some(_), Some(_)) => Err(anyhow!(
+            (Some(_), Some(_)) => Err(usage_error!(
                 "config specifies both events_dir and [caldav]; pick one"
             )),
             (Some(dir), None) => Ok(EventSinkKind::LocalDir(dir)),
@@ -99,7 +120,7 @@ impl EventTargetArgs {
                     runtime.clone(),
                 )?))
             }
-            (None, None) => Err(anyhow!(
+            (None, None) => Err(usage_error!(
                 "no event target specified: pass --events-dir, --caldav-url, or set one in the config"
             )),
         }
@@ -431,7 +452,7 @@ impl ArtifactDirArgs {
         runtime: &tokio::runtime::Handle,
     ) -> Result<mailsift::targets::mail_forward::MailForwarder> {
         let from = self.receipts_forward_from.as_deref().ok_or_else(|| {
-            anyhow!("--receipts-forward-from is required with --receipts-forward-to")
+            usage_error!("--receipts-forward-from is required with --receipts-forward-to")
         })?;
 
         let transport = match (
@@ -782,6 +803,20 @@ fn build_firefly(
 }
 
 fn main() -> Result<()> {
+    match run() {
+        // Caller mistakes (bad flags, a mailbox that doesn't exist) are not
+        // bugs: a plain message is more useful than anyhow's Debug backtrace.
+        // Everything else keeps the default `?`-from-main behaviour so real
+        // failures stay loud.
+        Err(err) if err.is::<UsageError>() || err.is::<imap_scan::MailboxNotFound>() => {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        }
+        other => other,
+    }
+}
+
+fn run() -> Result<()> {
     // rustls 0.23 needs a CryptoProvider explicitly installed before any
     // TLS handshake; do it here so every subcommand that uses TLS
     // (imap-scan, milter health-checks, caldav target) is covered.
@@ -979,7 +1014,7 @@ fn main() -> Result<()> {
             let auth_method = match (&password, &oauth2_token) {
                 (Some(pw), _) => {
                     let user = resolved_user.as_deref().ok_or_else(|| {
-                        anyhow!(
+                        usage_error!(
                             "no username in URL and could not look up the current user; \
                              include one in the URL (imaps://user@host/...)"
                         )
@@ -988,7 +1023,7 @@ fn main() -> Result<()> {
                 }
                 (None, Some(tok)) => {
                     let user = resolved_user.as_deref().ok_or_else(|| {
-                        anyhow!(
+                        usage_error!(
                             "XOAUTH2 requires a username; include one in the URL \
                              (imaps://you@imap.gmail.com/INBOX)"
                         )
