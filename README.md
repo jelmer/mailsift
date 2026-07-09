@@ -121,9 +121,40 @@ history. Spaces in the pasted app password are fine; `--password-file`
 uses the file verbatim after trimming surrounding whitespace. Workspace
 admins can disable app passwords, in which case use OAuth2 below.
 
-**OAuth2 (XOAUTH2), fixed token.** Pass a short-lived bearer token via
-`--oauth2-token-file` instead of `--password-file`. The file holds just
-the access token (surrounding whitespace is trimmed):
+**OAuth2 (XOAUTH2), recommended.** Run `mailsift imap-auth` once to do
+the browser consent flow and write a JSON credential bundle, then point
+`imap-scan` at it. mailsift mints a fresh access token at every connect,
+so this survives token expiry across reconnects and `--watch` sessions.
+
+```sh
+mailsift imap-auth you@gmail.com \
+    --client-id "$CLIENT_ID.apps.googleusercontent.com" \
+    --client-secret-file ~/.config/mailsift/gmail.client-secret \
+    --output ~/.config/mailsift/gmail.json
+mailsift imap-scan imaps://you@imap.gmail.com/INBOX \
+    --oauth2-credentials-file ~/.config/mailsift/gmail.json --watch
+```
+
+`imap-auth` starts a temporary server on `127.0.0.1`, opens your browser
+at the provider's consent screen, and captures the result; pass
+`--no-browser` to print the URL and paste the redirect back instead (for
+headless / SSH sessions). The provider is derived from the account
+domain, or name it with `--provider google|microsoft`. The client id and
+secret come from an OAuth2 client you register with the provider (a
+"Desktop app" client for Google; a public/native client for Microsoft,
+which has no secret so you omit `--client-secret-file`). The bundle is
+written owner-readable and holds a long-lived refresh token, so keep it
+somewhere private.
+
+The bundle can also be assembled by hand (or from an existing refresh
+token) with the discrete flags: `--oauth2-refresh-token-file`,
+`--oauth2-client-id`, `--oauth2-client-secret-file`, and either an
+IMAP-host-derived provider or an explicit `--oauth2-provider` /
+`--oauth2-token-endpoint`.
+
+**OAuth2 (XOAUTH2), fixed token.** For a one-off scan that finishes
+within an hour, pass a short-lived bearer token via `--oauth2-token-file`
+instead. The file holds just the access token (whitespace trimmed):
 
 ```sh
 oauth2l fetch --type=bearer \
@@ -133,35 +164,9 @@ mailsift imap-scan imaps://you@imap.gmail.com/INBOX \
     --oauth2-token-file ~/.cache/mailsift/gmail.token --since 01-Jan-2026
 ```
 
-[`oauth2l`](https://github.com/google/oauth2l) runs the browser consent
-flow the first time and caches a refresh token, so later `fetch` calls
-are non-interactive. Workspace accounts can instead use a service
-account with domain-wide delegation. The token file is read once at
-startup and Gmail access tokens expire after ~1 hour, so this mode only
-fits a one-off scan that finishes within the token's lifetime. For a
-long `--watch` session, use the refresh-token mode below.
-
-**OAuth2 (XOAUTH2), refresh token.** Give mailsift a long-lived refresh
-token plus your app's client id (and, for Google, its client secret) and
-it mints a fresh access token at every connect, so it survives token
-expiry across reconnects and `--watch` sessions. The provider's token
-endpoint is derived from the IMAP host for Gmail and Outlook; override
-it with `--oauth2-provider google|microsoft` or a full
-`--oauth2-token-endpoint` for anything else.
-
-```sh
-mailsift imap-scan imaps://you@imap.gmail.com/INBOX \
-    --oauth2-refresh-token-file ~/.config/mailsift/gmail.refresh \
-    --oauth2-client-id "$CLIENT_ID.apps.googleusercontent.com" \
-    --oauth2-client-secret-file ~/.config/mailsift/gmail.secret \
-    --watch
-```
-
-Obtaining the refresh token itself still needs a one-time browser
-consent; `oauth2l`, the provider's OAuth playground, or any OAuth2
-client library can produce one. Google desktop-app clients carry a
-client secret; Microsoft public (native) clients omit
-`--oauth2-client-secret-file`.
+Gmail access tokens expire after ~1 hour and the file is read once at
+startup, so a long `--watch` session outlives it; use the credential
+bundle above for that.
 
 A progress bar shows scan progress when stderr is a TTY; one summary
 line per message names the UID, extractor, and what was extracted:

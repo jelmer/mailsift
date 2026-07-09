@@ -57,35 +57,50 @@ fn xoauth2_user(resolved_user: Option<&str>) -> Result<&str> {
     })
 }
 
+/// The `--oauth2-*` flags of `imap-scan`, borrowed for
+/// [`build_token_provider`].
+struct OAuth2ScanFlags<'a> {
+    credentials_file: Option<&'a Path>,
+    refresh_token_file: Option<&'a Path>,
+    client_id: Option<&'a str>,
+    client_secret_file: Option<&'a Path>,
+    provider_name: Option<&'a str>,
+    token_endpoint: Option<&'a str>,
+}
+
 /// Build an OAuth2 [`TokenProvider`](mailsift::oauth2::TokenProvider)
-/// from the `--oauth2-refresh-token-*` flags, or return `None` if no
-/// refresh token was given (the caller then falls back to the other auth
-/// methods).
+/// from the `--oauth2-*` flags, or return `None` if neither a credential
+/// bundle nor a refresh token was given (the caller then falls back to
+/// the other auth methods).
 ///
-/// The token endpoint is taken from `--oauth2-token-endpoint` if given,
-/// else from `--oauth2-provider`, else derived from the IMAP host. An
-/// unrecognised host with no explicit endpoint is a usage error rather
-/// than a silent guess.
+/// A `--oauth2-credentials-file` is self-contained. Otherwise the token
+/// endpoint is taken from `--oauth2-token-endpoint` if given, else from
+/// `--oauth2-provider`, else derived from the IMAP host. An unrecognised
+/// host with no explicit endpoint is a usage error rather than a silent
+/// guess.
 fn build_token_provider(
-    refresh_token_file: Option<&Path>,
-    client_id: Option<&str>,
-    client_secret_file: Option<&Path>,
-    provider_name: Option<&str>,
-    token_endpoint: Option<&str>,
+    flags: &OAuth2ScanFlags<'_>,
     imap_host: &str,
     runtime: &tokio::runtime::Handle,
 ) -> Result<Option<mailsift::oauth2::TokenProvider>> {
     use mailsift::oauth2::{OAuth2Config, Provider, TokenProvider};
 
-    let Some(refresh_token_file) = refresh_token_file else {
+    // A credential bundle is self-contained; use it directly.
+    if let Some(path) = flags.credentials_file {
+        let config = OAuth2Config::load(path)?;
+        return Ok(Some(TokenProvider::new(config, runtime.clone())));
+    }
+
+    let Some(refresh_token_file) = flags.refresh_token_file else {
         return Ok(None);
     };
     // clap's `requires = "oauth2_client_id"` guarantees this, but the
     // handler shouldn't assume the parser's invariants hold.
-    let client_id = client_id
+    let client_id = flags
+        .client_id
         .ok_or_else(|| usage_error!("--oauth2-refresh-token-file requires --oauth2-client-id"))?;
 
-    let endpoint = match (token_endpoint, provider_name) {
+    let endpoint = match (flags.token_endpoint, flags.provider_name) {
         (Some(explicit), _) => explicit.to_string(),
         (None, Some(name)) => Provider::from_name(name)
             .ok_or_else(|| {
@@ -108,7 +123,7 @@ fn build_token_provider(
     };
 
     let refresh_token = read_secret_file(refresh_token_file)?;
-    let client_secret = client_secret_file.map(read_secret_file).transpose()?;
+    let client_secret = flags.client_secret_file.map(read_secret_file).transpose()?;
     Ok(Some(TokenProvider::new(
         OAuth2Config {
             token_endpoint: endpoint,
@@ -118,6 +133,67 @@ fn build_token_provider(
         },
         runtime.clone(),
     )))
+}
+
+/// Handle `mailsift imap-auth`: run the browser consent flow and write
+/// the credential bundle.
+fn run_imap_auth(args: ImapAuthArgs, runtime: &tokio::runtime::Handle) -> Result<()> {
+    use mailsift::oauth2::{ConsentRequest, Provider, consent};
+
+    let provider = match args.provider.as_deref() {
+        Some(name) => Provider::from_name(name)
+            .ok_or_else(|| usage_error!("unknown --provider {name:?}; use google or microsoft"))?,
+        None => {
+            let domain = args.account.rsplit('@').next().filter(|d| !d.is_empty());
+            // Only Gmail/Outlook domains are auto-derivable; anything
+            // else must name the provider explicitly.
+            match domain {
+                Some(d) if d.eq_ignore_ascii_case("gmail.com") => Provider::Google,
+                Some(d)
+                    if d.eq_ignore_ascii_case("outlook.com")
+                        || d.eq_ignore_ascii_case("hotmail.com")
+                        || d.eq_ignore_ascii_case("live.com") =>
+                {
+                    Provider::Microsoft
+                }
+                _ => {
+                    return Err(usage_error!(
+                        "cannot derive the provider from {:?}; pass --provider google|microsoft",
+                        args.account
+                    ));
+                }
+            }
+        }
+    };
+
+    let client_secret = args
+        .client_secret_file
+        .as_deref()
+        .map(read_secret_file)
+        .transpose()?;
+
+    let config = consent(
+        ConsentRequest {
+            auth_endpoint: provider.auth_endpoint(),
+            token_endpoint: provider.token_endpoint(),
+            client_id: &args.client_id,
+            client_secret: client_secret.as_deref(),
+            scope: provider.consent_scope(),
+            login_hint: Some(&args.account),
+            no_browser: args.no_browser,
+        },
+        runtime,
+    )?;
+
+    config.save(&args.output)?;
+    println!(
+        "Wrote OAuth2 credentials to {}. Use it with:\n  \
+         mailsift imap-scan imaps://{}@<host>/INBOX --oauth2-credentials-file {}",
+        args.output.display(),
+        args.account,
+        args.output.display()
+    );
+    Ok(())
 }
 
 #[derive(Parser)]
@@ -229,6 +305,18 @@ struct ImapScanArgs {
         help_heading = "Authentication"
     )]
     oauth2_token_file: Option<PathBuf>,
+    /// JSON credential bundle from `mailsift imap-auth` (client id,
+    /// secret, refresh token, and token endpoint in one file). The
+    /// self-contained equivalent of the `--oauth2-refresh-token-file` +
+    /// `--oauth2-client-*` flags; mints a fresh access token at every
+    /// (re)connect, so it suits `--watch`. The URL must include the
+    /// account.
+    #[arg(
+        long,
+        conflicts_with_all = ["password_file", "oauth2_token_file", "oauth2_refresh_token_file"],
+        help_heading = "Authentication"
+    )]
+    oauth2_credentials_file: Option<PathBuf>,
     /// File containing a long-lived OAuth2 refresh token for SASL
     /// XOAUTH2. mailsift mints a fresh access token from it at every
     /// (re)connect, so this survives token expiry across a `--watch`
@@ -291,6 +379,35 @@ struct ImapScanArgs {
     watch: bool,
 }
 
+/// Arguments for the `imap-auth` subcommand.
+#[derive(Args)]
+struct ImapAuthArgs {
+    /// The email account to authorize (`you@gmail.com`). Used to derive
+    /// the provider when `--provider` is omitted and to pre-fill the
+    /// consent screen.
+    account: String,
+    /// OAuth2 provider: `google` or `microsoft`. Derived from the
+    /// account's domain when omitted.
+    #[arg(long)]
+    provider: Option<String>,
+    /// OAuth2 client id of your registered application.
+    #[arg(long)]
+    client_id: String,
+    /// File containing the OAuth2 client secret. Google desktop apps
+    /// need one; Microsoft public (native) clients omit it.
+    #[arg(long)]
+    client_secret_file: Option<PathBuf>,
+    /// Where to write the JSON credential bundle. Pass this file to
+    /// `imap-scan --oauth2-credentials-file`. Created with owner-only
+    /// permissions.
+    #[arg(long, short)]
+    output: PathBuf,
+    /// Don't start a local server or open a browser; print the URL and
+    /// read the redirected URL back from stdin. For headless / SSH use.
+    #[arg(long)]
+    no_browser: bool,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Run the pipeline against a saved .eml file.
@@ -322,6 +439,9 @@ enum Command {
     // struct-variant trips clippy's `large_enum_variant`. See
     // [`ImapScanArgs`].
     ImapScan(Box<ImapScanArgs>),
+    /// Obtain an OAuth2 refresh token via the browser consent flow and
+    /// write a credential bundle for `imap-scan --oauth2-credentials-file`.
+    ImapAuth(ImapAuthArgs),
     /// Validate every discoverable extractor manifest. Parses each
     /// `<name>.yaml`, compiles the `subject_regex`, parses `requires:`
     /// entries, and checks the named script is executable. Reports the
@@ -1110,6 +1230,7 @@ fn run() -> Result<()> {
                 url,
                 password_file,
                 oauth2_token_file,
+                oauth2_credentials_file,
                 oauth2_refresh_token_file,
                 oauth2_client_id,
                 oauth2_client_secret_file,
@@ -1143,18 +1264,21 @@ fn run() -> Result<()> {
                 .map(read_secret_file)
                 .transpose()?;
             // Both XOAUTH2 paths feed a `&dyn TokenSource`: a fixed token
-            // wraps in a StaticTokenProvider, a refresh token in the
-            // minting TokenProvider. Bind both here so they outlive the
-            // borrowed AuthMethod.
+            // wraps in a StaticTokenProvider, a refresh token (or a
+            // credential bundle) in the minting TokenProvider. Bind both
+            // here so they outlive the borrowed AuthMethod.
             let static_token_provider = oauth2_token
                 .clone()
                 .map(mailsift::oauth2::StaticTokenProvider::new);
             let refresh_token_provider = build_token_provider(
-                oauth2_refresh_token_file.as_deref(),
-                oauth2_client_id.as_deref(),
-                oauth2_client_secret_file.as_deref(),
-                oauth2_provider.as_deref(),
-                oauth2_token_endpoint.as_deref(),
+                &OAuth2ScanFlags {
+                    credentials_file: oauth2_credentials_file.as_deref(),
+                    refresh_token_file: oauth2_refresh_token_file.as_deref(),
+                    client_id: oauth2_client_id.as_deref(),
+                    client_secret_file: oauth2_client_secret_file.as_deref(),
+                    provider_name: oauth2_provider.as_deref(),
+                    token_endpoint: oauth2_token_endpoint.as_deref(),
+                },
                 &target_imap.host,
                 runtime.handle(),
             )?;
@@ -1218,6 +1342,7 @@ fn run() -> Result<()> {
                 watch,
             })
         }
+        Command::ImapAuth(args) => run_imap_auth(args, runtime.handle()),
         Command::Milter {
             socket,
             extractors,

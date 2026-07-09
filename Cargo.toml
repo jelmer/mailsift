@@ -10,7 +10,7 @@ default = ["gssapi", "smtp"]
 # Kerberos authentication: SASL `AUTHENTICATE GSSAPI` for IMAP and HTTP
 # `Negotiate` for CalDAV. Requires a system GSSAPI library (MIT Kerberos
 # or Heimdal) at link time.
-gssapi = ["dep:base64", "dep:libgssapi", "imap/gssapi"]
+gssapi = ["dep:libgssapi", "imap/gssapi"]
 # SMTP submission for the receipts forwarder. Without it the sendmail
 # pipe transport still works. Pulls in `lettre`'s MIME / encoding /
 # TLS dep tree.
@@ -18,10 +18,12 @@ smtp = ["lettre/smtp-transport", "lettre/tokio1-rustls-tls"]
 
 [dependencies]
 anyhow = "1"
-base64 = { version = "0.22", optional = true }
+base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 clap = { version = "4", features = ["derive"] }
+# Randomness for OAuth2 PKCE verifier + CSRF state.
+getrandom = "0.2"
 # Cross-platform SIGINT/SIGTERM handler for the long-running daemons.
 ctrlc = "3"
 icalendar = "0.16"
