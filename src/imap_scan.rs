@@ -52,7 +52,6 @@ impl std::fmt::Display for MailboxNotFound {
 impl std::error::Error for MailboxNotFound {}
 
 /// How to authenticate to the IMAP server.
-#[derive(Clone, Copy)]
 pub enum AuthMethod<'a> {
     /// IMAP `LOGIN` with user + password.
     Login { user: &'a str, password: &'a str },
@@ -61,12 +60,17 @@ pub enum AuthMethod<'a> {
     /// authorization identity.
     #[cfg(feature = "gssapi")]
     Gssapi { authzid: Option<&'a str> },
-    /// SASL `AUTHENTICATE XOAUTH2` with a Gmail (or other provider)
-    /// OAuth2 bearer token. The token is short-lived; obtain a fresh
-    /// one before each run (e.g. via `oauth2l` or `gcloud`).
+    /// SASL `AUTHENTICATE XOAUTH2`. A fresh access token is fetched from
+    /// `tokens` at every (re)connect. With a
+    /// [`StaticTokenProvider`](crate::oauth2::StaticTokenProvider) that
+    /// is a fixed pre-obtained token (fine for a run that finishes within
+    /// its lifetime); with a
+    /// [`TokenProvider`](crate::oauth2::TokenProvider) it is minted from a
+    /// refresh token, so it survives token expiry across a `--watch`
+    /// session's reconnects.
     XOAuth2 {
         user: &'a str,
-        access_token: &'a str,
+        tokens: &'a dyn crate::oauth2::TokenSource,
     },
 }
 
@@ -201,7 +205,7 @@ fn connect_and_authenticate(config: &ImapScanConfig<'_>) -> Result<Session<imap:
         .connect()
         .with_context(|| format!("connecting to {}:{}", config.host, config.port))?;
 
-    let session = match config.auth {
+    let session = match &config.auth {
         AuthMethod::Login { user, password } => client
             .login(user, password)
             .map_err(|(e, _)| e)
@@ -224,8 +228,14 @@ fn connect_and_authenticate(config: &ImapScanConfig<'_>) -> Result<Session<imap:
                     }
                 })?
         }
-        AuthMethod::XOAuth2 { user, access_token } => {
-            let authenticator = XOAuth2Authenticator { user, access_token };
+        AuthMethod::XOAuth2 { user, tokens } => {
+            // Fetch (or reuse a cached) access token now, so a reconnect
+            // after the previous token expired picks up a fresh one.
+            let access_token = tokens.access_token()?;
+            let authenticator = XOAuth2Authenticator {
+                user,
+                access_token: &access_token,
+            };
             client
                 .authenticate("XOAUTH2", &authenticator)
                 .map_err(|(e, _)| anyhow::anyhow!("IMAP AUTHENTICATE XOAUTH2: {e}"))?

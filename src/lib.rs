@@ -7,6 +7,7 @@ pub mod extractor;
 pub mod gss;
 pub mod imap_scan;
 pub mod milter;
+pub mod oauth2;
 pub mod pipeline;
 pub mod reservation;
 pub mod seen;

@@ -45,6 +45,81 @@ fn read_secret_file(path: &Path) -> Result<String> {
         .to_string())
 }
 
+/// Resolve the username for XOAUTH2 auth, which the SASL message needs.
+/// XOAUTH2 has no equivalent of a username-less GSSAPI ticket, so unlike
+/// `LOGIN` we can't fall back to nothing: the account must be in the URL.
+fn xoauth2_user(resolved_user: Option<&str>) -> Result<&str> {
+    resolved_user.ok_or_else(|| {
+        usage_error!(
+            "XOAUTH2 requires a username; include one in the URL \
+             (imaps://you@imap.gmail.com/INBOX)"
+        )
+    })
+}
+
+/// Build an OAuth2 [`TokenProvider`](mailsift::oauth2::TokenProvider)
+/// from the `--oauth2-refresh-token-*` flags, or return `None` if no
+/// refresh token was given (the caller then falls back to the other auth
+/// methods).
+///
+/// The token endpoint is taken from `--oauth2-token-endpoint` if given,
+/// else from `--oauth2-provider`, else derived from the IMAP host. An
+/// unrecognised host with no explicit endpoint is a usage error rather
+/// than a silent guess.
+fn build_token_provider(
+    refresh_token_file: Option<&Path>,
+    client_id: Option<&str>,
+    client_secret_file: Option<&Path>,
+    provider_name: Option<&str>,
+    token_endpoint: Option<&str>,
+    imap_host: &str,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<mailsift::oauth2::TokenProvider>> {
+    use mailsift::oauth2::{OAuth2Config, Provider, TokenProvider};
+
+    let Some(refresh_token_file) = refresh_token_file else {
+        return Ok(None);
+    };
+    // clap's `requires = "oauth2_client_id"` guarantees this, but the
+    // handler shouldn't assume the parser's invariants hold.
+    let client_id = client_id
+        .ok_or_else(|| usage_error!("--oauth2-refresh-token-file requires --oauth2-client-id"))?;
+
+    let endpoint = match (token_endpoint, provider_name) {
+        (Some(explicit), _) => explicit.to_string(),
+        (None, Some(name)) => Provider::from_name(name)
+            .ok_or_else(|| {
+                usage_error!(
+                    "unknown --oauth2-provider {name:?}; use google or microsoft, \
+                     or pass --oauth2-token-endpoint"
+                )
+            })?
+            .token_endpoint()
+            .to_string(),
+        (None, None) => Provider::from_imap_host(imap_host)
+            .ok_or_else(|| {
+                usage_error!(
+                    "cannot derive an OAuth2 provider from IMAP host {imap_host:?}; \
+                     pass --oauth2-provider or --oauth2-token-endpoint"
+                )
+            })?
+            .token_endpoint()
+            .to_string(),
+    };
+
+    let refresh_token = read_secret_file(refresh_token_file)?;
+    let client_secret = client_secret_file.map(read_secret_file).transpose()?;
+    Ok(Some(TokenProvider::new(
+        OAuth2Config {
+            token_endpoint: endpoint,
+            client_id: client_id.to_string(),
+            client_secret,
+            refresh_token,
+        },
+        runtime.clone(),
+    )))
+}
+
 #[derive(Parser)]
 #[command(name = "mailsift", version, about)]
 struct Cli {
@@ -127,6 +202,95 @@ impl EventTargetArgs {
     }
 }
 
+/// Arguments for the `imap-scan` subcommand. Split out of the
+/// [`Command`] enum (and boxed there) because its flag set is far larger
+/// than any other variant's.
+#[derive(Args)]
+struct ImapScanArgs {
+    /// IMAP URL: `imaps://[user@]host[:port]/[mailbox]`. Without a
+    /// user the current OS user is used; without a mailbox `INBOX`
+    /// is used.
+    url: String,
+    /// File containing the IMAP password. Provide for plain LOGIN;
+    /// omit to authenticate via Kerberos (`gssapi` feature only) or
+    /// pass `--oauth2-token-file` for SASL XOAUTH2 (Gmail etc.).
+    #[arg(long, conflicts_with_all = ["oauth2_token_file", "oauth2_refresh_token_file"], help_heading = "Authentication")]
+    password_file: Option<PathBuf>,
+    /// File containing a fixed OAuth2 bearer token for SASL XOAUTH2.
+    /// The URL must include the account
+    /// (`imaps://you@imap.gmail.com/INBOX`). Tokens expire, so this
+    /// is only suitable for a one-off scan that finishes within the
+    /// token's lifetime; for `--watch` use
+    /// `--oauth2-refresh-token-file` instead. Mutually exclusive with
+    /// the refresh-token flags.
+    #[arg(
+        long,
+        conflicts_with = "oauth2_refresh_token_file",
+        help_heading = "Authentication"
+    )]
+    oauth2_token_file: Option<PathBuf>,
+    /// File containing a long-lived OAuth2 refresh token for SASL
+    /// XOAUTH2. mailsift mints a fresh access token from it at every
+    /// (re)connect, so this survives token expiry across a `--watch`
+    /// session. Requires `--oauth2-client-id`; the provider (token
+    /// endpoint) is derived from the IMAP host for Gmail/Outlook and
+    /// can be overridden with `--oauth2-provider` /
+    /// `--oauth2-token-endpoint`. The URL must include the account.
+    #[arg(long, requires = "oauth2_client_id", help_heading = "Authentication")]
+    oauth2_refresh_token_file: Option<PathBuf>,
+    /// OAuth2 client id of the registered application. Required with
+    /// `--oauth2-refresh-token-file`.
+    #[arg(long, help_heading = "Authentication")]
+    oauth2_client_id: Option<String>,
+    /// File containing the OAuth2 client secret. Google desktop apps
+    /// need one; Microsoft public (native) clients must omit it.
+    #[arg(long, help_heading = "Authentication")]
+    oauth2_client_secret_file: Option<PathBuf>,
+    /// Override the OAuth2 provider instead of deriving it from the
+    /// IMAP host. One of `google` or `microsoft`. Rarely needed; use
+    /// it when the host isn't recognised but is one of these
+    /// providers, or use `--oauth2-token-endpoint` for anything else.
+    #[arg(long, help_heading = "Authentication")]
+    oauth2_provider: Option<String>,
+    /// OAuth2 token endpoint URL, for a provider not derivable from
+    /// the IMAP host (anything other than Gmail/Outlook). Takes
+    /// precedence over `--oauth2-provider` and host derivation.
+    #[arg(long, help_heading = "Authentication")]
+    oauth2_token_endpoint: Option<String>,
+    /// Optional SASL authorization identity for GSSAPI auth.
+    #[arg(long, help_heading = "Authentication")]
+    authzid: Option<String>,
+    /// Only consider messages from this date onward, in IMAP date
+    /// format (e.g. `01-Jan-2026`).
+    #[arg(long)]
+    since: Option<String>,
+    /// Cap on the number of messages to process in the initial
+    /// scan. With `--watch`, the cap applies only to the backfill
+    /// pass; messages arriving while watching are not counted.
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Directory containing extractor scripts.
+    #[arg(long)]
+    extractors: Option<PathBuf>,
+    #[command(flatten)]
+    target: EventTargetArgs,
+    #[command(flatten)]
+    artifacts: ArtifactDirArgs,
+    #[command(flatten)]
+    trackers: TrackerArgs,
+    #[command(flatten)]
+    firefly: FireflyArgs,
+    /// Don't actually file artifacts; just report what would happen.
+    #[arg(long)]
+    dry_run: bool,
+    /// After the initial scan, stay connected and process new
+    /// messages as they arrive (IMAP IDLE, RFC 2177). Runs until
+    /// interrupted (Ctrl-C). On transport errors the connection is
+    /// rebuilt with exponential backoff.
+    #[arg(long)]
+    watch: bool,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Run the pipeline against a saved .eml file.
@@ -154,55 +318,10 @@ enum Command {
         explain: bool,
     },
     /// Walk an IMAP mailbox and run the pipeline over each message.
-    ImapScan {
-        /// IMAP URL: `imaps://[user@]host[:port]/[mailbox]`. Without a
-        /// user the current OS user is used; without a mailbox `INBOX`
-        /// is used.
-        url: String,
-        /// File containing the IMAP password. Provide for plain LOGIN;
-        /// omit to authenticate via Kerberos (`gssapi` feature only) or
-        /// pass `--oauth2-token-file` for SASL XOAUTH2 (Gmail etc.).
-        #[arg(long, conflicts_with = "oauth2_token_file")]
-        password_file: Option<PathBuf>,
-        /// File containing an OAuth2 bearer token for SASL XOAUTH2.
-        /// Required for Gmail; the URL must include the account
-        /// (`imaps://you@imap.gmail.com/INBOX`). Tokens expire; refresh
-        /// before each run.
-        #[arg(long)]
-        oauth2_token_file: Option<PathBuf>,
-        /// Optional SASL authorization identity for GSSAPI auth.
-        #[arg(long)]
-        authzid: Option<String>,
-        /// Only consider messages from this date onward, in IMAP date
-        /// format (e.g. `01-Jan-2026`).
-        #[arg(long)]
-        since: Option<String>,
-        /// Cap on the number of messages to process in the initial
-        /// scan. With `--watch`, the cap applies only to the backfill
-        /// pass; messages arriving while watching are not counted.
-        #[arg(long)]
-        limit: Option<usize>,
-        /// Directory containing extractor scripts.
-        #[arg(long)]
-        extractors: Option<PathBuf>,
-        #[command(flatten)]
-        target: EventTargetArgs,
-        #[command(flatten)]
-        artifacts: ArtifactDirArgs,
-        #[command(flatten)]
-        trackers: TrackerArgs,
-        #[command(flatten)]
-        firefly: FireflyArgs,
-        /// Don't actually file artifacts; just report what would happen.
-        #[arg(long)]
-        dry_run: bool,
-        /// After the initial scan, stay connected and process new
-        /// messages as they arrive (IMAP IDLE, RFC 2177). Runs until
-        /// interrupted (Ctrl-C). On transport errors the connection is
-        /// rebuilt with exponential backoff.
-        #[arg(long)]
-        watch: bool,
-    },
+    // Boxed: this variant's args dwarf the others, so an unboxed
+    // struct-variant trips clippy's `large_enum_variant`. See
+    // [`ImapScanArgs`].
+    ImapScan(Box<ImapScanArgs>),
     /// Validate every discoverable extractor manifest. Parses each
     /// `<name>.yaml`, compiles the `subject_regex`, parses `requires:`
     /// entries, and checks the named script is executable. Reports the
@@ -986,22 +1105,28 @@ fn run() -> Result<()> {
             }
             result
         }
-        Command::ImapScan {
-            url,
-            password_file,
-            oauth2_token_file,
-            #[cfg_attr(not(feature = "gssapi"), allow(unused_variables))]
-            authzid,
-            since,
-            limit,
-            extractors,
-            target,
-            artifacts,
-            trackers,
-            firefly,
-            dry_run,
-            watch,
-        } => {
+        Command::ImapScan(args) => {
+            let ImapScanArgs {
+                url,
+                password_file,
+                oauth2_token_file,
+                oauth2_refresh_token_file,
+                oauth2_client_id,
+                oauth2_client_secret_file,
+                oauth2_provider,
+                oauth2_token_endpoint,
+                #[cfg_attr(not(feature = "gssapi"), allow(unused_variables))]
+                authzid,
+                since,
+                limit,
+                extractors,
+                target,
+                artifacts,
+                trackers,
+                firefly,
+                dry_run,
+                watch,
+            } = *args;
             let sink = target.build_sink(&config, runtime.handle())?;
             let extractors_dir = resolve_extractors(extractors, &config);
             let extractors = discover_required(&extractors_dir)?;
@@ -1017,8 +1142,30 @@ fn run() -> Result<()> {
                 .as_deref()
                 .map(read_secret_file)
                 .transpose()?;
+            // Both XOAUTH2 paths feed a `&dyn TokenSource`: a fixed token
+            // wraps in a StaticTokenProvider, a refresh token in the
+            // minting TokenProvider. Bind both here so they outlive the
+            // borrowed AuthMethod.
+            let static_token_provider = oauth2_token
+                .clone()
+                .map(mailsift::oauth2::StaticTokenProvider::new);
+            let refresh_token_provider = build_token_provider(
+                oauth2_refresh_token_file.as_deref(),
+                oauth2_client_id.as_deref(),
+                oauth2_client_secret_file.as_deref(),
+                oauth2_provider.as_deref(),
+                oauth2_token_endpoint.as_deref(),
+                &target_imap.host,
+                runtime.handle(),
+            )?;
+            let xoauth2_tokens: Option<&dyn mailsift::oauth2::TokenSource> =
+                match (&static_token_provider, &refresh_token_provider) {
+                    (Some(s), _) => Some(s),
+                    (None, Some(r)) => Some(r),
+                    (None, None) => None,
+                };
             let resolved_user = target_imap.user.clone().or_else(current_username);
-            let auth_method = match (&password, &oauth2_token) {
+            let auth_method = match (&password, xoauth2_tokens) {
                 (Some(pw), _) => {
                     let user = resolved_user.as_deref().ok_or_else(|| {
                         usage_error!(
@@ -1028,18 +1175,10 @@ fn run() -> Result<()> {
                     })?;
                     imap_scan::AuthMethod::Login { user, password: pw }
                 }
-                (None, Some(tok)) => {
-                    let user = resolved_user.as_deref().ok_or_else(|| {
-                        usage_error!(
-                            "XOAUTH2 requires a username; include one in the URL \
-                             (imaps://you@imap.gmail.com/INBOX)"
-                        )
-                    })?;
-                    imap_scan::AuthMethod::XOAuth2 {
-                        user,
-                        access_token: tok,
-                    }
-                }
+                (None, Some(tokens)) => imap_scan::AuthMethod::XOAuth2 {
+                    user: xoauth2_user(resolved_user.as_deref())?,
+                    tokens,
+                },
                 #[cfg(feature = "gssapi")]
                 (None, None) => imap_scan::AuthMethod::Gssapi {
                     authzid: authzid.as_deref(),
@@ -1047,8 +1186,8 @@ fn run() -> Result<()> {
                 #[cfg(not(feature = "gssapi"))]
                 (None, None) => {
                     anyhow::bail!(
-                        "no --password-file or --oauth2-token-file given, and this build has \
-                         no GSSAPI support"
+                        "no --password-file, --oauth2-token-file or \
+                         --oauth2-refresh-token-file given, and this build has no GSSAPI support"
                     )
                 }
             };

@@ -121,7 +121,7 @@ history. Spaces in the pasted app password are fine; `--password-file`
 uses the file verbatim after trimming surrounding whitespace. Workspace
 admins can disable app passwords, in which case use OAuth2 below.
 
-**OAuth2 (XOAUTH2).** Pass a short-lived bearer token via
+**OAuth2 (XOAUTH2), fixed token.** Pass a short-lived bearer token via
 `--oauth2-token-file` instead of `--password-file`. The file holds just
 the access token (surrounding whitespace is trimmed):
 
@@ -137,10 +137,31 @@ mailsift imap-scan imaps://you@imap.gmail.com/INBOX \
 flow the first time and caches a refresh token, so later `fetch` calls
 are non-interactive. Workspace accounts can instead use a service
 account with domain-wide delegation. The token file is read once at
-startup and Gmail access tokens expire after ~1 hour, so refresh it
-before each run. For the same reason a long `--watch` session outlives
-its token; prefer the app-password route (or a cron'd token refresh +
-re-run) if you want to watch Gmail continuously.
+startup and Gmail access tokens expire after ~1 hour, so this mode only
+fits a one-off scan that finishes within the token's lifetime. For a
+long `--watch` session, use the refresh-token mode below.
+
+**OAuth2 (XOAUTH2), refresh token.** Give mailsift a long-lived refresh
+token plus your app's client id (and, for Google, its client secret) and
+it mints a fresh access token at every connect, so it survives token
+expiry across reconnects and `--watch` sessions. The provider's token
+endpoint is derived from the IMAP host for Gmail and Outlook; override
+it with `--oauth2-provider google|microsoft` or a full
+`--oauth2-token-endpoint` for anything else.
+
+```sh
+mailsift imap-scan imaps://you@imap.gmail.com/INBOX \
+    --oauth2-refresh-token-file ~/.config/mailsift/gmail.refresh \
+    --oauth2-client-id "$CLIENT_ID.apps.googleusercontent.com" \
+    --oauth2-client-secret-file ~/.config/mailsift/gmail.secret \
+    --watch
+```
+
+Obtaining the refresh token itself still needs a one-time browser
+consent; `oauth2l`, the provider's OAuth playground, or any OAuth2
+client library can produce one. Google desktop-app clients carry a
+client secret; Microsoft public (native) clients omit
+`--oauth2-client-secret-file`.
 
 A progress bar shows scan progress when stderr is a TTY; one summary
 line per message names the UID, extractor, and what was extracted:
