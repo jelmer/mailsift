@@ -121,9 +121,40 @@ history. Spaces in the pasted app password are fine; `--password-file`
 uses the file verbatim after trimming surrounding whitespace. Workspace
 admins can disable app passwords, in which case use OAuth2 below.
 
-**OAuth2 (XOAUTH2).** Pass a short-lived bearer token via
-`--oauth2-token-file` instead of `--password-file`. The file holds just
-the access token (surrounding whitespace is trimmed):
+**OAuth2 (XOAUTH2), recommended.** Run `mailsift imap-auth` once to do
+the browser consent flow and write a JSON credential bundle, then point
+`imap-scan` at it. mailsift mints a fresh access token at every connect,
+so this survives token expiry across reconnects and `--watch` sessions.
+
+```sh
+mailsift imap-auth you@gmail.com \
+    --client-id "$CLIENT_ID.apps.googleusercontent.com" \
+    --client-secret-file ~/.config/mailsift/gmail.client-secret \
+    --output ~/.config/mailsift/gmail.json
+mailsift imap-scan imaps://you@imap.gmail.com/INBOX \
+    --oauth2-credentials-file ~/.config/mailsift/gmail.json --watch
+```
+
+`imap-auth` starts a temporary server on `127.0.0.1`, opens your browser
+at the provider's consent screen, and captures the result; pass
+`--no-browser` to print the URL and paste the redirect back instead (for
+headless / SSH sessions). The provider is derived from the account
+domain, or name it with `--provider google|microsoft`. The client id and
+secret come from an OAuth2 client you register with the provider (a
+"Desktop app" client for Google; a public/native client for Microsoft,
+which has no secret so you omit `--client-secret-file`). The bundle is
+written owner-readable and holds a long-lived refresh token, so keep it
+somewhere private.
+
+The bundle can also be assembled by hand (or from an existing refresh
+token) with the discrete flags: `--oauth2-refresh-token-file`,
+`--oauth2-client-id`, `--oauth2-client-secret-file`, and either an
+IMAP-host-derived provider or an explicit `--oauth2-provider` /
+`--oauth2-token-endpoint`.
+
+**OAuth2 (XOAUTH2), fixed token.** For a one-off scan that finishes
+within an hour, pass a short-lived bearer token via `--oauth2-token-file`
+instead. The file holds just the access token (whitespace trimmed):
 
 ```sh
 oauth2l fetch --type=bearer \
@@ -133,14 +164,9 @@ mailsift imap-scan imaps://you@imap.gmail.com/INBOX \
     --oauth2-token-file ~/.cache/mailsift/gmail.token --since 01-Jan-2026
 ```
 
-[`oauth2l`](https://github.com/google/oauth2l) runs the browser consent
-flow the first time and caches a refresh token, so later `fetch` calls
-are non-interactive. Workspace accounts can instead use a service
-account with domain-wide delegation. The token file is read once at
-startup and Gmail access tokens expire after ~1 hour, so refresh it
-before each run. For the same reason a long `--watch` session outlives
-its token; prefer the app-password route (or a cron'd token refresh +
-re-run) if you want to watch Gmail continuously.
+Gmail access tokens expire after ~1 hour and the file is read once at
+startup, so a long `--watch` session outlives it; use the credential
+bundle above for that.
 
 A progress bar shows scan progress when stderr is a TTY; one summary
 line per message names the UID, extractor, and what was extracted:
