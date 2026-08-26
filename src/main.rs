@@ -57,6 +57,15 @@ fn xoauth2_user(resolved_user: Option<&str>) -> Result<&str> {
     })
 }
 
+/// clap value parser for `--socket-mode`. Accepts octal digits with or
+/// without a `0`/`0o` prefix (`0666`, `0o660`, `660` all mean 0o660).
+#[cfg(feature = "web")]
+fn parse_octal_mode(raw: &str) -> Result<u32, String> {
+    let s = raw.trim_start_matches("0o").trim_start_matches('0');
+    let s = if s.is_empty() { "0" } else { s };
+    u32::from_str_radix(s, 8).map_err(|e| format!("invalid octal mode {raw:?}: {e}"))
+}
+
 /// The `--oauth2-*` flags of `imap-scan`, borrowed for
 /// [`build_token_provider`].
 struct OAuth2ScanFlags<'a> {
@@ -503,6 +512,29 @@ enum Command {
         /// the milter writes to.
         #[arg(long)]
         log: Option<PathBuf>,
+    },
+    /// Serve a read-only HTTP dashboard over the configured artifact
+    /// directories (events, bills, parcels, receipts, subscriptions,
+    /// tickets). Rescans on every request; safe to leave running
+    /// alongside the milter or an `imap-scan --watch`.
+    #[cfg(feature = "web")]
+    Web {
+        /// Listen address: `host:port` for TCP or `unix:/path/to/sock`
+        /// for a unix socket.
+        #[arg(long, default_value = "127.0.0.1:8088")]
+        listen: String,
+        /// Permission bits for the unix socket, in octal. Default 0666
+        /// so a reverse proxy running as a different user can connect;
+        /// tighten (e.g. 0660 with a shared group) for multi-user hosts.
+        /// Ignored for TCP listens.
+        #[arg(long, value_parser = parse_octal_mode)]
+        socket_mode: Option<u32>,
+        /// URL prefix under which the app is mounted (e.g. `/mailsift`).
+        /// Every generated link is prefixed with this so the app works
+        /// behind a reverse proxy that only forwards a sub-path. Empty
+        /// or `/` means serve at the site root.
+        #[arg(long, default_value = "")]
+        base_path: String,
     },
     /// Run as a Postfix milter.
     Milter {
@@ -1440,6 +1472,17 @@ fn run() -> Result<()> {
                 },
                 dry_run,
             })
+        }
+        #[cfg(feature = "web")]
+        Command::Web {
+            listen,
+            socket_mode,
+            base_path,
+        } => {
+            let listen = mailsift::web::Listen::parse(&listen)?;
+            let base_path = mailsift::web::normalise_base_path(&base_path);
+            let config = std::sync::Arc::new(config);
+            runtime.block_on(mailsift::web::serve(listen, config, base_path, socket_mode))
         }
         Command::Milter {
             socket,

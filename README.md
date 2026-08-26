@@ -223,6 +223,33 @@ constraints (it sees mail before the local MTA's DKIM check has run), so
 it skips that check. Use `replay`/`imap-scan` for retroactive runs that
 do want DKIM enforcement.
 
+### `web`: browse extracted artifacts
+
+Build with the optional `web` feature:
+
+```sh
+cargo install --path . --features web
+```
+
+Then serve a read-only HTML dashboard over the configured
+`bills_dir` / `parcels_dir` / `receipts_dir` / `subscriptions_dir` /
+`events_dir` / `tickets_dir`:
+
+```sh
+mailsift web --listen 127.0.0.1:8088          # TCP
+mailsift web --listen unix:/run/mailsift.sock  # unix socket
+```
+
+The dashboard rescans the artifact directories on every request, so
+it happily sits alongside a running milter or `imap-scan --watch`.
+JSON views are exposed at `/api/bills.json`, `/api/parcels.json`,
+`/api/receipts.json`, and `/api/subscriptions.json` for scripting.
+Raw `.ics` and ticket blobs are served with their proper
+Content-Type so a browser can open them directly.
+
+No authentication is built in; bind to loopback (or put it behind a
+reverse proxy) if the artifacts are personal.
+
 ### Dovecot Sieve
 
 There is no dedicated Sieve mode: `replay -` already fits the Sieve

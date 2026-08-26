@@ -15,3 +15,5 @@ pub mod seen;
 pub mod stats;
 pub mod targets;
 pub mod unforward;
+#[cfg(feature = "web")]
+pub mod web;
