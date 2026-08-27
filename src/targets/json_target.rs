@@ -37,6 +37,37 @@ where
     chrono::Utc::now().year()
 }
 
+/// Format a unix timestamp as an RFC3339 string for use as a
+/// `receivedAt` field.
+pub fn format_received_at(epoch: i64) -> Option<String> {
+    let dt = chrono::DateTime::from_timestamp(epoch, 0)?;
+    Some(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+/// Inject `receivedAt = <RFC3339 string>` into the JSON body iff the
+/// field isn't already set (extractor precedence wins). Silently
+/// returns the input untouched when the body isn't a JSON object or
+/// when no epoch is supplied.
+pub fn body_with_received_at(body: &str, received_at_epoch: Option<i64>) -> String {
+    let Some(epoch) = received_at_epoch else {
+        return body.to_string();
+    };
+    let Some(stamped) = format_received_at(epoch) else {
+        return body.to_string();
+    };
+    let mut value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return body.to_string(),
+    };
+    if let Some(obj) = value.as_object_mut()
+        && !obj.contains_key("receivedAt")
+    {
+        obj.insert("receivedAt".into(), serde_json::Value::String(stamped));
+        return serde_json::to_string_pretty(&value).unwrap_or_else(|_| body.to_string());
+    }
+    body.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,5 +99,44 @@ mod tests {
     #[test]
     fn derive_year_picks_first_parseable() {
         assert_eq!(derive_year([Some("bad"), Some("2024-01-01")]), 2024);
+    }
+
+    #[test]
+    fn format_received_at_produces_rfc3339() {
+        // 2026-08-27T09:30:00Z
+        assert_eq!(
+            format_received_at(1787823000).as_deref(),
+            Some("2026-08-27T09:30:00Z")
+        );
+    }
+
+    #[test]
+    fn body_with_received_at_injects_field_once() {
+        let body = r#"{"payee":"Acme","invoiceNumber":"INV1"}"#;
+        let stamped = body_with_received_at(body, Some(1787823000));
+        let v: serde_json::Value = serde_json::from_str(&stamped).unwrap();
+        assert_eq!(v["receivedAt"], "2026-08-27T09:30:00Z");
+        assert_eq!(v["payee"], "Acme");
+    }
+
+    #[test]
+    fn body_with_received_at_preserves_existing() {
+        let body = r#"{"payee":"Acme","receivedAt":"2020-01-01T00:00:00Z"}"#;
+        let stamped = body_with_received_at(body, Some(1787823000));
+        let v: serde_json::Value = serde_json::from_str(&stamped).unwrap();
+        assert_eq!(v["receivedAt"], "2020-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn body_with_received_at_noop_without_epoch() {
+        let body = r#"{"payee":"Acme"}"#;
+        assert_eq!(body_with_received_at(body, None), body);
+    }
+
+    #[test]
+    fn body_with_received_at_noop_when_not_object() {
+        let body = "42";
+        let stamped = body_with_received_at(body, Some(1787823000));
+        assert_eq!(stamped, "42");
     }
 }

@@ -223,6 +223,11 @@ pub fn run(
 
     let (from_domain, subject) = parse_match_headers_from_parsed(&parsed_headers);
 
+    // Message receive date (from the `Date:` header). Used to stamp
+    // every filed JSON artifact with `receivedAt` so the web UI (and
+    // any other reader) can sort by "when did this arrive".
+    let received_at_epoch = message_date_epoch(&parsed_headers);
+
     // Stamp every recorded event with the same `ts` so a single
     // message's per-extractor lines cluster in the log. SystemTime
     // failures (clock before 1970) collapse to 0.
@@ -412,7 +417,14 @@ pub fn run(
             bill_arts,
             bills_dir,
             |artifact, dir| {
-                router::file_bill_artifact(&run.extractor, artifact, dir, firefly, &mut summary);
+                router::file_bill_artifact(
+                    &run.extractor,
+                    artifact,
+                    dir,
+                    firefly,
+                    received_at_epoch,
+                    &mut summary,
+                );
             },
         );
 
@@ -422,7 +434,14 @@ pub fn run(
             parcel_arts,
             parcels_dir,
             |artifact, dir| {
-                router::file_parcel_artifact(&run.extractor, artifact, dir, trackers, &mut summary);
+                router::file_parcel_artifact(
+                    &run.extractor,
+                    artifact,
+                    dir,
+                    trackers,
+                    received_at_epoch,
+                    &mut summary,
+                );
             },
         );
 
@@ -432,7 +451,13 @@ pub fn run(
             subscription_arts,
             subscriptions_dir,
             |artifact, dir| {
-                router::file_subscription_artifact(&run.extractor, artifact, dir, &mut summary);
+                router::file_subscription_artifact(
+                    &run.extractor,
+                    artifact,
+                    dir,
+                    received_at_epoch,
+                    &mut summary,
+                );
             },
         );
 
@@ -442,7 +467,14 @@ pub fn run(
             receipt_arts,
             receipts,
             |artifact, sink| {
-                router::file_receipt_artifact(&run.extractor, artifact, raw, sink, &mut summary);
+                router::file_receipt_artifact(
+                    &run.extractor,
+                    artifact,
+                    raw,
+                    sink,
+                    received_at_epoch,
+                    &mut summary,
+                );
             },
         );
 
@@ -579,16 +611,21 @@ fn collect_parts(mail: &mailparse::ParsedMail<'_>, out: &mut extractor::BodyPart
     }
 }
 
-/// Read a year from the message's `Date:` header. Best-effort; returns
-/// `None` if the header is missing or unparseable.
-fn message_date_year(headers: &[mailparse::MailHeader<'_>]) -> Option<i32> {
-    use chrono::Datelike;
+/// Read the message's `Date:` header as unix seconds. Best-effort;
+/// returns `None` if the header is missing or unparseable.
+pub(crate) fn message_date_epoch(headers: &[mailparse::MailHeader<'_>]) -> Option<i64> {
     let date_value = headers
         .iter()
         .find(|h| h.get_key_ref().eq_ignore_ascii_case("date"))?
         .get_value();
-    let dt = mailparse::dateparse(&date_value).ok()?;
-    let dt = chrono::DateTime::from_timestamp(dt, 0)?;
+    mailparse::dateparse(&date_value).ok()
+}
+
+/// Read a year from the message's `Date:` header. Best-effort; returns
+/// `None` if the header is missing or unparseable.
+fn message_date_year(headers: &[mailparse::MailHeader<'_>]) -> Option<i32> {
+    use chrono::Datelike;
+    let dt = chrono::DateTime::from_timestamp(message_date_epoch(headers)?, 0)?;
     Some(dt.year())
 }
 

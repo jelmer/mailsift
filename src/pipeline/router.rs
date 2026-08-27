@@ -173,9 +173,10 @@ pub(super) fn file_bill_artifact(
     artifact: &Artifact,
     bills_dir: &Path,
     firefly: Option<&crate::targets::firefly::FireflySink>,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
-    match bills::file_bill(&artifact.path, bills_dir, firefly) {
+    match bills::file_bill(&artifact.path, bills_dir, firefly, received_at_epoch) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_BILL);
         }
@@ -195,9 +196,10 @@ pub(super) fn file_parcel_artifact(
     artifact: &Artifact,
     parcels_dir: &Path,
     trackers: Option<&crate::targets::trackers::Trackers>,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
-    match parcels::file_parcel(&artifact.path, parcels_dir, trackers) {
+    match parcels::file_parcel(&artifact.path, parcels_dir, trackers, received_at_epoch) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_PARCEL);
         }
@@ -259,9 +261,10 @@ pub(super) fn file_receipt_artifact(
     artifact: &Artifact,
     raw_message: &[u8],
     sink: &receipts::ReceiptSink,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
-    match sink.file_receipt(&artifact.path, raw_message) {
+    match sink.file_receipt(&artifact.path, raw_message, received_at_epoch) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_RECEIPT);
         }
@@ -280,9 +283,10 @@ pub(super) fn file_subscription_artifact(
     extractor: &str,
     artifact: &Artifact,
     subscriptions_dir: &Path,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
-    match subscriptions::file_subscription(&artifact.path, subscriptions_dir) {
+    match subscriptions::file_subscription(&artifact.path, subscriptions_dir, received_at_epoch) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_SUBSCRIPTION);
         }

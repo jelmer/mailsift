@@ -163,6 +163,25 @@ calendar events. If you want a bill's due date to show on the calendar,
 emit both a `.bill.json` *and* a `.event.ics` from the same run -
 explicit beats clever.
 
+### Recommended optional fields
+
+The core fields above are the minimum. Everything else is passed through
+untouched, but a handful of extra keys light up the downstream tooling
+(web dashboard, calendar sinks, tracker registration) without any
+kind-specific plumbing:
+
+- `url` (any kind): a link to view or manage the artifact on the
+  vendor's site. The web dashboard renders it as an "open" link next
+  to the raw JSON. Kind-specific aliases are also honoured:
+  `trackingUrl` for parcels, `orderUrl` for receipts, `paymentUrl` /
+  `invoice.url` for bills, `managementUrl` for subscriptions.
+  Non-`http(s)` URLs are silently dropped.
+- For parcels: `trackingUrl` is the carrier's public tracking page.
+  Extractors that can extract or synthesise one directly should; if
+  they don't, mailsift synthesises one from `provider.@id` +
+  `trackingNumber` for the well-known carriers (Royal Mail, DPD,
+  Evri, and a few others).
+
 ### Dedup is mailsift's job, not yours
 
 Extractors don't deal with duplicate detection, the on-disk layout, or

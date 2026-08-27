@@ -41,7 +41,11 @@ impl Subscription {
     }
 }
 
-pub fn file_subscription(src: &Path, dir: &Path) -> Result<FileOutcome> {
+pub fn file_subscription(
+    src: &Path,
+    dir: &Path,
+    received_at_epoch: Option<i64>,
+) -> Result<FileOutcome> {
     let body = fs::read_to_string(src)
         .with_context(|| format!("reading subscription source {}", src.display()))?;
     let parsed: Subscription = serde_json::from_str(&body)
@@ -61,7 +65,8 @@ pub fn file_subscription(src: &Path, dir: &Path) -> Result<FileOutcome> {
 
     let target = dir.join(format!("{slug}.json"));
     let existed = target.exists();
-    write_atomic(&target, body.as_bytes())?;
+    let body_out = super::json_target::body_with_received_at(&body, received_at_epoch);
+    write_atomic(&target, body_out.as_bytes())?;
 
     let label = target.display().to_string();
     if existed {
@@ -107,7 +112,7 @@ mod tests {
         .unwrap();
         let dir = tmp.path().join("subs");
         fs::create_dir_all(&dir).unwrap();
-        let outcome = file_subscription(&src, &dir).unwrap();
+        let outcome = file_subscription(&src, &dir, None).unwrap();
         assert!(matches!(outcome, FileOutcome::Created(_)));
         let body = fs::read_to_string(dir.join("netflix.json")).unwrap();
         assert!(body.contains("Netflix"));

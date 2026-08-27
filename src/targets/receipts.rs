@@ -71,7 +71,12 @@ impl ReceiptSink {
     /// Only the [`ReceiptSink::Forward`] variant uses it; the
     /// LocalDir and WebDAV variants ignore it. Threading it through
     /// the API uniformly keeps the pipeline call site simple.
-    pub fn file_receipt(&self, src: &Path, raw_message: &[u8]) -> Result<FileOutcome> {
+    pub fn file_receipt(
+        &self,
+        src: &Path,
+        raw_message: &[u8],
+        received_at_epoch: Option<i64>,
+    ) -> Result<FileOutcome> {
         let body = fs::read_to_string(src)
             .with_context(|| format!("reading receipt source {}", src.display()))?;
         let receipt: Receipt = serde_json::from_str(&body)
@@ -96,10 +101,18 @@ impl ReceiptSink {
 
         match self {
             ReceiptSink::LocalDir(dir) => {
-                file_to_dir(&merchant_slug, &order_slug, year, body.as_bytes(), dir)
+                let body_out = super::json_target::body_with_received_at(&body, received_at_epoch);
+                file_to_dir(&merchant_slug, &order_slug, year, body_out.as_bytes(), dir)
             }
             ReceiptSink::Webdav(sink) => {
-                file_to_webdav(&merchant_slug, &order_slug, year, body.into_bytes(), sink)
+                let body_out = super::json_target::body_with_received_at(&body, received_at_epoch);
+                file_to_webdav(
+                    &merchant_slug,
+                    &order_slug,
+                    year,
+                    body_out.into_bytes(),
+                    sink,
+                )
             }
             ReceiptSink::Forward(fwd) => {
                 let hint = mail_forward::subject_hint(raw_message);
@@ -179,7 +192,7 @@ mod tests {
         .unwrap();
 
         let sink = ReceiptSink::LocalDir(tmp.path().to_path_buf());
-        let outcome = sink.file_receipt(&src, b"").unwrap();
+        let outcome = sink.file_receipt(&src, b"", None).unwrap();
         let path = match outcome {
             FileOutcome::Created(p) => p,
             FileOutcome::Updated(_) => panic!("expected Created on first write"),

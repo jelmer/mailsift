@@ -74,7 +74,12 @@ impl Bill {
     }
 }
 
-pub fn file_bill(src: &Path, dir: &Path, firefly: Option<&FireflySink>) -> Result<FileOutcome> {
+pub fn file_bill(
+    src: &Path,
+    dir: &Path,
+    firefly: Option<&FireflySink>,
+    received_at_epoch: Option<i64>,
+) -> Result<FileOutcome> {
     let body = fs::read_to_string(src)
         .with_context(|| format!("reading bill source {}", src.display()))?;
     let bill: Bill = serde_json::from_str(&body)
@@ -102,7 +107,8 @@ pub fn file_bill(src: &Path, dir: &Path, firefly: Option<&FireflySink>) -> Resul
         .join(format!("{payee_slug}-{invoice_slug}.json"));
 
     let existed = target.exists();
-    write_atomic(&target, body.as_bytes())?;
+    let body_out = super::json_target::body_with_received_at(&body, received_at_epoch);
+    write_atomic(&target, body_out.as_bytes())?;
 
     // Best-effort Firefly registration. We try on every filing (not
     // just on creation) because the Firefly side does its own
@@ -164,5 +170,23 @@ mod tests {
         let bill: Bill = serde_json::from_value(serde_json::json!({"dueDate": "2024-12-05"}))
             .expect("valid bill");
         assert_eq!(derive_year(bill.date_candidates()), 2024);
+    }
+
+    #[test]
+    fn file_bill_stamps_received_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("bill.json");
+        std::fs::write(
+            &src,
+            br#"{"payee":"Acme","invoiceNumber":"INV1","dueDate":"2024-12-05"}"#,
+        )
+        .unwrap();
+        let dir = tmp.path().join("out");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 2024-11-01T00:00:00Z
+        file_bill(&src, &dir, None, Some(1730419200)).unwrap();
+        let body = std::fs::read_to_string(dir.join("2024/acme-inv1.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["receivedAt"], "2024-11-01T00:00:00Z");
     }
 }
