@@ -182,7 +182,7 @@ pub fn run(
     extractors: &[extractor::Extractor],
     targets: PipelineTargets<'_>,
     dkim_policy: DkimPolicy,
-    _dry_run: bool,
+    dry_run: bool,
     mut explain: Option<&mut Vec<ExplainRecord>>,
 ) -> Result<()> {
     let PipelineTargets {
@@ -254,7 +254,7 @@ pub fn run(
 
     debug!(count = extractors.len(), "running extractors");
 
-    let mut summary = router::Summary::default();
+    let mut summary = router::Summary::new(dry_run);
 
     for ex in extractors {
         if !ex.matches_headers(from_domain.as_deref(), subject.as_deref()) {
@@ -545,7 +545,14 @@ pub fn run(
     }
 
     if !summary.is_empty() {
-        info!("extracted from {source}: {}", summary.render());
+        if dry_run {
+            info!(
+                "[dry-run] would extract from {source}: {}",
+                summary.render()
+            );
+        } else {
+            info!("extracted from {source}: {}", summary.render());
+        }
     }
 
     Ok(())
