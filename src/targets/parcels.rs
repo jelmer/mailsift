@@ -91,6 +91,15 @@ pub fn file_parcel(
     {
         obj.insert("receivedAt".into(), Value::String(stamped));
     }
+    // Synthesise a trackingUrl for well-known carriers when the
+    // extractor didn't supply one. Extractor-provided URLs always win.
+    if let Some(obj) = incoming.as_object_mut()
+        && !obj.contains_key("trackingUrl")
+        && let Some(carrier) = parcel.carrier_id()
+        && let Some(url) = tracking_url_for(carrier, tracking)
+    {
+        obj.insert("trackingUrl".into(), Value::String(url));
+    }
 
     let target = dir.join(format!("{tracking_slug}.json"));
     let existed = target.exists();
@@ -172,6 +181,38 @@ fn with_initial_history(incoming: Value) -> Value {
     Value::Object(obj)
 }
 
+/// Synthesise a public tracking URL for well-known carriers.
+///
+/// Returns `None` for carriers we don't have a template for; the
+/// extractor is welcome to provide a `trackingUrl` of its own for any
+/// carrier, which always wins over this fallback.
+///
+/// URLs are the ones the carrier hands out to customers on their
+/// public tracking page; format changes on their side are the failure
+/// mode. Keep the list short and only add carriers with a stable,
+/// tracking-number-only URL scheme.
+fn tracking_url_for(carrier: &str, tracking: &str) -> Option<String> {
+    let enc = percent_encoding::utf8_percent_encode(tracking, percent_encoding::NON_ALPHANUMERIC)
+        .to_string();
+    let url = match carrier {
+        "royal-mail" => {
+            format!("https://www.royalmail.com/track-your-item#/tracking-results/{enc}")
+        }
+        "dpd" => format!("https://www.dpd.co.uk/service/tracking?parcel={enc}"),
+        "postnl" => format!("https://jouw.postnl.nl/track-and-trace/{enc}-NL-NL"),
+        "evri" | "hermes" => format!("https://www.evri.com/track/parcel/{enc}"),
+        "parcelforce" => format!("https://www.parcelforce.com/track-trace?trackNumber={enc}"),
+        "yodel" => format!("https://www.yodel.co.uk/tracking/{enc}"),
+        "dhl" => format!("https://www.dhl.com/en/express/tracking.html?AWB={enc}"),
+        "ups" => format!("https://www.ups.com/track?tracknum={enc}"),
+        "fedex" => format!("https://www.fedex.com/fedextrack/?trknbr={enc}"),
+        "usps" => format!("https://tools.usps.com/go/TrackConfirmAction?tLabels={enc}"),
+        "amazon" => format!("https://www.amazon.co.uk/progress-tracker/package/{enc}"),
+        _ => return None,
+    };
+    Some(url)
+}
+
 fn history_entry_from(obj: &Map<String, Value>) -> Value {
     let mut entry = Map::new();
     entry.insert(
@@ -195,6 +236,69 @@ fn history_entry_from(obj: &Map<String, Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracking_url_synthesised_for_known_carrier() {
+        assert!(
+            tracking_url_for("royal-mail", "TQ123GB")
+                .unwrap()
+                .contains("TQ123GB")
+        );
+        assert!(
+            tracking_url_for("dpd", "15500806388448")
+                .unwrap()
+                .contains("15500806388448")
+        );
+    }
+
+    #[test]
+    fn tracking_url_none_for_unknown_carrier() {
+        assert!(tracking_url_for("moon-post", "X").is_none());
+    }
+
+    #[test]
+    fn tracking_url_percent_encodes_special_chars() {
+        let url = tracking_url_for("royal-mail", "AB 12/34").unwrap();
+        assert!(url.contains("AB%2012%2F34"), "got: {url}");
+    }
+
+    #[test]
+    fn file_parcel_stamps_tracking_url_for_known_carrier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in.json");
+        std::fs::write(
+            &src,
+            br#"{"trackingNumber":"TQ123GB","deliveryStatus":"OnItsWay",
+                 "provider":{"@id":"royal-mail","name":"Royal Mail"}}"#,
+        )
+        .unwrap();
+        let dir = tmp.path().join("out");
+        std::fs::create_dir_all(&dir).unwrap();
+        file_parcel(&src, &dir, None, None).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("TQ123GB.json")).unwrap())
+                .unwrap();
+        assert!(v["trackingUrl"].as_str().unwrap().contains("TQ123GB"));
+    }
+
+    #[test]
+    fn file_parcel_leaves_extractor_tracking_url_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in.json");
+        std::fs::write(
+            &src,
+            br#"{"trackingNumber":"TQ123GB","provider":{"@id":"royal-mail"},
+                 "trackingUrl":"https://example.org/custom"}"#,
+        )
+        .unwrap();
+        let dir = tmp.path().join("out");
+        std::fs::create_dir_all(&dir).unwrap();
+        file_parcel(&src, &dir, None, None).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("TQ123GB.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["trackingUrl"], "https://example.org/custom");
+    }
 
     #[test]
     fn tracking_from_serde() {
