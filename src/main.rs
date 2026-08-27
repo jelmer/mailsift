@@ -442,6 +442,39 @@ enum Command {
     /// Obtain an OAuth2 refresh token via the browser consent flow and
     /// write a credential bundle for `imap-scan --oauth2-credentials-file`.
     ImapAuth(ImapAuthArgs),
+    /// Walk a Maildir on disk and run the pipeline over each message.
+    ///
+    /// Useful for one-off backfills against archived mail. Reads
+    /// `cur/` and `new/` (`tmp/` is skipped) and, with `--recurse`,
+    /// descends into Maildir++ subfolders (`.name/cur`, `.name/new`).
+    MaildirScan {
+        /// Path to the Maildir root (contains `cur/`, `new/`, `tmp/`).
+        path: PathBuf,
+        /// Also process Maildir++ subfolders (`.foo/cur`, `.foo/new`).
+        #[arg(long)]
+        recurse: bool,
+        /// Skip messages whose file mtime is older than this
+        /// `YYYY-MM-DD` date.
+        #[arg(long)]
+        since: Option<String>,
+        /// Cap on the number of messages to process.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Directory containing extractor scripts.
+        #[arg(long)]
+        extractors: Option<PathBuf>,
+        #[command(flatten)]
+        target: EventTargetArgs,
+        #[command(flatten)]
+        artifacts: ArtifactDirArgs,
+        #[command(flatten)]
+        trackers: TrackerArgs,
+        #[command(flatten)]
+        firefly: FireflyArgs,
+        /// Don't actually file artifacts; just report what would happen.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Validate every discoverable extractor manifest. Parses each
     /// `<name>.yaml`, compiles the `subject_regex`, parses `requires:`
     /// entries, and checks the named script is executable. Reports the
@@ -879,6 +912,20 @@ fn discover_required(dirs: &[PathBuf]) -> Result<Vec<mailsift::extractor::Extrac
         ));
     }
     Ok(extractors)
+}
+
+/// Parse a `YYYY-MM-DD` date into the local-midnight `SystemTime` we
+/// compare Maildir mtimes against.
+fn parse_since_date(s: &str) -> Result<std::time::SystemTime> {
+    use chrono::{Local, NaiveDate, TimeZone};
+    let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .with_context(|| format!("parsing --since {s:?} (want YYYY-MM-DD)"))?;
+    let dt = date.and_hms_opt(0, 0, 0).expect("00:00:00 is a valid time");
+    let local = Local
+        .from_local_datetime(&dt)
+        .single()
+        .ok_or_else(|| anyhow!("{s} is ambiguous or non-existent in local time"))?;
+    Ok(local.into())
 }
 
 /// Print a per-extractor dispatch table from a `replay --explain` run.
@@ -1343,6 +1390,50 @@ fn run() -> Result<()> {
             })
         }
         Command::ImapAuth(args) => run_imap_auth(args, runtime.handle()),
+        Command::MaildirScan {
+            path,
+            recurse,
+            since,
+            limit,
+            extractors,
+            target,
+            artifacts,
+            trackers,
+            firefly,
+            dry_run,
+        } => {
+            let sink = target.build_sink(&config, runtime.handle())?;
+            let extractors_dir = resolve_extractors(extractors, &config);
+            let extractors = discover_required(&extractors_dir)?;
+            let dirs = artifacts.resolve(&config, runtime.handle())?;
+            let trackers = build_trackers(&trackers, &config, runtime.handle())?;
+            let firefly = build_firefly(&firefly, &config, runtime.handle())?;
+            let since = since.as_deref().map(parse_since_date).transpose()?;
+            mailsift::maildir_scan::run(mailsift::maildir_scan::MaildirScanConfig {
+                root: &path,
+                recurse,
+                since,
+                limit,
+                extractors: &extractors,
+                targets: pipeline::PipelineTargets {
+                    event_sink: &sink,
+                    bills_dir: dirs.bills.as_deref(),
+                    parcels_dir: dirs.parcels.as_deref(),
+                    subscriptions_dir: dirs.subscriptions.as_deref(),
+                    receipts: dirs.receipts.as_ref(),
+                    tickets: dirs.tickets.as_ref(),
+                    firefly: firefly.as_ref(),
+                    trackers: (!trackers.is_empty()).then_some(&trackers),
+                    trusted_forwarders: &config.trusted_forwarders,
+                    // Bulk import: mirror imap-scan's stance (don't
+                    // pollute the milter's stats, don't use its dedup
+                    // store; upstream sinks are already idempotent).
+                    recorder: &mailsift::stats::Recorder::Disabled,
+                    seen: None,
+                },
+                dry_run,
+            })
+        }
         Command::Milter {
             socket,
             extractors,

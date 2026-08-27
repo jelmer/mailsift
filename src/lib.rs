@@ -6,6 +6,7 @@ pub mod extractor;
 #[cfg(feature = "gssapi")]
 pub mod gss;
 pub mod imap_scan;
+pub mod maildir_scan;
 pub mod milter;
 pub mod oauth2;
 pub mod pipeline;

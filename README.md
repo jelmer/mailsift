@@ -192,6 +192,21 @@ Watch refuses to continue if the mailbox's `UIDVALIDITY` changes
 between reconnects (server restored from backup or renumbered the
 mailbox); restart manually in that case.
 
+### `maildir-scan`: walk a Maildir on disk
+
+```sh
+mailsift maildir-scan /srv/mail/jelmer/Maildir
+mailsift maildir-scan /srv/mail/jelmer/Maildir --recurse
+mailsift maildir-scan /srv/mail/jelmer/Maildir --recurse --since 2026-01-01
+```
+
+Reads `cur/` and `new/` (`tmp/` is skipped) and runs each message
+through the pipeline. With `--recurse`, also descends into Maildir++
+subfolders (`.name/cur`, `.name/new`); non-Maildir dotdirs are skipped.
+Useful for one-off backfills against archived mail without going through
+an IMAP server. Like `imap-scan`, this mode bypasses the milter's dedup
+store and stats recorder; upstream sinks (CalDAV etc.) are idempotent.
+
 ### `milter`: Postfix milter
 
 ```sh
