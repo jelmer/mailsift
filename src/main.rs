@@ -911,6 +911,11 @@ fn discover_required(dirs: &[PathBuf]) -> Result<Vec<mailsift::extractor::Extrac
             render_paths(dirs)
         ));
     }
+    tracing::info!(
+        count = extractors.len(),
+        dirs = %render_paths(dirs),
+        "loaded extractors"
+    );
     Ok(extractors)
 }
 
