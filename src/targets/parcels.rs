@@ -61,6 +61,7 @@ pub fn file_parcel(
     src: &Path,
     dir: &Path,
     trackers: Option<&super::trackers::Trackers>,
+    received_at_epoch: Option<i64>,
 ) -> Result<FileOutcome> {
     let body = fs::read_to_string(src)
         .with_context(|| format!("reading parcel source {}", src.display()))?;
@@ -79,8 +80,17 @@ pub fn file_parcel(
         );
     }
 
-    let incoming: Value = serde_json::from_str(&body)
+    let mut incoming: Value = serde_json::from_str(&body)
         .with_context(|| format!("parsing parcel JSON {}", src.display()))?;
+    // Stamp incoming with `receivedAt` before merge/init so that the
+    // history entry we mint from it inherits the same timestamp.
+    if let Some(epoch) = received_at_epoch
+        && let Some(stamped) = super::json_target::format_received_at(epoch)
+        && let Some(obj) = incoming.as_object_mut()
+        && !obj.contains_key("receivedAt")
+    {
+        obj.insert("receivedAt".into(), Value::String(stamped));
+    }
 
     let target = dir.join(format!("{tracking_slug}.json"));
     let existed = target.exists();
@@ -134,6 +144,12 @@ fn merge(mut existing: Value, incoming: Value) -> Value {
         if k == "history" {
             continue;
         }
+        // Preserve the original top-level receivedAt (when the parcel
+        // was first filed) even as later updates flow in; each update's
+        // date is captured in the per-history entry.
+        if k == "receivedAt" && existing_obj.contains_key("receivedAt") {
+            continue;
+        }
         existing_obj.insert(k, v);
     }
 
@@ -163,6 +179,7 @@ fn history_entry_from(obj: &Map<String, Value>) -> Value {
         Value::String(Utc::now().to_rfc3339()),
     );
     for key in [
+        "receivedAt",
         "deliveryStatus",
         "expectedArrivalUntil",
         "expectedArrivalFrom",
@@ -207,5 +224,44 @@ mod tests {
         let history = obj.get("history").unwrap().as_array().unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[1].get("deliveryStatus").unwrap(), "OutForDelivery");
+    }
+
+    #[test]
+    fn file_parcel_stamps_received_at_and_preserves_it_on_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in.json");
+        std::fs::write(
+            &src,
+            br#"{"trackingNumber":"XYZ","deliveryStatus":"Scheduled"}"#,
+        )
+        .unwrap();
+        let dir = tmp.path().join("out");
+        std::fs::create_dir_all(&dir).unwrap();
+        // First filing: 2024-11-01T00:00:00Z
+        file_parcel(&src, &dir, None, Some(1730419200)).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("XYZ.json")).unwrap()).unwrap();
+        assert_eq!(v["receivedAt"], "2024-11-01T00:00:00Z");
+        let history = v["history"].as_array().unwrap();
+        assert_eq!(history[0]["receivedAt"], "2024-11-01T00:00:00Z");
+
+        // Second filing (update): 2024-11-15T00:00:00Z. Top-level
+        // receivedAt should stay at the original date; the new history
+        // entry should carry the update's date.
+        std::fs::write(
+            &src,
+            br#"{"trackingNumber":"XYZ","deliveryStatus":"OutForDelivery"}"#,
+        )
+        .unwrap();
+        file_parcel(&src, &dir, None, Some(1731628800)).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("XYZ.json")).unwrap()).unwrap();
+        assert_eq!(
+            v["receivedAt"], "2024-11-01T00:00:00Z",
+            "top-level receivedAt should be preserved"
+        );
+        let history = v["history"].as_array().unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1]["receivedAt"], "2024-11-15T00:00:00Z");
     }
 }

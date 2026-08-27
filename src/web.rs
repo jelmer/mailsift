@@ -611,9 +611,18 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
         for (year, slug, value) in walk_year_json(dir)? {
             let payee = pick_str(&value, &["payee", "accountName"]).unwrap_or_default();
             let invoice = pick_str(&value, &["invoiceNumber", "identifier"]).unwrap_or_default();
-            let date = pick_str(&value, &["dueDate", "paymentDueDate", "date", "issueDate"])
-                .and_then(|d| parse_any_date(&d))
-                .unwrap_or_else(|| mtime_date(&dir.join(&year).join(format!("{slug}.json"))));
+            let date = pick_str(
+                &value,
+                &[
+                    "receivedAt",
+                    "dueDate",
+                    "paymentDueDate",
+                    "date",
+                    "issueDate",
+                ],
+            )
+            .and_then(|d| parse_any_date(&d))
+            .unwrap_or_else(|| mtime_date(&dir.join(&year).join(format!("{slug}.json"))));
             items.push(FeedItem {
                 date,
                 kind: "bill",
@@ -632,6 +641,7 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
             let date = pick_str(
                 &value,
                 &[
+                    "receivedAt",
                     "actualDeliveryTime",
                     "expectedArrivalUntil",
                     "expectedArrivalFrom",
@@ -654,7 +664,7 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
         for (year, slug, value) in walk_year_json(dir)? {
             let merchant = pick_str(&value, &["merchant", "seller"]).unwrap_or_default();
             let order = pick_str(&value, &["orderNumber", "identifier"]).unwrap_or_default();
-            let date = pick_str(&value, &["orderDate", "date"])
+            let date = pick_str(&value, &["receivedAt", "orderDate", "date"])
                 .and_then(|d| parse_any_date(&d))
                 .unwrap_or_else(|| mtime_date(&dir.join(&year).join(format!("{slug}.json"))));
             items.push(FeedItem {
@@ -672,9 +682,10 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
         for (name, value) in walk_flat_json(dir)? {
             let display = pick_str(&value, &["name", "provider"]).unwrap_or_default();
             let renewal = pick_str(&value, &["renewalDate", "nextPaymentDate"]);
-            let date = renewal
+            let date = pick_str(&value, &["receivedAt"])
                 .as_deref()
                 .and_then(parse_any_date)
+                .or_else(|| renewal.as_deref().and_then(parse_any_date))
                 .unwrap_or_else(|| mtime_date(&dir.join(&name)));
             items.push(FeedItem {
                 date,
@@ -1536,6 +1547,41 @@ mod tests {
         assert!(body.contains("Recent"), "no Recent section: {body}");
         assert!(body.contains("Acme"), "Acme bill missing: {body}");
         assert!(body.contains("Flight"), "event missing: {body}");
+    }
+
+    #[tokio::test]
+    async fn feed_prefers_received_at_over_due_date() {
+        // Two bills with dueDate=today but different receivedAt. Feed
+        // should sort them by receivedAt.
+        let tmp = tempfile::tempdir().unwrap();
+        let bills = tmp.path().join("bills/2026");
+        fs::create_dir_all(&bills).unwrap();
+        fs::write(
+            bills.join("acme-A.json"),
+            br#"{"payee":"Acme","invoiceNumber":"A","dueDate":"2027-01-01",
+                 "receivedAt":"2025-06-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        fs::write(
+            bills.join("acme-B.json"),
+            br#"{"payee":"Acme","invoiceNumber":"B","dueDate":"2027-01-01",
+                 "receivedAt":"2026-05-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let config = Config {
+            bills_dir: Some(tmp.path().join("bills")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/").await;
+        let pos_a = body.find("acme-A").expect("acme A missing");
+        let pos_b = body.find("acme-B").expect("acme B missing");
+        // Newer receivedAt (B, 2026) should appear before older (A, 2025)
+        // in the Recent list.
+        assert!(
+            pos_b < pos_a,
+            "expected B before A (newer receivedAt first); body: {body}"
+        );
     }
 
     #[tokio::test]
