@@ -489,17 +489,17 @@ fn render_feed_section(state: &AppState, title: &str, items: &[&FeedItem], limit
         rows.push_str(&format!(
             "<tr><td>{date}</td><td><span class=\"badge\">{kind}</span></td>\
              <td>{title}</td><td class=\"muted\">{subtitle}</td>\
-             <td><a href=\"{href}\">open</a></td></tr>",
+             <td>{links}</td></tr>",
             date = esc(&item.date.to_string()),
             kind = esc(item.kind),
             title = esc(&item.title),
             subtitle = esc(&item.subtitle),
-            href = esc(&state.url(&item.href)),
+            links = links_cell(&state.url(&item.href), item.vendor_url.as_deref()),
         ));
     }
     format!(
         "<h2>{title}</h2>\
-         <table><thead><tr><th>date</th><th>type</th><th></th><th></th><th></th></tr></thead>\
+         <table><thead><tr><th>date</th><th>type</th><th></th><th></th><th>links</th></tr></thead>\
          <tbody>{rows}</tbody></table>",
         title = esc(title),
     )
@@ -530,6 +530,8 @@ struct FeedItem {
     title: String,
     /// Secondary line (invoice number, order number, tracking, ...).
     subtitle: String,
+    /// Vendor / detail URL from the artifact JSON, if present.
+    vendor_url: Option<String>,
     /// Root-relative URL to the detail page; run through `state.url`
     /// before rendering.
     href: String,
@@ -599,6 +601,7 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 kind: "event",
                 title: summary,
                 subtitle: stem,
+                vendor_url: None,
                 href: format!("/events/{name}"),
             });
         }
@@ -616,6 +619,7 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 kind: "bill",
                 title: payee,
                 subtitle: invoice,
+                vendor_url: vendor_url(&value),
                 href: format!("/bills/{year}/{slug}.json"),
             });
         }
@@ -640,6 +644,7 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 kind: "parcel",
                 title: tracking,
                 subtitle: status,
+                vendor_url: vendor_url(&value),
                 href: format!("/parcels/{name}"),
             });
         }
@@ -657,6 +662,7 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 kind: "receipt",
                 title: merchant,
                 subtitle: order,
+                vendor_url: vendor_url(&value),
                 href: format!("/receipts/{year}/{slug}.json"),
             });
         }
@@ -675,6 +681,7 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 kind: "subscription",
                 title: display,
                 subtitle: renewal.unwrap_or_default(),
+                vendor_url: vendor_url(&value),
                 href: format!("/subscriptions/{name}"),
             });
         }
@@ -705,6 +712,7 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                     kind: "ticket",
                     title: name.clone(),
                     subtitle: year.clone(),
+                    vendor_url: None,
                     href: format!("/tickets/{year}/{name}"),
                 });
             }
@@ -942,14 +950,15 @@ async fn list_bills(State(state): State<Arc<AppState>>) -> Result<Html<String>, 
             })
             .unwrap_or_default();
         let href = state.url(&format!("/bills/{}/{}.json", year, slug));
+        let vendor = vendor_url(&value);
         let cells = format!(
-            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}\">json</a></td>",
+            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
             esc(&year),
             esc(&payee.unwrap_or_default()),
             esc(&invoice.unwrap_or_default()),
             esc(&due.unwrap_or_default()),
             esc(&amount),
-            esc(&href),
+            links_cell(&href, vendor.as_deref()),
         );
         rows.push((year, slug, cells));
     }
@@ -994,14 +1003,14 @@ async fn list_parcels(State(state): State<Arc<AppState>>) -> Result<Html<String>
             .to_string();
         let eta =
             pick_str(&value, &["expectedArrivalUntil", "actualDeliveryTime"]).unwrap_or_default();
+        let vendor = vendor_url(&value);
         let cells = format!(
-            "<td>{}</td><td><span class=\"badge\">{}</span></td><td>{}</td><td>{}</td>\
-             <td><a href=\"{}\">json</a></td>",
+            "<td>{}</td><td><span class=\"badge\">{}</span></td><td>{}</td><td>{}</td><td>{}</td>",
             esc(&tracking),
             esc(&carrier),
             esc(&status),
             esc(&eta),
-            esc(&state.url(&format!("/parcels/{name}"))),
+            links_cell(&state.url(&format!("/parcels/{name}")), vendor.as_deref()),
         );
         rows.push((name, cells));
     }
@@ -1049,14 +1058,17 @@ async fn list_receipts(State(state): State<Arc<AppState>>) -> Result<Html<String
         let merchant = pick_str(&value, &["merchant", "seller"]).unwrap_or_default();
         let order = pick_str(&value, &["orderNumber", "identifier"]).unwrap_or_default();
         let date = pick_str(&value, &["orderDate", "date"]).unwrap_or_default();
+        let vendor = vendor_url(&value);
         let cells = format!(
-            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
-             <td><a href=\"{}\">json</a></td>",
+            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
             esc(&year),
             esc(&merchant),
             esc(&order),
             esc(&date),
-            esc(&state.url(&format!("/receipts/{year}/{slug}.json"))),
+            links_cell(
+                &state.url(&format!("/receipts/{year}/{slug}.json")),
+                vendor.as_deref(),
+            ),
         );
         rows.push((year, slug, cells));
     }
@@ -1097,12 +1109,16 @@ async fn list_subscriptions(State(state): State<Arc<AppState>>) -> Result<Html<S
             .get("price")
             .and_then(|v| v.as_str().map(String::from).or_else(|| Some(v.to_string())))
             .unwrap_or_default();
+        let vendor = vendor_url(&value);
         let cells = format!(
-            "<td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}\">json</a></td>",
+            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
             esc(&display),
             esc(&renewal),
             esc(&price),
-            esc(&state.url(&format!("/subscriptions/{name}"))),
+            links_cell(
+                &state.url(&format!("/subscriptions/{name}")),
+                vendor.as_deref(),
+            ),
         );
         rows.push((name, cells));
     }
@@ -1358,6 +1374,60 @@ fn pick_str(value: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
+/// Extract the vendor / detail URL for an artifact if it carries one.
+///
+/// Looks at a handful of well-known keys (`url`, `orderUrl`, ...) and
+/// requires the value to be an absolute `http(s)://` URL to avoid
+/// rendering unclickable strings or opening a "javascript:" link.
+///
+/// Also picks up an `invoice.url` sub-object (used by some bill
+/// extractors) or `url` inside `potentialAction` (schema.org's Action
+/// pattern for "Track this parcel").
+fn vendor_url(value: &Value) -> Option<String> {
+    const KEYS: &[&str] = &[
+        "url",
+        "orderUrl",
+        "paymentUrl",
+        "trackingUrl",
+        "managementUrl",
+        "pdfLink",
+    ];
+    if let Some(u) = pick_str(value, KEYS).filter(|u| is_safe_http_url(u)) {
+        return Some(u);
+    }
+    if let Some(inv) = value.get("invoice")
+        && let Some(u) = pick_str(inv, &["url", "pdfLink"]).filter(|u| is_safe_http_url(u))
+    {
+        return Some(u);
+    }
+    if let Some(action) = value.get("potentialAction")
+        && let Some(u) = pick_str(action, &["url", "target"]).filter(|u| is_safe_http_url(u))
+    {
+        return Some(u);
+    }
+    None
+}
+
+fn is_safe_http_url(s: &str) -> bool {
+    let s = s.trim();
+    s.starts_with("http://") || s.starts_with("https://")
+}
+
+/// Render a "links" cell for a list row: always a link to the raw
+/// JSON, plus an optional "open" link to the artifact's vendor URL.
+/// `open` links carry `rel=\"noopener noreferrer\"` since they leave
+/// our origin.
+fn links_cell(json_href: &str, vendor: Option<&str>) -> String {
+    let mut out = format!("<a href=\"{}\">json</a>", esc(json_href));
+    if let Some(url) = vendor {
+        out.push_str(&format!(
+            " &middot; <a href=\"{}\" rel=\"noopener noreferrer\">open</a>",
+            esc(url),
+        ));
+    }
+    out
+}
+
 fn human_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -1485,6 +1555,74 @@ mod tests {
         assert!(body.contains("github.com/jelmer/mailsift"), "no repo link");
         assert!(body.contains("2025-2026"), "no copyright year");
         assert!(body.contains("jelmer@jelmer.uk"), "no author email");
+    }
+
+    #[test]
+    fn vendor_url_prefers_url_key() {
+        let v: Value =
+            serde_json::from_str(r#"{"url":"https://vendor.example/x", "other":"nope"}"#).unwrap();
+        assert_eq!(vendor_url(&v).as_deref(), Some("https://vendor.example/x"));
+    }
+
+    #[test]
+    fn vendor_url_falls_back_to_kind_specific_keys() {
+        let v: Value =
+            serde_json::from_str(r#"{"trackingUrl":"https://carrier.example/t/1"}"#).unwrap();
+        assert_eq!(
+            vendor_url(&v).as_deref(),
+            Some("https://carrier.example/t/1")
+        );
+        let v: Value =
+            serde_json::from_str(r#"{"managementUrl":"https://sub.example/manage"}"#).unwrap();
+        assert_eq!(
+            vendor_url(&v).as_deref(),
+            Some("https://sub.example/manage")
+        );
+    }
+
+    #[test]
+    fn vendor_url_reads_nested_invoice_url() {
+        let v: Value =
+            serde_json::from_str(r#"{"invoice":{"url":"https://vendor.example/inv.pdf"}}"#)
+                .unwrap();
+        assert_eq!(
+            vendor_url(&v).as_deref(),
+            Some("https://vendor.example/inv.pdf")
+        );
+    }
+
+    #[test]
+    fn vendor_url_rejects_non_http() {
+        let v: Value = serde_json::from_str(r#"{"url":"javascript:alert(1)"}"#).unwrap();
+        assert_eq!(vendor_url(&v), None);
+        let v: Value = serde_json::from_str(r#"{"url":"file:///etc/passwd"}"#).unwrap();
+        assert_eq!(vendor_url(&v), None);
+        let v: Value = serde_json::from_str(r#"{"url":"just-a-string"}"#).unwrap();
+        assert_eq!(vendor_url(&v), None);
+    }
+
+    #[tokio::test]
+    async fn bill_row_renders_vendor_open_link() {
+        let (tmp, mut config) = fixture();
+        // Overwrite the fixture bill with one that has a `url`.
+        let bill = tmp.path().join("bills/2026/acme-INV1.json");
+        fs::write(
+            &bill,
+            br#"{"payee":"Acme","invoiceNumber":"INV1","dueDate":"2026-05-01",
+                 "url":"https://acme.example/invoice/INV1"}"#,
+        )
+        .unwrap();
+        config.bills_dir = Some(tmp.path().join("bills"));
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/bills").await;
+        assert!(
+            body.contains("https://acme.example/invoice/INV1"),
+            "vendor URL missing: {body}"
+        );
+        assert!(
+            body.contains("rel=\"noopener noreferrer\""),
+            "external link rel missing"
+        );
     }
 
     #[tokio::test]
