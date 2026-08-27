@@ -23,6 +23,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use chrono::{NaiveDate, NaiveDateTime, Utc};
 use serde_json::Value;
 use tracing::info;
 
@@ -206,6 +207,7 @@ async fn serve_unix(path: &Path, app: Router, mode: u32) -> Result<()> {
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/all", get(list_all))
         .route("/events", get(list_events))
         .route("/events/:name", get(get_event))
         .route("/bills", get(list_bills))
@@ -301,6 +303,8 @@ pre { background: #f5f5f7; padding: 1rem; overflow: auto; }
 .card h2 { margin: 0 0 0.25rem; font-size: 1.1rem; }
 .card .n { font-size: 2rem; font-weight: 600; color: #2a3f5f; }
 a { color: #2a3f5f; }
+footer { max-width: 960px; margin: 3rem auto 1.5rem; padding: 1rem 1.25rem; border-top: 1px solid #e0e0e0; color: #777; font-size: 0.85rem; }
+footer a { color: #777; }
 "#;
 
 fn page(state: &AppState, title: &str, body: &str) -> String {
@@ -332,7 +336,13 @@ fn page(state: &AppState, title: &str, body: &str) -> String {
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <style>{CSS}</style>\n</head>\n<body>\n\
          <header>\n{nav}</header>\n\
-         <main>\n<h1>{title}</h1>\n{body}\n</main>\n</body>\n</html>",
+         <main>\n<h1>{title}</h1>\n{body}\n</main>\n\
+         <footer>\n\
+         <a href=\"https://github.com/jelmer/mailsift\">mailsift</a> \
+         &copy; 2025-2026 Jelmer Vernoo&#307;j \
+         &lt;<a href=\"mailto:jelmer@jelmer.uk\">jelmer@jelmer.uk</a>&gt;\n\
+         </footer>\n\
+         </body>\n</html>",
         title = esc(title),
     )
 }
@@ -351,6 +361,10 @@ fn esc(s: &str) -> String {
     }
     out
 }
+
+/// Cap on the number of upcoming/recent items on the homepage. Above
+/// this, the "view all" link takes over.
+const FEED_HOMEPAGE_LIMIT: usize = 20;
 
 async fn index(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
     // Only kinds with a configured local dir are shown. The sinks
@@ -417,8 +431,305 @@ async fn index(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppEr
         }
     }
 
-    let body = format!("<div class=\"grid\">{}</div>", cards.join(""));
+    let cards_html = format!("<div class=\"grid\">{}</div>", cards.join(""));
+
+    let feed = build_feed(&state)?;
+    let (upcoming, recent) = split_feed(&feed);
+
+    let mut body = cards_html;
+    body.push_str(&render_feed_sections(
+        &state,
+        &upcoming,
+        &recent,
+        FEED_HOMEPAGE_LIMIT,
+    ));
+    if feed.len() > FEED_HOMEPAGE_LIMIT {
+        body.push_str(&format!(
+            "<p><a href=\"{}\">View all {} items</a></p>",
+            esc(&state.url("/all")),
+            feed.len(),
+        ));
+    }
+
     Ok(Html(page(&state, "Overview", &body)))
+}
+
+/// Partition and sort a feed into (upcoming, recent). Upcoming is
+/// soonest first; recent is newest first.
+fn split_feed(feed: &[FeedItem]) -> (Vec<&FeedItem>, Vec<&FeedItem>) {
+    let today = Utc::now().date_naive();
+    let mut upcoming: Vec<&FeedItem> = feed.iter().filter(|i| i.date >= today).collect();
+    let mut recent: Vec<&FeedItem> = feed.iter().filter(|i| i.date < today).collect();
+    upcoming.sort_by_key(|i| i.date);
+    recent.sort_by_key(|i| std::cmp::Reverse(i.date));
+    (upcoming, recent)
+}
+
+/// Render both sections in order, up to `limit` items each. Empty
+/// sections are skipped.
+fn render_feed_sections(
+    state: &AppState,
+    upcoming: &[&FeedItem],
+    recent: &[&FeedItem],
+    limit: usize,
+) -> String {
+    let mut out = String::new();
+    if !upcoming.is_empty() {
+        out.push_str(&render_feed_section(state, "Upcoming", upcoming, limit));
+    }
+    if !recent.is_empty() {
+        out.push_str(&render_feed_section(state, "Recent", recent, limit));
+    }
+    out
+}
+
+fn render_feed_section(state: &AppState, title: &str, items: &[&FeedItem], limit: usize) -> String {
+    let mut rows = String::new();
+    for item in items.iter().take(limit) {
+        rows.push_str(&format!(
+            "<tr><td>{date}</td><td><span class=\"badge\">{kind}</span></td>\
+             <td>{title}</td><td class=\"muted\">{subtitle}</td>\
+             <td><a href=\"{href}\">open</a></td></tr>",
+            date = esc(&item.date.to_string()),
+            kind = esc(item.kind),
+            title = esc(&item.title),
+            subtitle = esc(&item.subtitle),
+            href = esc(&state.url(&item.href)),
+        ));
+    }
+    format!(
+        "<h2>{title}</h2>\
+         <table><thead><tr><th>date</th><th>type</th><th></th><th></th><th></th></tr></thead>\
+         <tbody>{rows}</tbody></table>",
+        title = esc(title),
+    )
+}
+
+async fn list_all(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
+    let feed = build_feed(&state)?;
+    let (upcoming, recent) = split_feed(&feed);
+    let body = if feed.is_empty() {
+        "<div class=\"empty\">no artifacts yet</div>".to_string()
+    } else {
+        render_feed_sections(&state, &upcoming, &recent, usize::MAX)
+    };
+    Ok(Html(page(&state, "All artifacts", &body)))
+}
+
+/// A single row in the merged homepage feed. Every artifact type
+/// contributes zero or more of these, tagged with an [`AppState`]-
+/// relative URL and a date used for sorting.
+#[derive(Debug, Clone)]
+struct FeedItem {
+    /// Sort key. Extracted from a per-kind field (dueDate, orderDate,
+    /// DTSTART, ...) when available; falls back to file mtime.
+    date: NaiveDate,
+    /// Kind label rendered as a badge in the list.
+    kind: &'static str,
+    /// Free-form title (payee, merchant, event summary, ...).
+    title: String,
+    /// Secondary line (invoice number, order number, tracking, ...).
+    subtitle: String,
+    /// Root-relative URL to the detail page; run through `state.url`
+    /// before rendering.
+    href: String,
+}
+
+/// Try a series of ISO-ish date formats. Accepts YYYY-MM-DD,
+/// YYYY-MM-DDTHH:MM:SS(Z|+00:00), and iCal `YYYYMMDDTHHMMSSZ`.
+fn parse_any_date(raw: &str) -> Option<NaiveDate> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(d);
+    }
+    // strip fractional seconds + timezone before parsing.
+    let head = s.split('.').next().unwrap_or(s);
+    let head = head
+        .strip_suffix('Z')
+        .or_else(|| head.split(['+', '-']).next())
+        .unwrap_or(head);
+    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y%m%dT%H%M%S", "%Y%m%d"] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(head, fmt) {
+            return Some(dt.date());
+        }
+        if fmt == "%Y%m%d"
+            && let Ok(d) = NaiveDate::parse_from_str(head, fmt)
+        {
+            return Some(d);
+        }
+    }
+    None
+}
+
+/// Gather every artifact into a single date-sorted feed. Missing dates
+/// fall back to the file mtime, so nothing is silently dropped.
+fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
+    let mut items: Vec<FeedItem> = Vec::new();
+
+    if let Some(dir) = state.events_dir() {
+        for entry in read_dir_or_empty(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file()
+                || path
+                    .extension()
+                    .is_none_or(|e| !e.eq_ignore_ascii_case("ics"))
+            {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let stem = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let body = fs::read_to_string(&path).unwrap_or_default();
+            let summary = ics_field(&body, "SUMMARY").unwrap_or_else(|| stem.clone());
+            let dtstart = ics_field(&body, "DTSTART").and_then(|d| parse_any_date(&d));
+            let date = dtstart.unwrap_or_else(|| mtime_date(&path));
+            items.push(FeedItem {
+                date,
+                kind: "event",
+                title: summary,
+                subtitle: stem,
+                href: format!("/events/{name}"),
+            });
+        }
+    }
+
+    if let Some(dir) = state.bills_dir() {
+        for (year, slug, value) in walk_year_json(dir)? {
+            let payee = pick_str(&value, &["payee", "accountName"]).unwrap_or_default();
+            let invoice = pick_str(&value, &["invoiceNumber", "identifier"]).unwrap_or_default();
+            let date = pick_str(&value, &["dueDate", "paymentDueDate", "date", "issueDate"])
+                .and_then(|d| parse_any_date(&d))
+                .unwrap_or_else(|| mtime_date(&dir.join(&year).join(format!("{slug}.json"))));
+            items.push(FeedItem {
+                date,
+                kind: "bill",
+                title: payee,
+                subtitle: invoice,
+                href: format!("/bills/{year}/{slug}.json"),
+            });
+        }
+    }
+
+    if let Some(dir) = state.parcels_dir() {
+        for (name, value) in walk_flat_json(dir)? {
+            let tracking = pick_str(&value, &["trackingNumber", "identifier"]).unwrap_or_default();
+            let status = pick_str(&value, &["deliveryStatus"]).unwrap_or_default();
+            let date = pick_str(
+                &value,
+                &[
+                    "actualDeliveryTime",
+                    "expectedArrivalUntil",
+                    "expectedArrivalFrom",
+                ],
+            )
+            .and_then(|d| parse_any_date(&d))
+            .unwrap_or_else(|| mtime_date(&dir.join(&name)));
+            items.push(FeedItem {
+                date,
+                kind: "parcel",
+                title: tracking,
+                subtitle: status,
+                href: format!("/parcels/{name}"),
+            });
+        }
+    }
+
+    if let Some(dir) = state.receipts_dir() {
+        for (year, slug, value) in walk_year_json(dir)? {
+            let merchant = pick_str(&value, &["merchant", "seller"]).unwrap_or_default();
+            let order = pick_str(&value, &["orderNumber", "identifier"]).unwrap_or_default();
+            let date = pick_str(&value, &["orderDate", "date"])
+                .and_then(|d| parse_any_date(&d))
+                .unwrap_or_else(|| mtime_date(&dir.join(&year).join(format!("{slug}.json"))));
+            items.push(FeedItem {
+                date,
+                kind: "receipt",
+                title: merchant,
+                subtitle: order,
+                href: format!("/receipts/{year}/{slug}.json"),
+            });
+        }
+    }
+
+    if let Some(dir) = state.subscriptions_dir() {
+        for (name, value) in walk_flat_json(dir)? {
+            let display = pick_str(&value, &["name", "provider"]).unwrap_or_default();
+            let renewal = pick_str(&value, &["renewalDate", "nextPaymentDate"]);
+            let date = renewal
+                .as_deref()
+                .and_then(parse_any_date)
+                .unwrap_or_else(|| mtime_date(&dir.join(&name)));
+            items.push(FeedItem {
+                date,
+                kind: "subscription",
+                title: display,
+                subtitle: renewal.unwrap_or_default(),
+                href: format!("/subscriptions/{name}"),
+            });
+        }
+    }
+
+    if let Some(dir) = state.tickets_dir() {
+        for entry in read_dir_or_empty(dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let year = entry.file_name().to_string_lossy().into_owned();
+            let year_num: i32 = year.parse().unwrap_or(0);
+            for inner in fs::read_dir(entry.path())? {
+                let inner = inner?;
+                if !inner.file_type()?.is_file() {
+                    continue;
+                }
+                let name = inner.file_name().to_string_lossy().into_owned();
+                // Tickets don't carry their own date; use file mtime,
+                // falling back to Jan 1 of the year dir if we can't
+                // stat.
+                let date = mtime_date_opt(&inner.path())
+                    .or_else(|| NaiveDate::from_ymd_opt(year_num, 1, 1))
+                    .unwrap_or_else(|| Utc::now().date_naive());
+                items.push(FeedItem {
+                    date,
+                    kind: "ticket",
+                    title: name.clone(),
+                    subtitle: year.clone(),
+                    href: format!("/tickets/{year}/{name}"),
+                });
+            }
+        }
+    }
+
+    Ok(items)
+}
+
+/// File mtime as a naive UTC date. On any error (missing file, no
+/// mtime, out-of-range) fall back to today so the item still surfaces
+/// in the feed.
+fn mtime_date(path: &Path) -> NaiveDate {
+    mtime_date_opt(path).unwrap_or_else(|| Utc::now().date_naive())
+}
+
+fn mtime_date_opt(path: &Path) -> Option<NaiveDate> {
+    let meta = fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let secs = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let dt = chrono::DateTime::from_timestamp(secs, 0)?;
+    Some(dt.date_naive())
 }
 
 /// Count top-level files under `dir` whose extension matches `ext`
@@ -1120,6 +1431,60 @@ mod tests {
         let status = resp.status();
         let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[test]
+    fn parse_any_date_iso_and_ical() {
+        assert_eq!(
+            parse_any_date("2026-05-01"),
+            NaiveDate::from_ymd_opt(2026, 5, 1)
+        );
+        assert_eq!(
+            parse_any_date("2026-08-27T18:00:00Z"),
+            NaiveDate::from_ymd_opt(2026, 8, 27)
+        );
+        assert_eq!(
+            parse_any_date("20260201T100000Z"),
+            NaiveDate::from_ymd_opt(2026, 2, 1)
+        );
+        assert_eq!(
+            parse_any_date("20260201"),
+            NaiveDate::from_ymd_opt(2026, 2, 1)
+        );
+        assert!(parse_any_date("not a date").is_none());
+        assert!(parse_any_date("").is_none());
+    }
+
+    #[tokio::test]
+    async fn homepage_shows_feed_sections() {
+        // Fixture bill is due 2026-05-01 (past by 2026-08-27), event is
+        // 2026-02-01 (also past). Both should land in Recent.
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Recent"), "no Recent section: {body}");
+        assert!(body.contains("Acme"), "Acme bill missing: {body}");
+        assert!(body.contains("Flight"), "event missing: {body}");
+    }
+
+    #[tokio::test]
+    async fn list_all_route_serves() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/all").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("All artifacts"));
+    }
+
+    #[tokio::test]
+    async fn footer_contains_copyright_and_repo_link() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/").await;
+        assert!(body.contains("github.com/jelmer/mailsift"), "no repo link");
+        assert!(body.contains("2025-2026"), "no copyright year");
+        assert!(body.contains("jelmer@jelmer.uk"), "no author email");
     }
 
     #[tokio::test]
