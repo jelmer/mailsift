@@ -912,9 +912,10 @@ fn discover_required(dirs: &[PathBuf]) -> Result<Vec<mailsift::extractor::Extrac
         ));
     }
     tracing::info!(
-        count = extractors.len(),
-        dirs = %render_paths(dirs),
-        "loaded extractors"
+        "loaded {} extractor{} from {}",
+        extractors.len(),
+        if extractors.len() == 1 { "" } else { "s" },
+        render_paths(dirs),
     );
     Ok(extractors)
 }
@@ -1137,6 +1138,7 @@ fn run() -> Result<()> {
         )
         .without_time()
         .with_target(false)
+        .with_level(false)
         .init();
 
     let cli = Cli::parse();
