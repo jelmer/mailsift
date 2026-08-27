@@ -52,6 +52,7 @@ fn replay_fails_with_empty_extractors_dir() {
     let manifest = manifest_dir();
     let eml = manifest.join("tests/fixtures/eml/ics-attachment.eml");
     let empty = tempfile::tempdir().expect("tempdir");
+    let events = tempfile::tempdir().expect("tempdir");
 
     let output = Command::cargo_bin("mailsift")
         .expect("binary built")
@@ -59,6 +60,8 @@ fn replay_fails_with_empty_extractors_dir() {
         .arg(&eml)
         .arg("--extractors")
         .arg(empty.path())
+        .arg("--events-dir")
+        .arg(events.path())
         .assert()
         .failure()
         .get_output()
