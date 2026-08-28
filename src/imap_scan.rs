@@ -103,6 +103,11 @@ pub struct ImapScanConfig<'a> {
     pub auth: AuthMethod<'a>,
     pub mailbox: &'a str,
     pub since: Option<&'a str>,
+    /// Upper bound on message internal date, exclusive, in IMAP date
+    /// format. Combined with `since` this bounds a scan to a specific
+    /// window so a single IMAP session doesn't outrun the server's
+    /// idle timeout on very large mailboxes.
+    pub before: Option<&'a str>,
     pub limit: Option<usize>,
     pub extractors: &'a [crate::extractor::Extractor],
     pub targets: PipelineTargets<'a>,
@@ -151,7 +156,7 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
         "selected (read-only)"
     );
 
-    let query = build_search_query(config.since);
+    let query = build_search_query(config.since, config.before);
     let mut uids: Vec<u32> = session
         .uid_search(&query)
         .with_context(|| format!("UID SEARCH {query}"))?
@@ -576,10 +581,12 @@ fn reselect(
     Ok(mbox.uid_validity)
 }
 
-fn build_search_query(since: Option<&str>) -> String {
-    match since {
-        Some(s) => format!("SINCE {s}"),
-        None => "ALL".to_string(),
+fn build_search_query(since: Option<&str>, before: Option<&str>) -> String {
+    match (since, before) {
+        (Some(s), Some(b)) => format!("SINCE {s} BEFORE {b}"),
+        (Some(s), None) => format!("SINCE {s}"),
+        (None, Some(b)) => format!("BEFORE {b}"),
+        (None, None) => "ALL".to_string(),
     }
 }
 
@@ -680,12 +687,33 @@ mod tests {
 
     #[test]
     fn search_query_default() {
-        assert_eq!(build_search_query(None), "ALL");
+        assert_eq!(build_search_query(None, None), "ALL");
     }
 
     #[test]
     fn search_query_since() {
-        assert_eq!(build_search_query(Some("01-Jan-2026")), "SINCE 01-Jan-2026");
+        assert_eq!(
+            build_search_query(Some("01-Jan-2026"), None),
+            "SINCE 01-Jan-2026"
+        );
+    }
+
+    #[test]
+    fn search_query_before() {
+        assert_eq!(
+            build_search_query(None, Some("01-Feb-2026")),
+            "BEFORE 01-Feb-2026"
+        );
+    }
+
+    /// Bounded windows chunk very large mailbox walks so a single IMAP
+    /// session doesn't outlive the server's idle timeout.
+    #[test]
+    fn search_query_since_and_before() {
+        assert_eq!(
+            build_search_query(Some("01-Jan-2026"), Some("01-Feb-2026")),
+            "SINCE 01-Jan-2026 BEFORE 01-Feb-2026"
+        );
     }
 
     #[test]
