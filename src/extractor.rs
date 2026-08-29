@@ -641,13 +641,36 @@ pub fn run_one(extractor: &Extractor, raw: &[u8], timeout: Duration) -> Result<E
         .spawn()
         .with_context(|| format!("spawning extractor {}", extractor.name))?;
 
-    {
-        let mut stdin = child.stdin.take().expect("piped stdin");
-        // Best-effort: if the extractor exits before reading all of stdin
-        // we don't want to crash the parent on the resulting EPIPE.
-        let _ = stdin.write_all(raw);
+    // Feed stdin and drain both output pipes on their own threads.
+    // All three have to happen concurrently with the wait: pipes hold
+    // only a bounded amount (64KiB on Linux), so an extractor that
+    // writes a large report to stdout blocks in write() until we read,
+    // and one that never reads stdin blocks us in write_all(). Doing
+    // any of it inline deadlocks until the timeout kills a child that
+    // was working fine.
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let raw_owned = raw.to_vec();
+    let writer = std::thread::spawn(move || {
+        // Best-effort: if the extractor exits before reading all of
+        // stdin we don't want to crash the parent on the resulting
+        // EPIPE.
+        let _ = stdin.write_all(&raw_owned);
         drop(stdin);
-    }
+    });
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let stdout_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stderr_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
 
     // `wait_timeout` is a real blocking wait with a deadline, so the
     // happy path returns the moment the extractor finishes; no more
@@ -665,21 +688,16 @@ pub fn run_one(extractor: &Extractor, raw: &[u8], timeout: Duration) -> Result<E
         }
     };
 
-    // Drain stdout / stderr now that the child has exited. The pipes
-    // are bounded; if an extractor wrote enough that the OS-level
-    // buffer filled, it would have blocked before exit, so by the
-    // time we reach here both streams have either been drained or
-    // are small enough to read in full.
-    let mut stderr_buf = Vec::new();
-    let mut stdout_buf = Vec::new();
-    if let Some(mut s) = child.stderr.take() {
-        use std::io::Read;
-        let _ = s.read_to_end(&mut stderr_buf);
-    }
-    if let Some(mut s) = child.stdout.take() {
-        use std::io::Read;
-        let _ = s.read_to_end(&mut stdout_buf);
-    }
+    // The child has exited, so every pipe is at EOF and the helper
+    // threads are finishing or done. A panicked helper just means we
+    // lose that stream's contents, not the run.
+    //
+    // Extractors communicate through artifact files rather than
+    // stdout, so its contents are discarded; we drain it only to keep
+    // a chatty extractor from blocking on a full pipe.
+    drop(stdout_reader.join());
+    let stderr_buf = stderr_reader.join().unwrap_or_default();
+    let _ = writer.join();
 
     let stderr = String::from_utf8_lossy(&stderr_buf);
     if !stderr.trim().is_empty() {
@@ -1152,5 +1170,61 @@ mod tests {
             "got: {:?}",
             issues[0].message
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_one_handles_extractor_writing_more_than_a_pipe_buffer() {
+        // An extractor that writes far more to stdout than a pipe
+        // buffer holds (64KiB on Linux) must not wedge the parent:
+        // the child blocks in write() until someone drains the pipe.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("noisy.py");
+        fs::write(
+            &script,
+            "#!/usr/bin/env python3\nimport sys\nsys.stdout.write('x' * (2 * 1024 * 1024))\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let ex = Extractor {
+            name: "noisy".into(),
+            script,
+            order: 100,
+            require_dkim: Vec::new(),
+            from_domains: Vec::new(),
+            subject_regex: None,
+            body_requirements: Vec::new(),
+        };
+        let run = run_one(&ex, b"From: x\r\n\r\n", Duration::from_secs(10))
+            .expect("extractor writing a lot to stdout should not deadlock");
+        assert_eq!(run.result.artifacts.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_one_handles_extractor_that_never_reads_stdin() {
+        // A large message fed to an extractor that exits without
+        // reading stdin must not block the parent in write_all().
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("ignores-stdin.py");
+        fs::write(&script, "#!/usr/bin/env python3\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let ex = Extractor {
+            name: "ignores-stdin".into(),
+            script,
+            order: 100,
+            require_dkim: Vec::new(),
+            from_domains: Vec::new(),
+            subject_regex: None,
+            body_requirements: Vec::new(),
+        };
+        let big = vec![b'x'; 4 * 1024 * 1024];
+        let run = run_one(&ex, &big, Duration::from_secs(10))
+            .expect("large stdin to a non-reading extractor should not deadlock");
+        assert_eq!(run.result.artifacts.len(), 0);
     }
 }
