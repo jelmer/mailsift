@@ -45,6 +45,12 @@ pub struct Config {
     /// Directory under which to file `subscription` artifacts.
     #[serde(default)]
     pub subscriptions_dir: Option<PathBuf>,
+    /// Directory under which to archive the raw `reservation` JSON.
+    /// Independent of `events_dir` / `[caldav]`: reservations are
+    /// always converted to calendar events, and additionally archived
+    /// here when this is set.
+    #[serde(default)]
+    pub reservations_dir: Option<PathBuf>,
     #[serde(default)]
     pub receipts_dir: Option<PathBuf>,
     /// Optional WebDAV collection to PUT `receipt` artifacts into.

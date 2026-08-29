@@ -143,6 +143,15 @@ mailsift classifies every file in cwd by its suffix. The part before the
 suffix - the `<slug>` - is yours to choose and becomes the default
 filename when the artifact is filed on disk.
 
+Structure the slug as `<what-it-is>-<date>`: `ryanair-fr1234-2026-04-10`,
+not `boarding-pass`. Kinds that carry their own identifying fields
+(bills, receipts, reservations, ...) get renamed from those when filed,
+so the slug is mostly a fallback there. Tickets are the exception - a
+PDF or a pkpass has nothing readable inside it, so the slug is the only
+name the blob will ever have, and every ticket called `boarding-pass`
+lands on the same path. Use an ISO `YYYY-MM-DD` date so names sort
+chronologically.
+
 | Filename                   | Kind           | Required content |
 |----------------------------|----------------|------------------|
 | `<slug>.event.ics`         | `event`        | A valid iCalendar file. The `UID` inside is the dedup key. Multiple `VEVENT`s in one file are split into separate events. |
@@ -151,12 +160,18 @@ filename when the artifact is filed on disk.
 | `<slug>.receipt.json`      | `receipt`      | Loose schema.org `Order` / `Invoice` JSON. Must include `orderNumber` (or `identifier`) and a merchant/seller name. |
 | `<slug>.bill.json`         | `bill`         | JSON with `payee`, `amount`, `dueDate`, `invoiceNumber`. |
 | `<slug>.subscription.json` | `subscription` | schema.org-ish JSON carrying at least `subscriptionDuration`. Downstream tooling synthesises renewal reminders from it. |
-| `<slug>.ticket.<ext>`      | `ticket`       | Any binary blob (PDF, pkpass, image, ...). Dedup is by content hash; `<ext>` is taken literally as the on-disk extension. |
+| `<slug>.ticket.<ext>`      | `ticket`       | Any binary blob (PDF, pkpass, image, ...). Dedup is by content hash; `<ext>` is taken literally as the on-disk extension. The slug is the filed name, so make it specific: `ryanair-fr1234-2026-04-10.ticket.pdf`. |
 
 Dotfiles and other `_*` files are skipped silently; any other
 unrecognised filename in cwd is logged with a warning. Emit as many
 artifacts as the message warrants - one boarding-pass email can produce
 a `.ticket.pdf` and a `.reservation.json` at once.
+
+A filed ticket gets a `<slug>.meta.json` sidecar beside it recording
+the blob's filename and content type, plus the booking reference and
+passenger from a `.reservation.json` emitted in the same run. Emitting
+both from one message is what makes a ticket traceable back to its
+trip.
 
 Bills, parcels and subscriptions are **not** auto-synthesised into
 calendar events. If you want a bill's due date to show on the calendar,

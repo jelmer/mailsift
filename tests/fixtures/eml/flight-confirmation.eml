@@ -1,0 +1,10 @@
+From: bookings@flight.fixture.test
+To: jelmer@example.org
+Subject: fixture-flight confirmation
+Date: Mon, 2 Mar 2026 09:00:00 +0000
+Message-ID: <fixture-flight-1@flight.fixture.test>
+Authentication-Results: example.org; dkim=pass header.d=flight.fixture.test header.i=@flight.fixture.test
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Your flight FX123 on 10 April 2026 is confirmed. Boarding pass attached.
