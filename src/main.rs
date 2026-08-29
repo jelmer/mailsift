@@ -607,6 +607,11 @@ struct ArtifactDirArgs {
     /// omitted, subscription artifacts are dropped with a warning.
     #[arg(long)]
     subscriptions_dir: Option<PathBuf>,
+    /// Directory under which to archive the raw JSON of `reservation`
+    /// artifacts. Reservations are converted to calendar events
+    /// regardless; this additionally keeps the full booking record.
+    #[arg(long)]
+    reservations_dir: Option<PathBuf>,
     /// Directory under which to file `receipt` artifacts. Mutually
     /// exclusive with `--receipts-webdav-url` and
     /// `--receipts-forward-to`. If none is set, receipt artifacts are
@@ -684,6 +689,11 @@ impl ArtifactDirArgs {
             .as_ref()
             .or(config.subscriptions_dir.as_ref())
             .cloned();
+        let reservations = self
+            .reservations_dir
+            .as_ref()
+            .or(config.reservations_dir.as_ref())
+            .cloned();
 
         let receipts = self.build_receipts_sink(config, runtime)?;
         let tickets = self.build_tickets_sink(config, runtime)?;
@@ -692,6 +702,7 @@ impl ArtifactDirArgs {
             bills,
             parcels,
             subscriptions,
+            reservations,
             receipts,
             tickets,
         })
@@ -828,6 +839,7 @@ struct ResolvedArtifactTargets {
     bills: Option<PathBuf>,
     parcels: Option<PathBuf>,
     subscriptions: Option<PathBuf>,
+    reservations: Option<PathBuf>,
     receipts: Option<mailsift::targets::receipts::ReceiptSink>,
     tickets: Option<mailsift::targets::tickets::TicketSink>,
 }
@@ -1289,6 +1301,7 @@ fn run() -> Result<()> {
                     bills_dir: dirs.bills.as_deref(),
                     parcels_dir: dirs.parcels.as_deref(),
                     subscriptions_dir: dirs.subscriptions.as_deref(),
+                    reservations_dir: dirs.reservations.as_deref(),
                     receipts: dirs.receipts.as_ref(),
                     tickets: dirs.tickets.as_ref(),
                     firefly: firefly.as_ref(),
@@ -1414,6 +1427,7 @@ fn run() -> Result<()> {
                     bills_dir: dirs.bills.as_deref(),
                     parcels_dir: dirs.parcels.as_deref(),
                     subscriptions_dir: dirs.subscriptions.as_deref(),
+                    reservations_dir: dirs.reservations.as_deref(),
                     receipts: dirs.receipts.as_ref(),
                     tickets: dirs.tickets.as_ref(),
                     firefly: firefly.as_ref(),
@@ -1459,6 +1473,7 @@ fn run() -> Result<()> {
                     bills_dir: dirs.bills.as_deref(),
                     parcels_dir: dirs.parcels.as_deref(),
                     subscriptions_dir: dirs.subscriptions.as_deref(),
+                    reservations_dir: dirs.reservations.as_deref(),
                     receipts: dirs.receipts.as_ref(),
                     tickets: dirs.tickets.as_ref(),
                     firefly: firefly.as_ref(),
@@ -1509,6 +1524,7 @@ fn run() -> Result<()> {
                     bills_dir: dirs.bills,
                     parcels_dir: dirs.parcels,
                     subscriptions_dir: dirs.subscriptions,
+                    reservations_dir: dirs.reservations,
                     receipts: receipts_sink,
                     tickets: tickets_sink,
                     firefly: firefly_sink,

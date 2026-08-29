@@ -17,8 +17,8 @@ use crate::artifacts::{Artifact, Kind};
 use crate::reservation;
 use crate::seen::{self, Store as SeenStore};
 use crate::targets::{
-    EventSink, EventSinkKind, FileOutcome, SingleEvent, bills, parcels, receipts, split_calendar,
-    subscriptions, tickets,
+    EventSink, EventSinkKind, FileOutcome, SingleEvent, bills, parcels, receipts, reservations,
+    split_calendar, subscriptions, tickets,
 };
 
 pub(super) const KIND_EVENT: usize = 0;
@@ -27,6 +27,7 @@ pub(super) const KIND_PARCEL: usize = 2;
 pub(super) const KIND_RECEIPT: usize = 3;
 pub(super) const KIND_TICKET: usize = 4;
 pub(super) const KIND_SUBSCRIPTION: usize = 5;
+pub(super) const KIND_RESERVATION: usize = 6;
 
 /// Per-`pipeline::run` tally of successful artifact filings. Used to
 /// emit one compact INFO line per source message instead of one per
@@ -36,7 +37,7 @@ pub(super) struct Summary {
     /// `extractor name -> per-kind counts` (indexed by the `KIND_*`
     /// constants). `BTreeMap` so the rendered string is stable across
     /// invocations.
-    counts: BTreeMap<String, [u32; 6]>,
+    counts: BTreeMap<String, [u32; 7]>,
 }
 
 impl Summary {
@@ -47,7 +48,7 @@ impl Summary {
         if let Some(counts) = self.counts.get_mut(extractor) {
             counts[kind_index] += 1;
         } else {
-            let mut counts = [0u32; 6];
+            let mut counts = [0u32; 7];
             counts[kind_index] = 1;
             self.counts.insert(extractor.to_string(), counts);
         }
@@ -73,6 +74,7 @@ impl Summary {
                 (counts[KIND_RECEIPT], "receipt", "receipts"),
                 (counts[KIND_TICKET], "ticket", "tickets"),
                 (counts[KIND_SUBSCRIPTION], "subscription", "subscriptions"),
+                (counts[KIND_RESERVATION], "reservation", "reservations"),
             ] {
                 if count == 0 {
                     continue;
@@ -133,6 +135,36 @@ pub(super) fn file_event_artifact(
 
     for event in &singles {
         file_single(extractor, event, event_sink, seen, summary);
+    }
+}
+
+/// File the raw `.reservation.json` payload under `reservations_dir`.
+///
+/// Separate from the calendar conversion below: the VEVENT keeps only
+/// what iCalendar can express, so the booking reference, passenger and
+/// price survive only in the JSON. A reservation we can't render as an
+/// event is still worth archiving, and vice versa.
+pub(super) fn file_reservation_json(
+    extractor: &str,
+    artifact: &Artifact,
+    reservations_dir: &Path,
+    received_at_epoch: Option<i64>,
+    summary: &mut Summary,
+) {
+    match reservations::file_reservation(&artifact.path, reservations_dir, received_at_epoch) {
+        Ok(outcomes) => {
+            for _ in outcomes {
+                summary.bump(extractor, KIND_RESERVATION);
+            }
+        }
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %artifact.path.display(),
+                error = format!("{e:#}"),
+                "failed to file reservation"
+            );
+        }
     }
 }
 
@@ -306,9 +338,18 @@ pub(super) fn file_ticket_artifact(
     artifact: &Artifact,
     year: i32,
     sink: &tickets::TicketSink,
+    meta: &tickets::TicketMeta,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
-    match sink.file_ticket(&artifact.path, &artifact.slug, &artifact.ext, year) {
+    match sink.file_ticket(
+        &artifact.path,
+        &artifact.slug,
+        &artifact.ext,
+        year,
+        meta,
+        received_at_epoch,
+    ) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_TICKET);
         }
@@ -419,6 +460,30 @@ impl ReservationDatesDoc {
             ReservationDatesDoc::Many(rs) => rs,
         }
     }
+}
+
+/// Collect identifying fields from this run's sibling
+/// `.reservation.json` artifacts for the ticket sidecar. A boarding
+/// pass carries none of this itself, but the reservation filed in the
+/// same extractor run does.
+///
+/// Takes the first reservation that yields each field; a multi-leg
+/// itinerary shares its booking reference and passenger across legs,
+/// so the first one is representative.
+pub(super) fn sibling_ticket_meta(artifacts: &[Artifact]) -> tickets::TicketMeta {
+    let mut meta = tickets::TicketMeta::default();
+    for a in artifacts {
+        if a.kind != Kind::Reservation {
+            continue;
+        }
+        let Some(fields) = reservations::identifying_fields(&a.path) else {
+            continue;
+        };
+        meta.reservation_number = meta.reservation_number.or(fields.reservation_number);
+        meta.under_name = meta.under_name.or(fields.under_name);
+        meta.provider = meta.provider.or(fields.provider);
+    }
+    meta
 }
 
 /// Read a `.reservation.json` file and return the year of its earliest

@@ -9,6 +9,7 @@ pub mod local_events;
 pub mod mail_forward;
 pub mod parcels;
 pub mod receipts;
+pub mod reservations;
 pub mod seventeentrack;
 pub mod sink;
 pub mod subscriptions;

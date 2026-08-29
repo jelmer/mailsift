@@ -74,6 +74,7 @@ async fn milter_files_event_from_ics_attachment() {
             bills_dir: None,
             parcels_dir: None,
             subscriptions_dir: None,
+            reservations_dir: None,
             receipts: None,
             tickets: None,
             firefly: None,

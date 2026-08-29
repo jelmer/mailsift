@@ -32,6 +32,11 @@ pub struct PipelineTargets<'a> {
     /// Directory under which to file `subscription` artifacts. When
     /// `None`, subscription artifacts are dropped with a warning.
     pub subscriptions_dir: Option<&'a Path>,
+    /// Directory under which to archive the raw `reservation` JSON.
+    /// Independent of the event sink: a reservation is always
+    /// converted to a calendar event, and additionally archived here
+    /// when set. When `None`, only the calendar conversion happens.
+    pub reservations_dir: Option<&'a Path>,
     /// Receipt target (local directory, WebDAV collection, or mail
     /// forwarder). When `None`, receipt artifacts are dropped with a
     /// warning.
@@ -76,6 +81,8 @@ pub struct OwnedTargets {
     pub bills_dir: Option<PathBuf>,
     pub parcels_dir: Option<PathBuf>,
     pub subscriptions_dir: Option<PathBuf>,
+    /// See [`PipelineTargets::reservations_dir`].
+    pub reservations_dir: Option<PathBuf>,
     pub receipts: Option<Arc<crate::targets::receipts::ReceiptSink>>,
     pub tickets: Option<Arc<crate::targets::tickets::TicketSink>>,
     pub firefly: Option<Arc<crate::targets::firefly::FireflySink>>,
@@ -95,6 +102,7 @@ impl OwnedTargets {
             bills_dir: self.bills_dir.as_deref(),
             parcels_dir: self.parcels_dir.as_deref(),
             subscriptions_dir: self.subscriptions_dir.as_deref(),
+            reservations_dir: self.reservations_dir.as_deref(),
             receipts: self.receipts.as_deref(),
             tickets: self.tickets.as_deref(),
             firefly: self.firefly.as_deref(),
@@ -182,6 +190,7 @@ pub fn run(
         bills_dir,
         parcels_dir,
         subscriptions_dir,
+        reservations_dir,
         receipts,
         tickets,
         firefly,
@@ -401,7 +410,7 @@ pub fn run(
             router::file_event_artifact(&run.extractor, artifact, event_sink, seen, &mut summary);
         }
 
-        for artifact in reservations {
+        for artifact in &reservations {
             router::file_reservation_artifact(
                 &run.extractor,
                 artifact,
@@ -409,6 +418,21 @@ pub fn run(
                 seen,
                 &mut summary,
             );
+        }
+
+        // Archiving the raw JSON is additive: the calendar conversion
+        // above already ran, so an absent `reservations_dir` costs
+        // nothing beyond the fuller record.
+        if let Some(dir) = reservations_dir {
+            for artifact in &reservations {
+                router::file_reservation_json(
+                    &run.extractor,
+                    artifact,
+                    dir,
+                    received_at_epoch,
+                    &mut summary,
+                );
+            }
         }
 
         file_or_drop(
@@ -494,6 +518,13 @@ pub fn run(
                 message_date_year(&parsed_headers).unwrap_or_else(current_year)
             })
         });
+        // The same sibling reservation that dates the ticket also
+        // names the booking; a boarding pass carries neither itself.
+        let ticket_meta = if !ticket_arts.is_empty() && tickets.is_some() {
+            router::sibling_ticket_meta(&run.result.artifacts)
+        } else {
+            crate::targets::tickets::TicketMeta::default()
+        };
         file_or_drop(
             "ticket",
             &run.extractor,
@@ -505,6 +536,8 @@ pub fn run(
                     artifact,
                     ticket_year.expect("year computed when both tickets and sink exist"),
                     sink,
+                    &ticket_meta,
+                    received_at_epoch,
                     &mut summary,
                 );
             },

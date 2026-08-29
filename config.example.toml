@@ -24,10 +24,19 @@ extractors_dir = "/etc/mailsift/extractors"
 #   parcels_dir:  <tracking-number>.json (merged across messages)
 #   receipts_dir: <year>/<merchant-slug>-<order-id>.json
 #   tickets_dir:  <year>/<slug>.<ext>   (year from sibling event/reservation)
+#                 plus a <year>/<slug>.json sidecar naming the blob and
+#                 carrying the sibling reservation's booking reference
+#   reservations_dir: <year>/<provider-slug>-<reservation-number>.json
 bills_dir = "/home/jelmer/Documents/bills"
 parcels_dir = "/home/jelmer/Documents/parcels"
 receipts_dir = "/home/jelmer/Documents/receipts"
 tickets_dir = "/home/jelmer/Documents/tickets"
+
+# Archive of the raw `reservation` JSON. Independent of the event sink:
+# reservations are always converted to calendar events, and additionally
+# kept here in full (booking reference, passenger, price) when set.
+# Without it only the calendar entry survives.
+reservations_dir = "/home/jelmer/Documents/reservations"
 
 # Where to file `event` artifacts as `<UID>.ics`. Mutually exclusive
 # with [caldav] below.
