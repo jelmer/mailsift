@@ -14,7 +14,7 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
 use icalendar::{Calendar, Component, DatePerhapsTime, Event, EventLike};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -281,6 +281,7 @@ impl Address {
 ///   trailing `Z` is also OK)
 /// - Naive ISO 8601 (`2024-07-12T18:45:00`), treated as floating
 ///   local time
+/// - Date only (`2024-07-12`), rendered as an all-day component
 /// - Tebi's `InstantLocalizable(instant YY-MM-DDTHH:MM:SS[.fff]Z,
 ///   timeZone=..., style=...)` wrapper; the year is two digits and
 ///   we treat it as `20YY` (Tebi appeared after the millennium and
@@ -289,6 +290,10 @@ impl Address {
 enum DateTimeField {
     Zoned(DateTime<FixedOffset>),
     Floating(NaiveDateTime),
+    /// Date without a time. Rendered as an all-day (DATE-valued)
+    /// component; lodging reservations in particular often carry only
+    /// `checkinDate` / `checkoutDate`.
+    Date(NaiveDate),
 }
 
 impl<'de> Deserialize<'de> for DateTimeField {
@@ -319,6 +324,9 @@ fn parse_date_time(raw: &str) -> Option<DateTimeField> {
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M") {
         return Some(DateTimeField::Floating(dt));
     }
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(DateTimeField::Date(d));
+    }
     parse_instant_localizable(s)
 }
 
@@ -348,6 +356,7 @@ impl From<&DateTimeField> for DatePerhapsTime {
         match p {
             DateTimeField::Zoned(dt) => dt.with_timezone(&Utc).into(),
             DateTimeField::Floating(dt) => (*dt).into(),
+            DateTimeField::Date(d) => (*d).into(),
         }
     }
 }
@@ -611,6 +620,7 @@ fn uid_for(prefix: &str, id: &ReservationId, summary: &str, dtstart: &DateTimeFi
     match dtstart {
         DateTimeField::Zoned(dt) => hasher.update(dt.to_rfc3339().as_bytes()),
         DateTimeField::Floating(dt) => hasher.update(dt.to_string().as_bytes()),
+        DateTimeField::Date(d) => hasher.update(d.to_string().as_bytes()),
     }
     let hex = format!("{:x}", hasher.finalize());
     format!("{prefix}-{}@mailsift", &hex[..16])
@@ -792,5 +802,37 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\r\n")
             + "\r\n"
+    }
+
+    #[test]
+    fn lodging_with_date_only_checkin_is_converted() {
+        // Airbnb-style `checkinDate` / `checkoutDate` are date-only.
+        // A reservation carrying them must still produce an event.
+        let json = serde_json::json!({
+            "@type": "LodgingReservation",
+            "reservationNumber": "HMABCD",
+            "reservationFor": {"@type": "LodgingBusiness", "name": "Some Hotel"},
+            "checkinDate": "2026-07-12",
+            "checkoutDate": "2026-07-15"
+        });
+        let events = convert(&json).expect("convert should succeed");
+        assert_eq!(events.len(), 1);
+        // Date-only input must render as an all-day (DATE-valued)
+        // component, not a midnight timestamp.
+        assert!(
+            events[0].body.contains("DTSTART;VALUE=DATE:20260712"),
+            "got: {}",
+            events[0].body
+        );
+        assert!(
+            events[0].body.contains("DTEND;VALUE=DATE:20260715"),
+            "got: {}",
+            events[0].body
+        );
+    }
+
+    #[test]
+    fn parse_date_time_accepts_date_only() {
+        assert!(parse_date_time("2026-07-12").is_some());
     }
 }
