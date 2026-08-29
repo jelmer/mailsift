@@ -11,7 +11,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use tracing::info;
@@ -137,7 +137,27 @@ pub fn file_parcel(
     }
 }
 
+/// Fields describing where a parcel is right now, as opposed to what
+/// it is. Only a mail newer than everything already recorded may
+/// overwrite these; the rest merge unconditionally.
+const STATE_FIELDS: [&str; 5] = [
+    "deliveryStatus",
+    "expectedArrivalFrom",
+    "expectedArrivalUntil",
+    "actualDeliveryTime",
+    "trackingUrl",
+];
+
 /// Overlay incoming fields onto existing, appending a history entry.
+///
+/// A mailbox is not processed in date order -- a rescan, a re-filed
+/// folder or an IMAP scan that walks messages by UID can all hand us
+/// an older mail after a newer one. Applying every incoming field
+/// blindly then rolls the parcel's state backwards, leaving a
+/// delivered parcel claiming to be out for delivery. So the state
+/// fields above are only taken from a mail at least as new as the
+/// newest one already merged; everything else still overlays, and the
+/// history records the mail either way.
 fn merge(mut existing: Value, incoming: Value) -> Value {
     let Value::Object(mut existing_obj) = existing.take() else {
         // Existing isn't an object; replace wholesale.
@@ -148,6 +168,17 @@ fn merge(mut existing: Value, incoming: Value) -> Value {
     };
 
     let history_entry = history_entry_from(&incoming_obj);
+    let incoming_date = received_at_of(&incoming_obj);
+    let newest_known = newest_received_at(&existing_obj);
+    let is_stale = match (incoming_date, newest_known) {
+        (Some(incoming), Some(newest)) => incoming < newest,
+        // Undated mail can't be ordered by date. Fall back on the one
+        // thing we know regardless: a parcel that has been delivered
+        // or returned does not go back to being in transit. Not every
+        // extractor sets `receivedAt`, and those records hit this path
+        // exclusively.
+        _ => is_final_status(&existing_obj) && !is_final_status(&incoming_obj),
+    };
 
     for (k, v) in incoming_obj {
         if k == "history" {
@@ -157,6 +188,9 @@ fn merge(mut existing: Value, incoming: Value) -> Value {
         // was first filed) even as later updates flow in; each update's
         // date is captured in the per-history entry.
         if k == "receivedAt" && existing_obj.contains_key("receivedAt") {
+            continue;
+        }
+        if is_stale && STATE_FIELDS.contains(&k.as_str()) {
             continue;
         }
         existing_obj.insert(k, v);
@@ -170,6 +204,46 @@ fn merge(mut existing: Value, incoming: Value) -> Value {
     }
 
     Value::Object(existing_obj)
+}
+
+/// Whether a record's `deliveryStatus` is a terminal one. Matches the
+/// schema.org `DeliveryEvent` and `OrderStatus` spellings extractors
+/// emit, ignoring case and separators.
+fn is_final_status(obj: &Map<String, Value>) -> bool {
+    let Some(status) = obj.get("deliveryStatus").and_then(Value::as_str) else {
+        return false;
+    };
+    let normalised: String = status
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    matches!(
+        normalised.as_str(),
+        "delivered" | "orderdelivered" | "returned" | "orderreturned" | "returnedtosender"
+    )
+}
+
+/// The `receivedAt` of a single record or history entry, as a
+/// comparable timestamp.
+fn received_at_of(obj: &Map<String, Value>) -> Option<DateTime<Utc>> {
+    let raw = obj.get("receivedAt")?.as_str()?;
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// The newest mail date already merged into a record: the top-level
+/// `receivedAt` and every history entry's, whichever is latest.
+fn newest_received_at(obj: &Map<String, Value>) -> Option<DateTime<Utc>> {
+    let from_history = obj
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .filter_map(received_at_of);
+    received_at_of(obj).into_iter().chain(from_history).max()
 }
 
 fn with_initial_history(incoming: Value) -> Value {
@@ -310,6 +384,182 @@ mod tests {
     }
 
     #[test]
+    fn older_mail_does_not_overwrite_a_newer_status() {
+        // Mailboxes are not processed in date order, so a delivery
+        // notification can be filed before the "out for delivery" mail
+        // that preceded it. The newer mail must win regardless.
+        let existing = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "Delivered",
+            "receivedAt": "2024-12-20T15:00:00Z",
+            "history": [
+                {"seen_at": "2024-12-21T10:00:00Z", "receivedAt": "2024-12-20T15:00:00Z",
+                 "deliveryStatus": "Delivered"}
+            ]
+        });
+        let incoming = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "OutForDelivery",
+            "receivedAt": "2024-12-20T08:00:00Z"
+        });
+        let merged = merge(existing, incoming);
+        let obj = merged.as_object().unwrap();
+        assert_eq!(
+            obj.get("deliveryStatus").unwrap(),
+            "Delivered",
+            "an older mail must not un-deliver a parcel"
+        );
+        // The older mail is still recorded in the history.
+        assert_eq!(obj.get("history").unwrap().as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn newer_mail_updates_the_status() {
+        let existing = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "OutForDelivery",
+            "receivedAt": "2024-12-20T08:00:00Z",
+            "history": [
+                {"seen_at": "2024-12-20T09:00:00Z", "receivedAt": "2024-12-20T08:00:00Z",
+                 "deliveryStatus": "OutForDelivery"}
+            ]
+        });
+        let incoming = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "Delivered",
+            "receivedAt": "2024-12-20T15:00:00Z"
+        });
+        let merged = merge(existing, incoming);
+        assert_eq!(
+            merged.as_object().unwrap().get("deliveryStatus").unwrap(),
+            "Delivered"
+        );
+    }
+
+    #[test]
+    fn a_stale_mail_still_contributes_non_state_fields() {
+        // Only the state fields are held back; a description the older
+        // mail carries is still worth having.
+        let existing = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "Delivered",
+            "receivedAt": "2024-12-20T15:00:00Z"
+        });
+        let incoming = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "OnItsWay",
+            "description": "A book",
+            "receivedAt": "2024-12-19T08:00:00Z"
+        });
+        let obj = merge(existing, incoming);
+        let obj = obj.as_object().unwrap();
+        assert_eq!(obj.get("deliveryStatus").unwrap(), "Delivered");
+        assert_eq!(obj.get("description").unwrap(), "A book");
+    }
+
+    #[test]
+    fn ordering_considers_history_dates_not_just_the_top_level() {
+        // The top-level receivedAt stays at the first mail's date, so
+        // ordering has to look at the history to find the newest.
+        let existing = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "Delivered",
+            "receivedAt": "2024-12-01T08:00:00Z",
+            "history": [
+                {"receivedAt": "2024-12-01T08:00:00Z", "deliveryStatus": "OnItsWay"},
+                {"receivedAt": "2024-12-20T15:00:00Z", "deliveryStatus": "Delivered"}
+            ]
+        });
+        let incoming = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "OutForDelivery",
+            "receivedAt": "2024-12-20T08:00:00Z"
+        });
+        let merged = merge(existing, incoming);
+        assert_eq!(
+            merged.as_object().unwrap().get("deliveryStatus").unwrap(),
+            "Delivered"
+        );
+    }
+
+    #[test]
+    fn same_timestamp_still_applies() {
+        // Equal dates are not stale: two mails in the same second
+        // should behave as before.
+        let existing = serde_json::json!({
+            "trackingNumber": "X", "deliveryStatus": "OnItsWay",
+            "receivedAt": "2024-12-20T08:00:00Z"
+        });
+        let incoming = serde_json::json!({
+            "trackingNumber": "X", "deliveryStatus": "Delivered",
+            "receivedAt": "2024-12-20T08:00:00Z"
+        });
+        let merged = merge(existing, incoming);
+        assert_eq!(
+            merged.as_object().unwrap().get("deliveryStatus").unwrap(),
+            "Delivered"
+        );
+    }
+
+    #[test]
+    fn undated_mail_cannot_undeliver_a_parcel() {
+        // Not every extractor sets receivedAt. Without dates we still
+        // refuse to walk a terminal state backwards.
+        let existing = serde_json::json!({"trackingNumber": "X", "deliveryStatus": "Delivered"});
+        let incoming = serde_json::json!({"trackingNumber": "X", "deliveryStatus": "OnItsWay"});
+        let merged = merge(existing, incoming);
+        assert_eq!(
+            merged.as_object().unwrap().get("deliveryStatus").unwrap(),
+            "Delivered"
+        );
+    }
+
+    #[test]
+    fn undated_mail_still_advances_a_parcel() {
+        // The guard only blocks moving away from a terminal state; an
+        // ordinary progression still applies.
+        let existing = serde_json::json!({"trackingNumber": "X", "deliveryStatus": "OnItsWay"});
+        let incoming = serde_json::json!({"trackingNumber": "X", "deliveryStatus": "Delivered"});
+        let merged = merge(existing, incoming);
+        assert_eq!(
+            merged.as_object().unwrap().get("deliveryStatus").unwrap(),
+            "Delivered"
+        );
+    }
+
+    #[test]
+    fn a_returned_parcel_is_also_terminal() {
+        let existing =
+            serde_json::json!({"trackingNumber": "X", "deliveryStatus": "OrderReturned"});
+        let incoming =
+            serde_json::json!({"trackingNumber": "X", "deliveryStatus": "OutForDelivery"});
+        let merged = merge(existing, incoming);
+        assert_eq!(
+            merged.as_object().unwrap().get("deliveryStatus").unwrap(),
+            "OrderReturned"
+        );
+    }
+
+    #[test]
+    fn timezones_are_compared_correctly() {
+        // 09:00+02:00 is 07:00Z, older than 08:00Z despite the larger
+        // wall-clock time.
+        let existing = serde_json::json!({
+            "trackingNumber": "X", "deliveryStatus": "Delivered",
+            "receivedAt": "2024-12-20T08:00:00Z"
+        });
+        let incoming = serde_json::json!({
+            "trackingNumber": "X", "deliveryStatus": "OnItsWay",
+            "receivedAt": "2024-12-20T09:00:00+02:00"
+        });
+        let merged = merge(existing, incoming);
+        assert_eq!(
+            merged.as_object().unwrap().get("deliveryStatus").unwrap(),
+            "Delivered"
+        );
+    }
+
+    #[test]
     fn merge_appends_history() {
         let existing = serde_json::json!({
             "trackingNumber": "X",
@@ -367,5 +617,62 @@ mod tests {
         let history = v["history"].as_array().unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[1]["receivedAt"], "2024-11-15T00:00:00Z");
+    }
+}
+
+#[cfg(test)]
+mod real_data_tests {
+    use super::*;
+
+    /// Replay a record's history through `merge` in the order mailsift
+    /// originally processed it (by `seen_at`), and report the status
+    /// the record ends up with.
+    fn replay(history: &[Value]) -> String {
+        let mut record = Value::Object(Map::new());
+        let mut first = true;
+        for entry in history {
+            let obj = entry.as_object().unwrap();
+            let mut incoming = Map::new();
+            incoming.insert("trackingNumber".into(), Value::String("X".into()));
+            for key in ["deliveryStatus", "receivedAt"] {
+                if let Some(v) = obj.get(key) {
+                    incoming.insert(key.to_string(), v.clone());
+                }
+            }
+            let incoming = Value::Object(incoming);
+            record = if first {
+                first = false;
+                with_initial_history(incoming)
+            } else {
+                merge(record, incoming)
+            };
+        }
+        record
+            .get("deliveryStatus")
+            .and_then(Value::as_str)
+            .unwrap_or("none")
+            .to_string()
+    }
+
+    #[test]
+    fn undated_delivery_survives_a_later_older_mail() {
+        // Shape taken from a real record: mailsift saw the delivery
+        // notification first, then the earlier "out for delivery" one,
+        // and neither carries a receivedAt.
+        let history = vec![
+            serde_json::json!({"deliveryStatus": "Delivered"}),
+            serde_json::json!({"deliveryStatus": "OutForDelivery"}),
+        ];
+        assert_eq!(replay(&history), "Delivered");
+    }
+
+    #[test]
+    fn dated_out_of_order_history_settles_on_the_newest() {
+        let history = vec![
+            serde_json::json!({"deliveryStatus": "OnItsWay", "receivedAt": "2025-11-20T09:00:00Z"}),
+            serde_json::json!({"deliveryStatus": "Delivered", "receivedAt": "2025-11-24T14:00:00Z"}),
+            serde_json::json!({"deliveryStatus": "OutForDelivery", "receivedAt": "2025-11-24T08:00:00Z"}),
+        ];
+        assert_eq!(replay(&history), "Delivered");
     }
 }
