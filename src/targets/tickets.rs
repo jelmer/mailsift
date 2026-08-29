@@ -16,6 +16,15 @@
 //! Same `<slug>` + `<ext>` overwrites in place either way, matching
 //! the PUT-by-name idempotency used elsewhere.
 //!
+//! Unlike the other kinds, a ticket can't be renamed from its own
+//! contents, so the extractor's slug is the filed name. Extractors are
+//! asked to structure it as `<what-it-is>-<date>` (see
+//! `README.extractors.md`); a slug like `boarding-pass` collides with
+//! every other ticket of that name in the same year. That's a
+//! convention rather than something enforced here - the slug is
+//! arbitrary by design, and rejecting one would drop a ticket we
+//! could otherwise keep.
+//!
 //! Alongside each blob goes a `<slug>.meta.json` sidecar. Nothing can
 //! be read out of a PDF or a pkpass, so the sidecar records what we
 //! knew at filing time: which file the blob landed in, its content

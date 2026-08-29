@@ -25,7 +25,11 @@ def main() -> int:
         },
     }
     Path("flight.reservation.json").write_text(json.dumps(body))
-    Path("boarding-pass.ticket.pdf").write_bytes(b"%PDF-1.4 fixture boarding pass")
+    # Slug follows the documented <what-it-is>-<date> convention;
+    # the blob keeps this name when filed.
+    Path("fixture-air-fx123-2026-04-10.ticket.pdf").write_bytes(
+        b"%PDF-1.4 fixture boarding pass"
+    )
     return 0
 
 

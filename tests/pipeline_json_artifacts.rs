@@ -86,16 +86,16 @@ fn ticket_sidecar_carries_sibling_reservation_fields() {
 
     // Year comes from the sibling reservation's departureTime, not
     // the message Date (March) - the trip is what matters.
-    let blob = tickets.join("2026/boarding-pass.pdf");
+    let blob = tickets.join("2026/fixture-air-fx123-2026-04-10.pdf");
     assert!(blob.exists(), "ticket blob missing at {}", blob.display());
 
-    let path = tickets.join("2026/boarding-pass.meta.json");
+    let path = tickets.join("2026/fixture-air-fx123-2026-04-10.meta.json");
     let body =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
 
-    assert_eq!(v["slug"], "boarding-pass");
-    assert_eq!(v["file"], "boarding-pass.pdf");
+    assert_eq!(v["slug"], "fixture-air-fx123-2026-04-10");
+    assert_eq!(v["file"], "fixture-air-fx123-2026-04-10.pdf");
     assert_eq!(v["contentType"], "application/pdf");
     assert_eq!(v["reservationNumber"], "FX7QT2");
     assert_eq!(v["underName"], "J Vernooij");
