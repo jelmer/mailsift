@@ -152,6 +152,8 @@ pub(super) fn file_reservation_json(
     summary: &mut Summary,
 ) {
     match reservations::file_reservation(&artifact.path, reservations_dir, received_at_epoch) {
+        // One bump per record written, matching the event side, where
+        // a multi-leg itinerary counts as several events.
         Ok(outcomes) => {
             for _ in outcomes {
                 summary.bump(extractor, KIND_RESERVATION);

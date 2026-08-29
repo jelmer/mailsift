@@ -19,7 +19,7 @@ on stdin and writes typed artifact files into a per-run tempdir:
 | `.bill.json`       | Loosely schema.org `Invoice`-shaped record (payee, invoice number, due date, ...).  |
 | `.parcel.json`     | schema.org `ParcelDelivery`-shaped record (merged across status-update mails).      |
 | `.receipt.json`    | Loosely schema.org `Order`-shaped record (merchant, order number, date, ...).       |
-| `.ticket.<ext>`    | Opaque ticket / boarding pass blob (`pdf`, `pkpass`, image formats). Filed with a `.json` sidecar describing it. |
+| `.ticket.<ext>`    | Opaque ticket / boarding pass blob (`pdf`, `pkpass`, image formats). Filed with a `.meta.json` sidecar describing it. |
 
 Events go to a CalDAV inbox calendar or to a local `<UID>.ics` directory.
 Bills, parcels, receipts and tickets get filed under year-keyed local

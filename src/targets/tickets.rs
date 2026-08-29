@@ -16,12 +16,19 @@
 //! Same `<slug>` + `<ext>` overwrites in place either way, matching
 //! the PUT-by-name idempotency used elsewhere.
 //!
-//! Alongside each blob goes a `<slug>.json` sidecar. Nothing can be
-//! read out of a PDF or a pkpass, so the sidecar records what we knew
-//! at filing time: which file the blob landed in, its content type,
-//! and the identifying fields ([`TicketMeta`]) lifted from the sibling
-//! reservation in the same extractor run. That makes the ticket
-//! directory searchable without opening every attachment.
+//! Alongside each blob goes a `<slug>.meta.json` sidecar. Nothing can
+//! be read out of a PDF or a pkpass, so the sidecar records what we
+//! knew at filing time: which file the blob landed in, its content
+//! type, and the identifying fields ([`TicketMeta`]) lifted from the
+//! sibling reservation in the same extractor run. That makes the
+//! ticket directory searchable without opening every attachment.
+//!
+//! The `.meta.` infix keeps the sidecar clear of the blob itself: a
+//! ticket extension is arbitrary (`classify` in [`crate::artifacts`]
+//! takes whatever follows `.ticket.`), so a `.ticket.json` blob would
+//! otherwise land on the sidecar's own path and one would silently
+//! overwrite the other. `sanitize_ext` rejects dots, so no blob can
+//! ever be named `<slug>.meta.json`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -77,6 +84,11 @@ fn content_type_for(ext: &str) -> &'static str {
     }
 }
 
+/// Filename of the sidecar describing the blob `<slug>.<ext>`.
+fn sidecar_name(slug: &str) -> String {
+    format!("{slug}.meta.json")
+}
+
 /// Render the sidecar body for a ticket blob.
 fn sidecar_body(
     slug: &str,
@@ -102,7 +114,7 @@ pub enum TicketSink {
 
 impl TicketSink {
     /// File `src` (a binary blob on disk) under the kind/year/slug/ext
-    /// scheme the sink defines, plus a `<slug>.json` sidecar
+    /// scheme the sink defines, plus a `<slug>.meta.json` sidecar
     /// describing it.
     ///
     /// The returned [`FileOutcome`] describes the blob; a sidecar
@@ -146,7 +158,7 @@ fn file_to_dir(
 
     let existed = target.exists();
     write_atomic(&target, &body)?;
-    write_atomic(&year_dir.join(format!("{slug}.json")), sidecar.as_bytes())?;
+    write_atomic(&year_dir.join(sidecar_name(slug)), sidecar.as_bytes())?;
 
     if existed {
         info!(target = %target.display(), "ticket updated");
@@ -169,7 +181,7 @@ fn file_to_webdav(
     let sub_path = format!("{year:04}/{slug}.{ext}");
     let outcome = sink.put(&sub_path, content_type_for(ext), body)?;
     sink.put(
-        &format!("{year:04}/{slug}.json"),
+        &format!("{year:04}/{}", sidecar_name(slug)),
         "application/json",
         sidecar.as_bytes().to_vec(),
     )?;
@@ -253,7 +265,8 @@ mod tests {
         )
         .unwrap();
 
-        let body = std::fs::read_to_string(tmp.path().join("2026/easyjet-ezy2521.json")).unwrap();
+        let body =
+            std::fs::read_to_string(tmp.path().join("2026/easyjet-ezy2521.meta.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["slug"], "easyjet-ezy2521");
         assert_eq!(v["file"], "easyjet-ezy2521.pdf");
@@ -274,12 +287,33 @@ mod tests {
         sink.file_ticket(&src, "gig", "png", 2026, &TicketMeta::default(), None)
             .unwrap();
 
-        let body = std::fs::read_to_string(tmp.path().join("2026/gig.json")).unwrap();
+        let body = std::fs::read_to_string(tmp.path().join("2026/gig.meta.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["contentType"], "image/png");
         let obj = v.as_object().unwrap();
         assert!(!obj.contains_key("reservationNumber"));
         assert!(!obj.contains_key("receivedAt"));
+    }
+
+    /// A ticket blob may legitimately be named `<slug>.ticket.json`;
+    /// `classify` takes whatever follows `.ticket.` as the extension.
+    /// The sidecar must not land on top of it.
+    #[test]
+    fn json_ticket_blob_survives_beside_its_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("t.json");
+        std::fs::write(&src, br#"{"real":"ticket payload"}"#).unwrap();
+
+        let sink = TicketSink::LocalDir(tmp.path().to_path_buf());
+        sink.file_ticket(&src, "gig", "json", 2026, &TicketMeta::default(), None)
+            .unwrap();
+
+        let blob = std::fs::read_to_string(tmp.path().join("2026/gig.json")).unwrap();
+        assert_eq!(blob, r#"{"real":"ticket payload"}"#);
+
+        let sidecar = std::fs::read_to_string(tmp.path().join("2026/gig.meta.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&sidecar).unwrap();
+        assert_eq!(v["file"], "gig.json");
     }
 
     #[test]
@@ -299,7 +333,7 @@ mod tests {
         )
         .unwrap();
 
-        let body = std::fs::read_to_string(tmp.path().join("2026/ns-reizigers.json")).unwrap();
+        let body = std::fs::read_to_string(tmp.path().join("2026/ns-reizigers.meta.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["slug"], "ns-reizigers");
         assert_eq!(v["file"], "ns-reizigers.pdf");

@@ -9,6 +9,11 @@
 //! Driven by a fixture extractor that emits both from one message, so
 //! the sibling lookup is exercised rather than stubbed.
 
+// The sidecar carries a `.meta.json` infix rather than a plain
+// `.json`: a ticket blob's extension is arbitrary, so a
+// `<slug>.ticket.json` attachment would otherwise land on the
+// sidecar's own path.
+
 use std::path::PathBuf;
 
 use assert_cmd::Command;
@@ -84,7 +89,7 @@ fn ticket_sidecar_carries_sibling_reservation_fields() {
     let blob = tickets.join("2026/boarding-pass.pdf");
     assert!(blob.exists(), "ticket blob missing at {}", blob.display());
 
-    let path = tickets.join("2026/boarding-pass.json");
+    let path = tickets.join("2026/boarding-pass.meta.json");
     let body =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");

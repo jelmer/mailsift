@@ -24,9 +24,10 @@ extractors_dir = "/etc/mailsift/extractors"
 #   parcels_dir:  <tracking-number>.json (merged across messages)
 #   receipts_dir: <year>/<merchant-slug>-<order-id>.json
 #   tickets_dir:  <year>/<slug>.<ext>   (year from sibling event/reservation)
-#                 plus a <year>/<slug>.json sidecar naming the blob and
-#                 carrying the sibling reservation's booking reference
+#                 plus a <year>/<slug>.meta.json sidecar naming the blob
+#                 and carrying the sibling reservation's booking reference
 #   reservations_dir: <year>/<provider-slug>-<reservation-number>.json
+#                 (a multi-leg itinerary appends each leg's own date)
 bills_dir = "/home/jelmer/Documents/bills"
 parcels_dir = "/home/jelmer/Documents/parcels"
 receipts_dir = "/home/jelmer/Documents/receipts"
