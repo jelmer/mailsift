@@ -547,12 +547,20 @@ fn parse_any_date(raw: &str) -> Option<NaiveDate> {
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         return Some(d);
     }
-    // strip fractional seconds + timezone before parsing.
+    // Strip fractional seconds + timezone before parsing. The offset
+    // is only looked for after the `T`: splitting the whole string on
+    // `-` would cut an ISO date down to its year.
     let head = s.split('.').next().unwrap_or(s);
-    let head = head
-        .strip_suffix('Z')
-        .or_else(|| head.split(['+', '-']).next())
-        .unwrap_or(head);
+    let head = match head.strip_suffix('Z') {
+        Some(without_z) => without_z,
+        None => match head.find('T') {
+            Some(t) => match head[t..].find(['+', '-']) {
+                Some(off) => &head[..t + off],
+                None => head,
+            },
+            None => head,
+        },
+    };
     for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y%m%dT%H%M%S", "%Y%m%d"] {
         if let Ok(dt) = NaiveDateTime::parse_from_str(head, fmt) {
             return Some(dt.date());
@@ -1534,6 +1542,24 @@ mod tests {
         );
         assert!(parse_any_date("not a date").is_none());
         assert!(parse_any_date("").is_none());
+    }
+
+    #[test]
+    fn parse_any_date_accepts_floating_and_offset_times() {
+        // No trailing `Z`: the offset search must not cut the date's
+        // own hyphens.
+        assert_eq!(
+            parse_any_date("2026-04-10T15:00:00"),
+            NaiveDate::from_ymd_opt(2026, 4, 10)
+        );
+        assert_eq!(
+            parse_any_date("2026-04-10T15:00:00+02:00"),
+            NaiveDate::from_ymd_opt(2026, 4, 10)
+        );
+        assert_eq!(
+            parse_any_date("2026-04-10T15:00:00-05:00"),
+            NaiveDate::from_ymd_opt(2026, 4, 10)
+        );
     }
 
     #[tokio::test]
