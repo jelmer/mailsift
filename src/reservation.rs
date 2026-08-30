@@ -324,6 +324,12 @@ fn parse_date_time(raw: &str) -> Option<DateTimeField> {
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M") {
         return Some(DateTimeField::Floating(dt));
     }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(DateTimeField::Floating(dt));
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M") {
+        return Some(DateTimeField::Floating(dt));
+    }
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         return Some(DateTimeField::Date(d));
     }
@@ -834,5 +840,18 @@ mod tests {
     #[test]
     fn parse_date_time_accepts_date_only() {
         assert!(parse_date_time("2026-07-12").is_some());
+    }
+
+    #[test]
+    fn parse_date_time_accepts_space_separator() {
+        let parsed =
+            parse_date_time("2025-08-28 12:00:00").expect("space-separated timestamp parses");
+        match parsed {
+            DateTimeField::Floating(dt) => {
+                assert_eq!(dt.to_string(), "2025-08-28 12:00:00");
+            }
+            other => panic!("expected Floating, got {other:?}"),
+        }
+        assert!(parse_date_time("2025-08-28 12:00").is_some());
     }
 }
