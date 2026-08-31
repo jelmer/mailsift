@@ -1,7 +1,8 @@
 //! Read-only HTTP dashboard for the artifact directories.
 //!
 //! Scans the configured `bills_dir`, `parcels_dir`, `receipts_dir`,
-//! `subscriptions_dir`, `events_dir`, and `tickets_dir` on each request
+//! `subscriptions_dir`, `events_dir`, `reservations_dir`, and
+//! `tickets_dir` on each request
 //! and renders a small HTML view of what's there. JSON views and raw
 //! file downloads are exposed alongside so the same server can be used
 //! as a data source for other tools.
@@ -84,6 +85,13 @@ impl AppState {
     }
     fn subscriptions_dir(&self) -> Option<&Path> {
         self.config.subscriptions_dir.as_deref()
+    }
+
+    /// Archived reservation JSON. Independent of `events_dir`: a
+    /// reservation is always turned into a calendar event, and the
+    /// full record is additionally kept here when configured.
+    fn reservations_dir(&self) -> Option<&Path> {
+        self.config.reservations_dir.as_deref()
     }
 
     /// Receipts have three possible sinks; only the local one is
@@ -218,12 +226,15 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/receipts/:year/:name", get(get_receipt))
         .route("/subscriptions", get(list_subscriptions))
         .route("/subscriptions/:name", get(get_subscription))
+        .route("/reservations", get(list_reservations))
+        .route("/reservations/:year/:name", get(get_reservation))
         .route("/tickets", get(list_tickets))
         .route("/tickets/:year/:name", get(get_ticket))
         .route("/api/bills.json", get(api_bills))
         .route("/api/parcels.json", get(api_parcels))
         .route("/api/receipts.json", get(api_receipts))
         .route("/api/subscriptions.json", get(api_subscriptions))
+        .route("/api/reservations.json", get(api_reservations))
         .with_state(state)
 }
 
@@ -320,6 +331,11 @@ fn page(state: &AppState, title: &str, body: &str) -> String {
             "/subscriptions",
             state.subscriptions_dir().is_some(),
         ),
+        (
+            "reservations",
+            "/reservations",
+            state.reservations_dir().is_some(),
+        ),
         ("tickets", "/tickets", state.tickets_dir().is_some()),
     ] {
         if present {
@@ -410,6 +426,14 @@ async fn index(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppEr
             state
                 .subscriptions_dir()
                 .map(|d| count_flat(d, "json"))
+                .transpose()?,
+        ),
+        (
+            "reservations",
+            "/reservations",
+            state
+                .reservations_dir()
+                .map(|d| count_year(d, Some("json")))
                 .transpose()?,
         ),
         (
@@ -547,12 +571,20 @@ fn parse_any_date(raw: &str) -> Option<NaiveDate> {
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         return Some(d);
     }
-    // strip fractional seconds + timezone before parsing.
+    // Strip fractional seconds + timezone before parsing. The offset
+    // is only looked for after the `T`: splitting the whole string on
+    // `-` would cut an ISO date down to its year.
     let head = s.split('.').next().unwrap_or(s);
-    let head = head
-        .strip_suffix('Z')
-        .or_else(|| head.split(['+', '-']).next())
-        .unwrap_or(head);
+    let head = match head.strip_suffix('Z') {
+        Some(without_z) => without_z,
+        None => match head.find('T') {
+            Some(t) => match head[t..].find(['+', '-']) {
+                Some(off) => &head[..t + off],
+                None => head,
+            },
+            None => head,
+        },
+    };
     for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y%m%dT%H%M%S", "%Y%m%d"] {
         if let Ok(dt) = NaiveDateTime::parse_from_str(head, fmt) {
             return Some(dt.date());
@@ -694,6 +726,22 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 subtitle: renewal.unwrap_or_default(),
                 vendor_url: vendor_url(&value),
                 href: format!("/subscriptions/{name}"),
+            });
+        }
+    }
+
+    if let Some(dir) = state.reservations_dir() {
+        for (year, slug, value) in walk_year_json(dir)? {
+            let date = reservation_date(&value)
+                .and_then(|d| parse_any_date(&d))
+                .unwrap_or_else(|| mtime_date(&dir.join(&year).join(format!("{slug}.json"))));
+            items.push(FeedItem {
+                date,
+                kind: "reservation",
+                title: reservation_provider(&value).unwrap_or_default(),
+                subtitle: reservation_number(&value).unwrap_or_default(),
+                vendor_url: vendor_url(&value),
+                href: format!("/reservations/{year}/{slug}.json"),
             });
         }
     }
@@ -1170,6 +1218,91 @@ async fn get_subscription(
         .into_response())
 }
 
+/// Name of a schema.org node that may be a bare string or an object
+/// with a `name` (or, for airlines, an `iataCode`). Mirrors the
+/// `Named` handling in [`crate::targets::reservations`].
+fn named(value: &Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        return (!s.trim().is_empty()).then(|| s.to_string());
+    }
+    pick_str(value, &["name", "iataCode"])
+}
+
+/// Who a reservation is with. Same precedence as the filing target:
+/// the airline, then the generic provider, then the broker, then the
+/// name of the thing reserved (hotel, venue).
+fn reservation_provider(value: &Value) -> Option<String> {
+    let for_ = value.get("reservationFor");
+    for_.and_then(|f| f.get("airline"))
+        .and_then(named)
+        .or_else(|| value.get("provider").and_then(named))
+        .or_else(|| value.get("broker").and_then(named))
+        .or_else(|| for_.and_then(|f| f.get("name")).and_then(named))
+}
+
+/// Booking reference.
+fn reservation_number(value: &Value) -> Option<String> {
+    pick_str(value, &["reservationNumber", "reservationId", "identifier"])
+}
+
+/// The date this reservation happens on, most specific first. Prefers
+/// the trip's own date over `receivedAt` so a booking made months
+/// ahead still sorts as upcoming.
+fn reservation_date(value: &Value) -> Option<String> {
+    let for_ = value.get("reservationFor");
+    for_.and_then(|f| pick_str(f, &["departureTime", "startDate", "doorTime"]))
+        .or_else(|| pick_str(value, &["checkinTime", "startTime", "receivedAt"]))
+}
+
+async fn list_reservations(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
+    let dir = require_dir(state.reservations_dir(), "reservations")?;
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+    for (year, slug, value) in walk_year_json(dir)? {
+        let provider = reservation_provider(&value).unwrap_or_default();
+        let number = reservation_number(&value).unwrap_or_default();
+        let under = value.get("underName").and_then(named).unwrap_or_default();
+        let date = reservation_date(&value).unwrap_or_default();
+        let cells = format!(
+            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
+            esc(&year),
+            esc(&provider),
+            esc(&number),
+            esc(&under),
+            esc(&date),
+            links_cell(
+                &state.url(&format!("/reservations/{year}/{slug}.json")),
+                vendor_url(&value).as_deref(),
+            ),
+        );
+        rows.push((year, slug, cells));
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    if rows.is_empty() {
+        return Ok(Html(page(
+            &state,
+            "Reservations",
+            "<div class=\"empty\">no reservations</div>",
+        )));
+    }
+    let body = format!(
+        "<table><thead><tr><th>year</th><th>provider</th><th>reference</th><th>name</th>\
+         <th>date</th><th></th></tr></thead><tbody>{}</tbody></table>",
+        rows.into_iter()
+            .map(|(_, _, c)| format!("<tr>{c}</tr>"))
+            .collect::<Vec<_>>()
+            .join("")
+    );
+    Ok(Html(page(&state, "Reservations", &body)))
+}
+
+async fn get_reservation(
+    State(state): State<Arc<AppState>>,
+    UrlPath((year, name)): UrlPath<(String, String)>,
+) -> Result<Response, AppError> {
+    let dir = require_dir(state.reservations_dir(), "reservations")?;
+    serve_json_file(dir, &year, &name)
+}
+
 async fn list_tickets(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.tickets_dir(), "tickets")?;
     let mut rows: Vec<(String, String, String)> = Vec::new();
@@ -1289,6 +1422,21 @@ async fn api_receipts(State(state): State<Arc<AppState>>) -> Result<Json<Value>,
 async fn api_subscriptions(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
     let dir = require_dir(state.subscriptions_dir(), "subscriptions")?;
     let items: Vec<Value> = walk_flat_json(dir)?.into_iter().map(|(_, v)| v).collect();
+    Ok(Json(Value::Array(items)))
+}
+
+async fn api_reservations(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
+    let dir = require_dir(state.reservations_dir(), "reservations")?;
+    let items: Vec<Value> = walk_year_json(dir)?
+        .into_iter()
+        .map(|(year, slug, mut v)| {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("_year".into(), Value::String(year));
+                obj.insert("_slug".into(), Value::String(slug));
+            }
+            v
+        })
+        .collect();
     Ok(Json(Value::Array(items)))
 }
 
@@ -1482,10 +1630,21 @@ mod tests {
               DTSTART:20260201T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         )
         .unwrap();
+        let reservations = tmp.path().join("reservations/2026");
+        fs::create_dir_all(&reservations).unwrap();
+        fs::write(
+            reservations.join("fixture-air-FX7QT2.json"),
+            br#"{"@type":"FlightReservation","reservationNumber":"FX7QT2",
+                 "underName":{"name":"J Vernooij"},
+                 "reservationFor":{"airline":{"iataCode":"FX","name":"Fixture Air"},
+                                   "departureTime":"2026-04-10T08:00:00Z"}}"#,
+        )
+        .unwrap();
         let config = Config {
             events_dir: Some(events),
             bills_dir: Some(tmp.path().join("bills")),
             parcels_dir: Some(parcels),
+            reservations_dir: Some(tmp.path().join("reservations")),
             ..Config::default()
         };
         (tmp, config)
@@ -1534,6 +1693,24 @@ mod tests {
         );
         assert!(parse_any_date("not a date").is_none());
         assert!(parse_any_date("").is_none());
+    }
+
+    #[test]
+    fn parse_any_date_accepts_floating_and_offset_times() {
+        // No trailing `Z`: the offset search must not cut the date's
+        // own hyphens.
+        assert_eq!(
+            parse_any_date("2026-04-10T15:00:00"),
+            NaiveDate::from_ymd_opt(2026, 4, 10)
+        );
+        assert_eq!(
+            parse_any_date("2026-04-10T15:00:00+02:00"),
+            NaiveDate::from_ymd_opt(2026, 4, 10)
+        );
+        assert_eq!(
+            parse_any_date("2026-04-10T15:00:00-05:00"),
+            NaiveDate::from_ymd_opt(2026, 4, 10)
+        );
     }
 
     #[tokio::test]
@@ -1711,6 +1888,7 @@ mod tests {
         assert!(body.contains(">events<"));
         assert!(body.contains(">bills<"));
         assert!(body.contains(">parcels<"));
+        assert!(body.contains(">reservations<"));
     }
 
     #[tokio::test]
@@ -1938,5 +2116,146 @@ tickets_dir = "/var/mailsift/tickets"
         assert_eq!(human_size(500), "500 B");
         assert_eq!(human_size(2048), "2.0 KB");
         assert_eq!(human_size(2 * 1024 * 1024), "2.0 MB");
+    }
+
+    #[tokio::test]
+    async fn reservations_list_shows_row() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/reservations").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Fixture Air"), "provider missing: {body}");
+        assert!(body.contains("FX7QT2"), "reference missing: {body}");
+        assert!(body.contains("J Vernooij"), "under name missing: {body}");
+    }
+
+    #[tokio::test]
+    async fn reservations_overview_card_counts() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        let card = body
+            .split("<div class=\"card\">")
+            .skip(1)
+            .find(|c| c.contains("href=\"/reservations\""))
+            .expect("no reservations card");
+        assert!(
+            card.contains("<div class=\"n\">1</div>"),
+            "expected a count of 1; card: {card}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reservations_appear_in_feed() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/all").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("<span class=\"badge\">reservation</span>"),
+            "no reservation badge in feed: {body}"
+        );
+        assert!(body.contains("Fixture Air"), "feed row missing: {body}");
+    }
+
+    #[tokio::test]
+    async fn reservation_download_serves_json() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/reservations/2026/fixture-air-FX7QT2.json").await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["reservationNumber"], "FX7QT2");
+    }
+
+    #[tokio::test]
+    async fn reservations_json_api() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/api/reservations.json").await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["reservationNumber"], "FX7QT2");
+        assert_eq!(parsed[0]["_year"], "2026");
+        assert_eq!(parsed[0]["_slug"], "fixture-air-FX7QT2");
+    }
+
+    #[tokio::test]
+    async fn reservations_hidden_when_unconfigured() {
+        let (_tmp, mut config) = fixture();
+        config.reservations_dir = None;
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains(">reservations<"),
+            "reservations should be hidden"
+        );
+    }
+
+    #[tokio::test]
+    async fn reservations_unconfigured_returns_404() {
+        let (_tmp, mut config) = fixture();
+        config.reservations_dir = None;
+        let app = router(state_with(config, ""));
+        let (status, _) = get(&app, "/reservations").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn reservation_provider_prefers_airline() {
+        let v: Value = serde_json::from_str(
+            r#"{"provider":{"name":"Agency"},
+                "reservationFor":{"airline":{"name":"Fixture Air"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(reservation_provider(&v).as_deref(), Some("Fixture Air"));
+    }
+
+    #[test]
+    fn reservation_provider_falls_back_to_venue_name() {
+        let v: Value =
+            serde_json::from_str(r#"{"reservationFor":{"name":"Fixture Inn"}}"#).unwrap();
+        assert_eq!(reservation_provider(&v).as_deref(), Some("Fixture Inn"));
+    }
+
+    #[test]
+    fn reservation_provider_accepts_bare_string_node() {
+        let v: Value = serde_json::from_str(r#"{"broker":"Fixture Travel"}"#).unwrap();
+        assert_eq!(reservation_provider(&v).as_deref(), Some("Fixture Travel"));
+    }
+
+    #[test]
+    fn reservation_date_prefers_trip_date_over_received_at() {
+        let v: Value = serde_json::from_str(
+            r#"{"receivedAt":"2026-01-01T00:00:00Z",
+                "reservationFor":{"departureTime":"2026-04-10T08:00:00Z"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            reservation_date(&v).and_then(|d| parse_any_date(&d)),
+            NaiveDate::from_ymd_opt(2026, 4, 10)
+        );
+    }
+
+    #[test]
+    fn reservation_date_uses_checkin_for_lodging() {
+        let v: Value = serde_json::from_str(
+            r#"{"checkinTime":"2026-04-10T15:00:00",
+                "reservationFor":{"name":"Fixture Inn"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            reservation_date(&v).and_then(|d| parse_any_date(&d)),
+            NaiveDate::from_ymd_opt(2026, 4, 10)
+        );
+    }
+
+    #[test]
+    fn reservation_number_falls_back_to_identifier() {
+        let v: Value = serde_json::from_str(r#"{"identifier":"ID-9"}"#).unwrap();
+        assert_eq!(reservation_number(&v).as_deref(), Some("ID-9"));
     }
 }
