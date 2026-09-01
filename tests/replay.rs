@@ -72,4 +72,13 @@ fn replay_fails_with_empty_extractors_dir() {
         stderr.contains("no extractors found"),
         "unexpected stderr: {stderr}"
     );
+    assert!(
+        !stderr.contains("Stack backtrace"),
+        "user-config error should not include a backtrace: {stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "usage errors should exit 2, got {stderr}"
+    );
 }
