@@ -361,6 +361,13 @@ struct ImapScanArgs {
     /// format (e.g. `01-Jan-2026`).
     #[arg(long)]
     since: Option<String>,
+    /// Only consider messages with an internal date strictly before
+    /// this date, in IMAP date format. Combines with `--since` to
+    /// bound a scan to a window (e.g. one month) so a single IMAP
+    /// session doesn't outrun the server's idle timeout on very large
+    /// mailboxes.
+    #[arg(long)]
+    before: Option<String>,
     /// Cap on the number of messages to process in the initial
     /// scan. With `--watch`, the cap applies only to the backfill
     /// pass; messages arriving while watching are not counted.
@@ -1338,6 +1345,7 @@ fn run() -> Result<()> {
                 #[cfg_attr(not(feature = "gssapi"), allow(unused_variables))]
                 authzid,
                 since,
+                before,
                 limit,
                 extractors,
                 target,
@@ -1420,6 +1428,7 @@ fn run() -> Result<()> {
                 auth: auth_method,
                 mailbox: &target_imap.mailbox,
                 since: since.as_deref(),
+                before: before.as_deref(),
                 limit,
                 extractors: &extractors,
                 targets: pipeline::PipelineTargets {
