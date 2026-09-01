@@ -957,7 +957,7 @@ fn discover_required(dirs: &[PathBuf]) -> Result<Vec<mailsift::extractor::Extrac
     let extractors = mailsift::extractor::discover(dirs)
         .with_context(|| format!("discovering extractors in {}", render_paths(dirs)))?;
     if extractors.is_empty() {
-        return Err(anyhow!(
+        return Err(usage_error!(
             "no extractors found under {}; check extractors_dir",
             render_paths(dirs)
         ));
