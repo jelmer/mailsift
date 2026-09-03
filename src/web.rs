@@ -230,11 +230,13 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/reservations/:year/:name", get(get_reservation))
         .route("/tickets", get(list_tickets))
         .route("/tickets/:year/:name", get(get_ticket))
+        .route("/stats", get(show_stats))
         .route("/api/bills.json", get(api_bills))
         .route("/api/parcels.json", get(api_parcels))
         .route("/api/receipts.json", get(api_receipts))
         .route("/api/subscriptions.json", get(api_subscriptions))
         .route("/api/reservations.json", get(api_reservations))
+        .route("/api/stats.json", get(api_stats))
         .with_state(state)
 }
 
@@ -304,6 +306,7 @@ h1 { margin-top: 0; }
 table { border-collapse: collapse; width: 100%; background: #fff; }
 th, td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid #eee; vertical-align: top; }
 th { background: #f2f4f8; font-weight: 600; }
+th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
 tr:hover td { background: #fbfcff; }
 pre { background: #f5f5f7; padding: 1rem; overflow: auto; }
 .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.8rem; background: #e8eef7; color: #2a3f5f; }
@@ -337,6 +340,10 @@ fn page(state: &AppState, title: &str, body: &str) -> String {
             state.reservations_dir().is_some(),
         ),
         ("tickets", "/tickets", state.tickets_dir().is_some()),
+        // Stats is always in the nav: if there's no log yet the
+        // page renders an "empty" panel telling you where mailsift
+        // would write one.
+        ("stats", "/stats", true),
     ] {
         if present {
             nav.push_str(&format!(
@@ -1440,6 +1447,95 @@ async fn api_reservations(State(state): State<Arc<AppState>>) -> Result<Json<Val
     Ok(Json(Value::Array(items)))
 }
 
+/// Per-extractor stats table, aggregated on request from
+/// `$XDG_STATE_HOME/mailsift/events.ndjson`. The file is written by
+/// the milter and (by default) by `imap-scan` and `maildir-scan`.
+/// When no log exists yet the page renders an empty panel telling
+/// the user where mailsift would write one.
+async fn show_stats(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
+    let Some(log_path) = crate::stats::default_log_path() else {
+        return Ok(Html(page(
+            &state,
+            "Stats",
+            "<div class=\"empty\">no <code>$XDG_STATE_HOME</code> or <code>$HOME</code> \
+             set; can't locate an events log</div>",
+        )));
+    };
+    if !log_path.exists() {
+        return Ok(Html(page(
+            &state,
+            "Stats",
+            &format!(
+                "<div class=\"empty\">no events recorded yet at \
+                 <code>{}</code>. Run <code>mailsift imap-scan</code> or the milter \
+                 (or the maildir scanner) at least once to populate it.</div>",
+                esc(&log_path.display().to_string())
+            ),
+        )));
+    }
+    let stats = crate::stats::aggregate(&log_path)?;
+    if stats.is_empty() {
+        return Ok(Html(page(
+            &state,
+            "Stats",
+            "<div class=\"empty\">no events recorded</div>",
+        )));
+    }
+    let rows = stats
+        .iter()
+        .map(|s| {
+            let mean = s
+                .mean_duration_ms
+                .map(|m| format!("{m:.0}"))
+                .unwrap_or_else(|| "-".to_string());
+            let skipped = s.skipped_headers + s.skipped_body + s.skipped_dkim;
+            let last_domain = s.recent_domains.last().map(String::as_str).unwrap_or("-");
+            format!(
+                "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
+                 <td class=\"num\">{}</td><td class=\"num\">{}</td>\
+                 <td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td></tr>",
+                esc(&s.name),
+                s.runs,
+                s.produced,
+                s.empty,
+                s.failed,
+                skipped,
+                esc(&mean),
+                esc(last_domain),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let body = format!(
+        "<table><thead><tr>\
+         <th>extractor</th>\
+         <th class=\"num\">runs</th>\
+         <th class=\"num\">produced</th>\
+         <th class=\"num\">empty</th>\
+         <th class=\"num\">failed</th>\
+         <th class=\"num\">skipped</th>\
+         <th class=\"num\">mean&nbsp;ms</th>\
+         <th>last domain</th>\
+         </tr></thead><tbody>{rows}</tbody></table>\
+         <p class=\"muted\">Aggregated from <code>{}</code>. \
+         Skipped folds headers/body/DKIM prefilter reasons; mean ms is over runs \
+         that actually forked the extractor.</p>",
+        esc(&log_path.display().to_string()),
+    );
+    Ok(Html(page(&state, "Stats", &body)))
+}
+
+async fn api_stats(State(_state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
+    let Some(log_path) = crate::stats::default_log_path() else {
+        return Ok(Json(Value::Array(vec![])));
+    };
+    if !log_path.exists() {
+        return Ok(Json(Value::Array(vec![])));
+    }
+    let stats = crate::stats::aggregate(&log_path)?;
+    Ok(Json(serde_json::to_value(stats)?))
+}
+
 /// (filename, parsed JSON) for every `*.json` directly under `dir`.
 fn walk_flat_json(dir: &Path) -> Result<Vec<(String, Value)>> {
     let mut out = Vec::new();
@@ -2257,5 +2353,48 @@ tickets_dir = "/var/mailsift/tickets"
     fn reservation_number_falls_back_to_identifier() {
         let v: Value = serde_json::from_str(r#"{"identifier":"ID-9"}"#).unwrap();
         assert_eq!(reservation_number(&v).as_deref(), Some("ID-9"));
+    }
+
+    /// The /stats page is always in the nav, even for a config with
+    /// no artifact directories. The empty-state message is rendered
+    /// when the log file doesn't exist yet.
+    #[tokio::test]
+    async fn stats_page_renders_empty_state_when_no_log() {
+        // Point XDG_STATE_HOME at a directory that exists but has no
+        // events log. The env-mutation dance mirrors the pattern in
+        // `stats::tests::default_log_path_uses_xdg_state_home`.
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_state = std::env::var_os("XDG_STATE_HOME");
+        let prev_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+            std::env::remove_var("HOME");
+        }
+
+        let (_fx_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/stats").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("no events recorded yet"), "body: {body}");
+        assert!(body.contains("mailsift/events.ndjson"), "body: {body}");
+
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            if let Some(v) = prev_home {
+                std::env::set_var("HOME", v);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nav_includes_stats_link() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(">stats</a>"), "no stats link in nav: {body}");
     }
 }
