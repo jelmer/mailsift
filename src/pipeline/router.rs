@@ -38,9 +38,21 @@ pub(super) struct Summary {
     /// constants). `BTreeMap` so the rendered string is stable across
     /// invocations.
     counts: BTreeMap<String, [u32; 7]>,
+    /// When set, the filer functions skip the actual target write
+    /// (disk / CalDAV / SMTP / Firefly / trackers) but still bump the
+    /// summary as if the write had succeeded. Reports what `--dry-run`
+    /// would do.
+    pub(super) dry_run: bool,
 }
 
 impl Summary {
+    pub(super) fn new(dry_run: bool) -> Self {
+        Self {
+            counts: BTreeMap::new(),
+            dry_run,
+        }
+    }
+
     pub(super) fn bump(&mut self, extractor: &str, kind_index: usize) {
         // Avoid allocating a new `String` on every bump — only allocate
         // when this is the first sighting of the extractor. `BTreeMap`
@@ -151,6 +163,10 @@ pub(super) fn file_reservation_json(
     received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_RESERVATION);
+        return;
+    }
     match reservations::file_reservation(&artifact.path, reservations_dir, received_at_epoch) {
         // One bump per record written, matching the event side, where
         // a multi-leg itinerary counts as several events.
@@ -210,6 +226,10 @@ pub(super) fn file_bill_artifact(
     received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_BILL);
+        return;
+    }
     match bills::file_bill(&artifact.path, bills_dir, firefly, received_at_epoch) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_BILL);
@@ -233,6 +253,10 @@ pub(super) fn file_parcel_artifact(
     received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_PARCEL);
+        return;
+    }
     match parcels::file_parcel(&artifact.path, parcels_dir, trackers, received_at_epoch) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_PARCEL);
@@ -255,6 +279,10 @@ fn file_single(
     seen: Option<&SeenStore>,
     summary: &mut Summary,
 ) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_EVENT);
+        return;
+    }
     // Skip the network round-trip when (a) we have a seen.db, (b) the
     // sink is CalDAV (local-dir rewrites are cheap, no point gating),
     // and (c) we've already PUT this exact body for this UID. Local
@@ -298,6 +326,10 @@ pub(super) fn file_receipt_artifact(
     received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_RECEIPT);
+        return;
+    }
     match sink.file_receipt(&artifact.path, raw_message, received_at_epoch) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_RECEIPT);
@@ -320,6 +352,10 @@ pub(super) fn file_subscription_artifact(
     received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_SUBSCRIPTION);
+        return;
+    }
     match subscriptions::file_subscription(&artifact.path, subscriptions_dir, received_at_epoch) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_SUBSCRIPTION);
@@ -344,6 +380,10 @@ pub(super) fn file_ticket_artifact(
     received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_TICKET);
+        return;
+    }
     match sink.file_ticket(
         &artifact.path,
         &artifact.slug,
