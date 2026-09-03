@@ -112,7 +112,11 @@ impl Recorder {
 
 /// Default log path: `$XDG_STATE_HOME/mailsift/events.ndjson` or
 /// `$HOME/.local/state/mailsift/events.ndjson`.
-fn default_log_path() -> Option<PathBuf> {
+/// XDG state path the milter (and any scan invoked without
+/// `--no-stats`) appends per-extractor events to. `None` if neither
+/// `$XDG_STATE_HOME` nor `$HOME` is set; that shouldn't happen in
+/// practice but the daemon shouldn't crash if it does.
+pub fn default_log_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
