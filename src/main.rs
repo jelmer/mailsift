@@ -380,6 +380,12 @@ struct ImapScanArgs {
     /// Don't actually file artifacts; just report what would happen.
     #[arg(long)]
     dry_run: bool,
+    /// Skip appending per-extractor events to the stats log
+    /// (`$XDG_STATE_HOME/mailsift/events.ndjson`). Enable for one-off
+    /// bulk imports whose skew you don't want reflected in the
+    /// dashboard.
+    #[arg(long)]
+    no_stats: bool,
     /// After the initial scan, stay connected and process new
     /// messages as they arrive (IMAP IDLE, RFC 2177). Runs until
     /// interrupted (Ctrl-C). On transport errors the connection is
@@ -483,6 +489,12 @@ enum Command {
         /// Don't actually file artifacts; just report what would happen.
         #[arg(long)]
         dry_run: bool,
+        /// Skip appending per-extractor events to the stats log
+        /// (`$XDG_STATE_HOME/mailsift/events.ndjson`). Enable for
+        /// one-off bulk imports whose skew you don't want reflected
+        /// in the dashboard.
+        #[arg(long)]
+        no_stats: bool,
     },
     /// Validate every discoverable extractor manifest. Parses each
     /// `<name>.yaml`, compiles the `subject_regex`, parses `requires:`
@@ -1345,6 +1357,7 @@ fn run() -> Result<()> {
                 trackers,
                 firefly,
                 dry_run,
+                no_stats,
                 watch,
             } = *args;
             let sink = target.build_sink(&config, runtime.handle())?;
@@ -1414,6 +1427,14 @@ fn run() -> Result<()> {
                     )
                 }
             };
+            // Log per-extractor stats by default. `--no-stats` opts
+            // out for one-off bulk imports whose skew you don't want
+            // reflected in the dashboard.
+            let recorder = if no_stats {
+                mailsift::stats::Recorder::Disabled
+            } else {
+                mailsift::stats::Recorder::default_file()
+            };
             imap_scan::run(imap_scan::ImapScanConfig {
                 host: &target_imap.host,
                 port: target_imap.port,
@@ -1433,9 +1454,9 @@ fn run() -> Result<()> {
                     firefly: firefly.as_ref(),
                     trackers: (!trackers.is_empty()).then_some(&trackers),
                     trusted_forwarders: &config.trusted_forwarders,
-                    // Bulk import: don't skew the milter's stats, and
-                    // bypass the dedup store so every event is re-PUT.
-                    recorder: &mailsift::stats::Recorder::Disabled,
+                    recorder: &recorder,
+                    // Bulk import: bypass the dedup store so every
+                    // event is re-PUT.
                     seen: None,
                 },
                 dry_run,
@@ -1454,6 +1475,7 @@ fn run() -> Result<()> {
             trackers,
             firefly,
             dry_run,
+            no_stats,
         } => {
             let sink = target.build_sink(&config, runtime.handle())?;
             let extractors_dir = resolve_extractors(extractors, &config);
@@ -1462,6 +1484,14 @@ fn run() -> Result<()> {
             let trackers = build_trackers(&trackers, &config, runtime.handle())?;
             let firefly = build_firefly(&firefly, &config, runtime.handle())?;
             let since = since.as_deref().map(parse_since_date).transpose()?;
+            // Log per-extractor stats by default. `--no-stats` opts
+            // out for one-off bulk imports whose skew you don't want
+            // reflected in the dashboard.
+            let recorder = if no_stats {
+                mailsift::stats::Recorder::Disabled
+            } else {
+                mailsift::stats::Recorder::default_file()
+            };
             mailsift::maildir_scan::run(mailsift::maildir_scan::MaildirScanConfig {
                 root: &path,
                 recurse,
@@ -1479,10 +1509,9 @@ fn run() -> Result<()> {
                     firefly: firefly.as_ref(),
                     trackers: (!trackers.is_empty()).then_some(&trackers),
                     trusted_forwarders: &config.trusted_forwarders,
-                    // Bulk import: mirror imap-scan's stance (don't
-                    // pollute the milter's stats, don't use its dedup
-                    // store; upstream sinks are already idempotent).
-                    recorder: &mailsift::stats::Recorder::Disabled,
+                    recorder: &recorder,
+                    // Bulk import: bypass the dedup store; upstream
+                    // sinks are already idempotent.
                     seen: None,
                 },
                 dry_run,
