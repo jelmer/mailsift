@@ -345,6 +345,42 @@ pub(super) fn file_receipt_artifact(
     }
 }
 
+/// File a `<slug>.receipt.<ext>` binary sidecar (typically the
+/// original PDF from the email). Requires a sibling `.receipt.json`
+/// artifact in the same run: the merchant/order/year on disk come
+/// from that JSON so the two files land next to each other.
+///
+/// The Forward sink returns `Ok(None)`: the raw message already
+/// carries the attachment and was forwarded by the sibling call.
+pub(super) fn file_receipt_file_artifact(
+    extractor: &str,
+    artifact: &Artifact,
+    sibling: &Artifact,
+    sink: &receipts::ReceiptSink,
+    summary: &mut Summary,
+) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_RECEIPT);
+        return;
+    }
+    match sink.file_receipt_file(&artifact.path, &sibling.path, &artifact.ext) {
+        Ok(Some(FileOutcome::Created(_) | FileOutcome::Updated(_))) => {
+            summary.bump(extractor, KIND_RECEIPT);
+        }
+        Ok(None) => {
+            // Forward sink: nothing to do, no summary bump.
+        }
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %artifact.path.display(),
+                error = format!("{e:#}"),
+                "failed to file receipt file"
+            );
+        }
+    }
+}
+
 pub(super) fn file_subscription_artifact(
     extractor: &str,
     artifact: &Artifact,

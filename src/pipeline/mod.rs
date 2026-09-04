@@ -359,6 +359,7 @@ pub fn run(
         let mut bill_arts: Vec<&Artifact> = Vec::new();
         let mut parcel_arts: Vec<&Artifact> = Vec::new();
         let mut receipt_arts: Vec<&Artifact> = Vec::new();
+        let mut receipt_file_arts: Vec<&Artifact> = Vec::new();
         let mut ticket_arts: Vec<&Artifact> = Vec::new();
         let mut subscription_arts: Vec<&Artifact> = Vec::new();
         for artifact in &run.result.artifacts {
@@ -368,6 +369,7 @@ pub fn run(
                 Kind::Bill => bill_arts.push(artifact),
                 Kind::Parcel => parcel_arts.push(artifact),
                 Kind::Receipt => receipt_arts.push(artifact),
+                Kind::ReceiptFile => receipt_file_arts.push(artifact),
                 Kind::Ticket => ticket_arts.push(artifact),
                 Kind::Subscription => subscription_arts.push(artifact),
             }
@@ -378,6 +380,7 @@ pub fn run(
             + bill_arts.len()
             + parcel_arts.len()
             + receipt_arts.len()
+            + receipt_file_arts.len()
             + ticket_arts.len()
             + subscription_arts.len();
         if let Some(buf) = explain.as_deref_mut() {
@@ -388,7 +391,7 @@ pub fn run(
                     reservations: reservations.len() as u32,
                     bills: bill_arts.len() as u32,
                     parcels: parcel_arts.len() as u32,
-                    receipts: receipt_arts.len() as u32,
+                    receipts: (receipt_arts.len() + receipt_file_arts.len()) as u32,
                     tickets: ticket_arts.len() as u32,
                     subscriptions: subscription_arts.len() as u32,
                 },
@@ -484,6 +487,47 @@ pub fn run(
                 );
             },
         );
+
+        // Route receipt-file sidecars before consuming `receipt_arts`:
+        // each one needs its sibling `.receipt.json` for the merchant/
+        // order/year that determines the on-disk filename.
+        if !receipt_file_arts.is_empty() {
+            if let Some(sink) = receipts {
+                let json_siblings: Vec<&&Artifact> = receipt_arts
+                    .iter()
+                    .filter(|a| a.kind == Kind::Receipt)
+                    .collect();
+                for artifact in &receipt_file_arts {
+                    // Match by slug when possible so one run with
+                    // multiple receipts pairs each PDF with its own
+                    // JSON. Fall back to the first (and usually only)
+                    // JSON sibling.
+                    let sibling = json_siblings
+                        .iter()
+                        .find(|j| j.slug == artifact.slug)
+                        .or_else(|| json_siblings.first());
+                    match sibling {
+                        Some(json) => router::file_receipt_file_artifact(
+                            &run.extractor,
+                            artifact,
+                            json,
+                            sink,
+                            &mut summary,
+                        ),
+                        None => warn!(
+                            extractor = %run.extractor,
+                            path = %artifact.path.display(),
+                            "receipt file emitted without a sibling .receipt.json; dropping"
+                        ),
+                    }
+                }
+            } else {
+                warn!(
+                    extractor = %run.extractor,
+                    "receipt file emitted but no receipts sink configured; dropping"
+                );
+            }
+        }
 
         file_or_drop(
             "receipt",

@@ -158,6 +158,7 @@ chronologically.
 | `<slug>.reservation.json`  | `reservation`  | A schema.org-style reservation object (`FlightReservation`, `TrainReservation`, `BusReservation`, `LodgingReservation`, `EventReservation`, `FoodEstablishmentReservation`). mailsift converts it into a calendar event. |
 | `<slug>.parcel.json`       | `parcel`       | Loose schema.org `ParcelDelivery` JSON. Must include `trackingNumber` (the dedup key). Merged with any prior record for the same tracking number as the parcel progresses. |
 | `<slug>.receipt.json`      | `receipt`      | Loose schema.org `Order` / `Invoice` JSON. Must include `orderNumber` (or `identifier`) and a merchant/seller name. |
+| `<slug>.receipt.<ext>`     | `receipt-file` | Preserved receipt attachment (typically the original PDF). Any `ext` other than `json` triggers this kind. Requires a sibling `<slug>.receipt.json` in the same run: the merchant / order / year on disk come from the JSON, so the two files land next to each other. |
 | `<slug>.bill.json`         | `bill`         | JSON with `payee`, `amount`, `dueDate`, `invoiceNumber`. |
 | `<slug>.subscription.json` | `subscription` | schema.org-ish JSON carrying at least `subscriptionDuration`. Downstream tooling synthesises renewal reminders from it. |
 | `<slug>.ticket.<ext>`      | `ticket`       | Any binary blob (PDF, pkpass, image, ...). Dedup is by content hash; `<ext>` is taken literally as the on-disk extension. The slug is the filed name, so make it specific: `ryanair-fr1234-2026-04-10.ticket.pdf`. |

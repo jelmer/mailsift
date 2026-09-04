@@ -1125,16 +1125,28 @@ async fn list_receipts(State(state): State<Arc<AppState>>) -> Result<Html<String
         let order = pick_str(&value, &["orderNumber", "identifier"]).unwrap_or_default();
         let date = pick_str(&value, &["orderDate", "date"]).unwrap_or_default();
         let vendor = vendor_url(&value);
+        let attachment = find_sibling_attachment(dir, &year, &slug);
+        let mut links = format!(
+            "<a href=\"{}\">json</a>",
+            esc(&state.url(&format!("/receipts/{year}/{slug}.json")))
+        );
+        if let Some(ext) = &attachment {
+            links.push_str(&format!(
+                " | <a href=\"{}\">{}</a>",
+                esc(&state.url(&format!("/receipts/{year}/{slug}.{ext}"))),
+                esc(ext),
+            ));
+        }
+        if let Some(url) = vendor.as_deref() {
+            links.push_str(&format!(" | <a href=\"{}\">vendor</a>", esc(url)));
+        }
         let cells = format!(
             "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
             esc(&year),
             esc(&merchant),
             esc(&order),
             esc(&date),
-            links_cell(
-                &state.url(&format!("/receipts/{year}/{slug}.json")),
-                vendor.as_deref(),
-            ),
+            links,
         );
         rows.push((year, slug, cells));
     }
@@ -1162,7 +1174,18 @@ async fn get_receipt(
     UrlPath((year, name)): UrlPath<(String, String)>,
 ) -> Result<Response, AppError> {
     let dir = require_dir(state.receipts_dir(), "receipts")?;
-    serve_json_file(dir, &year, &name)
+    // `.json` is the structured receipt; any other extension is the
+    // preserved attachment (typically the original PDF).
+    if name.ends_with(".json") {
+        serve_json_file(dir, &year, &name)
+    } else {
+        let year = safe_segment(&year)?;
+        let name = safe_segment(&name)?;
+        let path = dir.join(year).join(name);
+        let body = fs::read(&path).map_err(|e| read_status(&path, e))?;
+        let ct = content_type_for(name);
+        Ok(([(header::CONTENT_TYPE, HeaderValue::from_static(ct))], body).into_response())
+    }
 }
 
 async fn list_subscriptions(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
@@ -1564,6 +1587,23 @@ fn walk_flat_json(dir: &Path) -> Result<Vec<(String, Value)>> {
 
 /// (year, `<stem>` without `.json`, parsed JSON) for every
 /// `<year>/<stem>.json` two levels down under `dir`.
+/// For a receipt at `<dir>/<year>/<slug>.json`, look for a paired
+/// binary sidecar (`<slug>.<ext>` where `ext != json`) and return its
+/// extension. Only the first non-json match wins; an extractor emits
+/// at most one PDF per receipt.
+fn find_sibling_attachment(dir: &Path, year: &str, slug: &str) -> Option<String> {
+    let entries = fs::read_dir(dir.join(year)).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        let (stem, ext) = name.rsplit_once('.')?;
+        if stem == slug && !ext.eq_ignore_ascii_case("json") {
+            return Some(ext.to_string());
+        }
+    }
+    None
+}
+
 fn walk_year_json(dir: &Path) -> Result<Vec<(String, String, Value)>> {
     let mut out = Vec::new();
     for entry in read_dir_or_empty(dir)? {

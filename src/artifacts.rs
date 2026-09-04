@@ -11,6 +11,9 @@ pub enum Kind {
     Bill,
     Parcel,
     Receipt,
+    /// A binary sidecar (typically a PDF) preserved from the receipt
+    /// email. Paired with a sibling `.receipt.json` sharing the same slug.
+    ReceiptFile,
     Ticket,
     Subscription,
 }
@@ -23,6 +26,7 @@ impl Kind {
             Kind::Bill => "bill",
             Kind::Parcel => "parcel",
             Kind::Receipt => "receipt",
+            Kind::ReceiptFile => "receipt-file",
             Kind::Ticket => "ticket",
             Kind::Subscription => "subscription",
         }
@@ -142,6 +146,17 @@ fn classify(name: &str) -> Option<(Kind, String, String)> {
         return Some((Kind::Ticket, stem.to_string(), ext.to_string()));
     }
 
+    // A `.receipt.<ext>` file that is not `.receipt.json` is a binary
+    // sidecar (typically the original PDF receipt).
+    if let Some(idx) = name.find(".receipt.") {
+        let stem = &name[..idx];
+        let ext = &name[idx + ".receipt.".len()..];
+        if stem.is_empty() || ext.is_empty() || ext.contains('/') || ext == "json" {
+            return None;
+        }
+        return Some((Kind::ReceiptFile, stem.to_string(), ext.to_string()));
+    }
+
     None
 }
 
@@ -161,5 +176,26 @@ mod tests {
     fn classify_unknown() {
         assert!(classify("random.txt").is_none());
         assert!(classify(".event.ics").is_none()); // empty slug
+    }
+
+    #[test]
+    fn classify_receipt_json_is_structured() {
+        let (kind, slug, ext) = classify("amazon-abc123.receipt.json").unwrap();
+        assert_eq!(kind, Kind::Receipt);
+        assert_eq!(slug, "amazon-abc123");
+        assert_eq!(ext, "json");
+    }
+
+    #[test]
+    fn classify_receipt_pdf_is_receipt_file() {
+        let (kind, slug, ext) = classify("amazon-abc123.receipt.pdf").unwrap();
+        assert_eq!(kind, Kind::ReceiptFile);
+        assert_eq!(slug, "amazon-abc123");
+        assert_eq!(ext, "pdf");
+    }
+
+    #[test]
+    fn classify_receipt_file_rejects_empty_slug() {
+        assert!(classify(".receipt.pdf").is_none());
     }
 }
