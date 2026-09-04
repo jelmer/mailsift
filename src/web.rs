@@ -1464,9 +1464,17 @@ async fn api_receipts(State(state): State<Arc<AppState>>) -> Result<Json<Value>,
     let items: Vec<Value> = walk_year_json(dir)?
         .into_iter()
         .map(|(year, slug, mut v)| {
+            let attachment_ext = find_sibling_attachment(dir, &year, &slug);
             if let Some(obj) = v.as_object_mut() {
-                obj.insert("_year".into(), Value::String(year));
-                obj.insert("_slug".into(), Value::String(slug));
+                obj.insert("_year".into(), Value::String(year.clone()));
+                obj.insert("_slug".into(), Value::String(slug.clone()));
+                if let Some(ext) = attachment_ext {
+                    obj.insert(
+                        "_attachmentHref".into(),
+                        Value::String(state.url(&format!("/receipts/{year}/{slug}.{ext}"))),
+                    );
+                    obj.insert("_attachmentExt".into(), Value::String(ext));
+                }
             }
             v
         })
