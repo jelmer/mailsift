@@ -21,7 +21,7 @@ use tracing::info;
 use super::FileOutcome;
 use super::firefly::{self, BillForFirefly, FireflySink};
 use super::json_target::{derive_year, first_non_empty};
-use super::sink::{slugify, write_atomic};
+use super::sink::{sanitize_ext, slugify, write_atomic};
 
 /// Shape we read out of a `.bill.json` artifact. Loosely schema.org
 /// `Invoice`-shaped; unknown fields are ignored so extractors can emit
@@ -74,12 +74,19 @@ impl Bill {
     }
 }
 
-pub fn file_bill(
-    src: &Path,
-    dir: &Path,
-    firefly: Option<&FireflySink>,
-    received_at_epoch: Option<i64>,
-) -> Result<FileOutcome> {
+/// The three fields we derive from a `.bill.json` to build its
+/// on-disk path.
+struct DerivedFilename {
+    payee_slug: String,
+    invoice_slug: String,
+    year: i32,
+}
+
+/// Read `.bill.json` at `src` and derive the filename components used
+/// for both the JSON itself and any paired binary sidecar. The body
+/// is returned so callers that need the raw JSON (e.g. the
+/// received-at rewrite) don't re-read the file.
+fn derive_from_bill_json(src: &Path) -> Result<(String, Bill, DerivedFilename)> {
     let body = fs::read_to_string(src)
         .with_context(|| format!("reading bill source {}", src.display()))?;
     let bill: Bill = serde_json::from_str(&body)
@@ -101,6 +108,30 @@ pub fn file_bill(
             src.display()
         );
     }
+    Ok((
+        body,
+        bill,
+        DerivedFilename {
+            payee_slug,
+            invoice_slug,
+            year,
+        },
+    ))
+}
+
+pub fn file_bill(
+    src: &Path,
+    dir: &Path,
+    firefly: Option<&FireflySink>,
+    received_at_epoch: Option<i64>,
+) -> Result<FileOutcome> {
+    let (body, bill, derived) = derive_from_bill_json(src)?;
+    let DerivedFilename {
+        payee_slug,
+        invoice_slug,
+        year,
+    } = derived;
+    let payee = bill.payee().expect("derive_from_bill_json checked payee");
 
     let target = dir
         .join(format!("{year:04}"))
@@ -122,6 +153,45 @@ pub fn file_bill(
         Ok(FileOutcome::Updated(label))
     } else {
         info!(target = %label, "bill created");
+        Ok(FileOutcome::Created(label))
+    }
+}
+
+/// File a binary sidecar (typically the original PDF) that belongs
+/// to the bill described by `sibling_json`.
+///
+/// The path is `<year>/<payee>-<invoice>.<ext>`, sharing the
+/// payee/invoice/year with the JSON so the two files land next to
+/// each other. `ext` is validated with the same sanitiser tickets and
+/// receipt files use.
+pub fn file_bill_file(
+    src: &Path,
+    sibling_json: &Path,
+    dir: &Path,
+    ext: &str,
+) -> Result<FileOutcome> {
+    let sanitized_ext = sanitize_ext(ext)?;
+    let (_body, _bill, derived) = derive_from_bill_json(sibling_json)?;
+    let DerivedFilename {
+        payee_slug,
+        invoice_slug,
+        year,
+    } = derived;
+
+    let target = dir
+        .join(format!("{year:04}"))
+        .join(format!("{payee_slug}-{invoice_slug}.{sanitized_ext}"));
+
+    let bytes = fs::read(src).with_context(|| format!("reading bill file {}", src.display()))?;
+    let existed = target.exists();
+    write_atomic(&target, &bytes)?;
+
+    let label = target.display().to_string();
+    if existed {
+        info!(target = %label, "bill file updated");
+        Ok(FileOutcome::Updated(label))
+    } else {
+        info!(target = %label, "bill file created");
         Ok(FileOutcome::Created(label))
     }
 }
@@ -170,6 +240,31 @@ mod tests {
         let bill: Bill = serde_json::from_value(serde_json::json!({"dueDate": "2024-12-05"}))
             .expect("valid bill");
         assert_eq!(derive_year(bill.date_candidates()), 2024);
+    }
+
+    #[test]
+    fn file_bill_file_lands_next_to_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let json = tmp.path().join("bill.json");
+        std::fs::write(
+            &json,
+            br#"{"payee":"Acme","invoiceNumber":"INV1","dueDate":"2024-12-05"}"#,
+        )
+        .unwrap();
+        let pdf = tmp.path().join("attachment.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4 fake").unwrap();
+        let dir = tmp.path().join("out");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let outcome = file_bill_file(&pdf, &json, &dir, "pdf").unwrap();
+        match outcome {
+            FileOutcome::Created(p) => {
+                let expected = dir.join("2024/acme-inv1.pdf");
+                assert_eq!(std::path::PathBuf::from(p), expected);
+                assert_eq!(std::fs::read(&expected).unwrap(), b"%PDF-1.4 fake");
+            }
+            FileOutcome::Updated(_) => panic!("expected Created on first write"),
+        }
     }
 
     #[test]

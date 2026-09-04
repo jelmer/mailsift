@@ -1015,8 +1015,22 @@ async fn list_bills(State(state): State<Arc<AppState>>) -> Result<Html<String>, 
                 Some(format!("{} {}", price, cur).trim().to_string())
             })
             .unwrap_or_default();
-        let href = state.url(&format!("/bills/{}/{}.json", year, slug));
+        let attachment = find_sibling_attachment(dir, &year, &slug);
+        let mut links = format!(
+            "<a href=\"{}\">json</a>",
+            esc(&state.url(&format!("/bills/{year}/{slug}.json")))
+        );
+        if let Some(ext) = &attachment {
+            links.push_str(&format!(
+                " | <a href=\"{}\">{}</a>",
+                esc(&state.url(&format!("/bills/{year}/{slug}.{ext}"))),
+                esc(ext),
+            ));
+        }
         let vendor = vendor_url(&value);
+        if let Some(url) = vendor.as_deref() {
+            links.push_str(&format!(" | <a href=\"{}\">vendor</a>", esc(url)));
+        }
         let cells = format!(
             "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
             esc(&year),
@@ -1024,7 +1038,7 @@ async fn list_bills(State(state): State<Arc<AppState>>) -> Result<Html<String>, 
             esc(&invoice.unwrap_or_default()),
             esc(&due.unwrap_or_default()),
             esc(&amount),
-            links_cell(&href, vendor.as_deref()),
+            links,
         );
         rows.push((year, slug, cells));
     }
@@ -1052,7 +1066,18 @@ async fn get_bill(
     UrlPath((year, name)): UrlPath<(String, String)>,
 ) -> Result<Response, AppError> {
     let dir = require_dir(state.bills_dir(), "bills")?;
-    serve_json_file(dir, &year, &name)
+    // `.json` is the structured bill; any other extension is the
+    // preserved attachment (typically the original PDF).
+    if name.ends_with(".json") {
+        serve_json_file(dir, &year, &name)
+    } else {
+        let year = safe_segment(&year)?;
+        let name = safe_segment(&name)?;
+        let path = dir.join(year).join(name);
+        let body = fs::read(&path).map_err(|e| read_status(&path, e))?;
+        let ct = content_type_for(name);
+        Ok(([(header::CONTENT_TYPE, HeaderValue::from_static(ct))], body).into_response())
+    }
 }
 
 async fn list_parcels(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {

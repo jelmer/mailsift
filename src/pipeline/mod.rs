@@ -357,6 +357,7 @@ pub fn run(
         let mut events: Vec<&Artifact> = Vec::new();
         let mut reservations: Vec<&Artifact> = Vec::new();
         let mut bill_arts: Vec<&Artifact> = Vec::new();
+        let mut bill_file_arts: Vec<&Artifact> = Vec::new();
         let mut parcel_arts: Vec<&Artifact> = Vec::new();
         let mut receipt_arts: Vec<&Artifact> = Vec::new();
         let mut receipt_file_arts: Vec<&Artifact> = Vec::new();
@@ -367,6 +368,7 @@ pub fn run(
                 Kind::Event => events.push(artifact),
                 Kind::Reservation => reservations.push(artifact),
                 Kind::Bill => bill_arts.push(artifact),
+                Kind::BillFile => bill_file_arts.push(artifact),
                 Kind::Parcel => parcel_arts.push(artifact),
                 Kind::Receipt => receipt_arts.push(artifact),
                 Kind::ReceiptFile => receipt_file_arts.push(artifact),
@@ -378,6 +380,7 @@ pub fn run(
         let total_artifacts = events.len()
             + reservations.len()
             + bill_arts.len()
+            + bill_file_arts.len()
             + parcel_arts.len()
             + receipt_arts.len()
             + receipt_file_arts.len()
@@ -389,7 +392,7 @@ pub fn run(
                 outcome: ExplainOutcome::Produced {
                     events: events.len() as u32,
                     reservations: reservations.len() as u32,
-                    bills: bill_arts.len() as u32,
+                    bills: (bill_arts.len() + bill_file_arts.len()) as u32,
                     parcels: parcel_arts.len() as u32,
                     receipts: (receipt_arts.len() + receipt_file_arts.len()) as u32,
                     tickets: ticket_arts.len() as u32,
@@ -434,6 +437,41 @@ pub fn run(
                     dir,
                     received_at_epoch,
                     &mut summary,
+                );
+            }
+        }
+
+        // Route bill-file sidecars before consuming `bill_arts`: each
+        // one needs its sibling `.bill.json` for the payee/invoice/year
+        // that determines the on-disk filename.
+        if !bill_file_arts.is_empty() {
+            if let Some(dir) = bills_dir {
+                let json_siblings: Vec<&&Artifact> =
+                    bill_arts.iter().filter(|a| a.kind == Kind::Bill).collect();
+                for artifact in &bill_file_arts {
+                    let sibling = json_siblings
+                        .iter()
+                        .find(|j| j.slug == artifact.slug)
+                        .or_else(|| json_siblings.first());
+                    match sibling {
+                        Some(json) => router::file_bill_file_artifact(
+                            &run.extractor,
+                            artifact,
+                            json,
+                            dir,
+                            &mut summary,
+                        ),
+                        None => warn!(
+                            extractor = %run.extractor,
+                            path = %artifact.path.display(),
+                            "bill file emitted without a sibling .bill.json; dropping"
+                        ),
+                    }
+                }
+            } else {
+                warn!(
+                    extractor = %run.extractor,
+                    "bill file emitted but no bills_dir configured; dropping"
                 );
             }
         }

@@ -160,6 +160,7 @@ chronologically.
 | `<slug>.receipt.json`      | `receipt`      | Loose schema.org `Order` / `Invoice` JSON. Must include `orderNumber` (or `identifier`) and a merchant/seller name. |
 | `<slug>.receipt.<ext>`     | `receipt-file` | Preserved receipt attachment (typically the original PDF). Any `ext` other than `json` triggers this kind. Requires a sibling `<slug>.receipt.json` in the same run: the merchant / order / year on disk come from the JSON, so the two files land next to each other. |
 | `<slug>.bill.json`         | `bill`         | JSON with `payee`, `amount`, `dueDate`, `invoiceNumber`. |
+| `<slug>.bill.<ext>`        | `bill-file`    | Preserved bill attachment (typically the original PDF). Any `ext` other than `json` triggers this kind. Requires a sibling `<slug>.bill.json` in the same run: the payee / invoice / year on disk come from the JSON, so the two files land next to each other. |
 | `<slug>.subscription.json` | `subscription` | schema.org-ish JSON carrying at least `subscriptionDuration`. Downstream tooling synthesises renewal reminders from it. |
 | `<slug>.ticket.<ext>`      | `ticket`       | Any binary blob (PDF, pkpass, image, ...). Dedup is by content hash; `<ext>` is taken literally as the on-disk extension. The slug is the filed name, so make it specific: `ryanair-fr1234-2026-04-10.ticket.pdf`. |
 

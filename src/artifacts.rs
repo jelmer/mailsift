@@ -9,6 +9,9 @@ pub enum Kind {
     Event,
     Reservation,
     Bill,
+    /// A binary sidecar (typically a PDF) preserved from the bill
+    /// email. Paired with a sibling `.bill.json` sharing the same slug.
+    BillFile,
     Parcel,
     Receipt,
     /// A binary sidecar (typically a PDF) preserved from the receipt
@@ -24,6 +27,7 @@ impl Kind {
             Kind::Event => "event",
             Kind::Reservation => "reservation",
             Kind::Bill => "bill",
+            Kind::BillFile => "bill-file",
             Kind::Parcel => "parcel",
             Kind::Receipt => "receipt",
             Kind::ReceiptFile => "receipt-file",
@@ -157,6 +161,17 @@ fn classify(name: &str) -> Option<(Kind, String, String)> {
         return Some((Kind::ReceiptFile, stem.to_string(), ext.to_string()));
     }
 
+    // Same for bills: `.bill.<ext>` with ext != json is the original
+    // invoice PDF (or scan) preserved from the mail.
+    if let Some(idx) = name.find(".bill.") {
+        let stem = &name[..idx];
+        let ext = &name[idx + ".bill.".len()..];
+        if stem.is_empty() || ext.is_empty() || ext.contains('/') || ext == "json" {
+            return None;
+        }
+        return Some((Kind::BillFile, stem.to_string(), ext.to_string()));
+    }
+
     None
 }
 
@@ -197,5 +212,21 @@ mod tests {
     #[test]
     fn classify_receipt_file_rejects_empty_slug() {
         assert!(classify(".receipt.pdf").is_none());
+    }
+
+    #[test]
+    fn classify_bill_json_is_structured() {
+        let (kind, slug, ext) = classify("eon-next-inv999.bill.json").unwrap();
+        assert_eq!(kind, Kind::Bill);
+        assert_eq!(slug, "eon-next-inv999");
+        assert_eq!(ext, "json");
+    }
+
+    #[test]
+    fn classify_bill_pdf_is_bill_file() {
+        let (kind, slug, ext) = classify("eon-next-inv999.bill.pdf").unwrap();
+        assert_eq!(kind, Kind::BillFile);
+        assert_eq!(slug, "eon-next-inv999");
+        assert_eq!(ext, "pdf");
     }
 }
