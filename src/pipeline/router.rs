@@ -318,6 +318,7 @@ fn file_single(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn file_receipt_artifact(
     extractor: &str,
     artifact: &Artifact,
@@ -325,6 +326,8 @@ pub(super) fn file_receipt_artifact(
     sink: &receipts::ReceiptSink,
     received_at_epoch: Option<i64>,
     summary: &mut Summary,
+    recorder: &crate::stats::Recorder,
+    now_ts: i64,
 ) {
     if summary.dry_run {
         summary.bump(extractor, KIND_RECEIPT);
@@ -341,9 +344,28 @@ pub(super) fn file_receipt_artifact(
                 error = format!("{e:#}"),
                 "failed to file receipt"
             );
+            // The forward sink is the only receipt variant that talks
+            // to the network (SMTP or a sendmail pipe). Its failures
+            // are the ones a human might want to see on the dashboard,
+            // so we record them under a synthetic extractor name.
+            if matches!(sink, receipts::ReceiptSink::Forward(_)) {
+                recorder.record(&crate::stats::Event {
+                    ts: now_ts,
+                    extractor: RECEIPTS_FORWARD_SINK_NAME.to_string(),
+                    outcome: crate::stats::Outcome::Failed,
+                    duration_ms: None,
+                    from_domain: None,
+                });
+            }
         }
     }
 }
+
+/// Synthetic "extractor" identifier used for sink-side receipts-forward
+/// failures so they show up in the aggregated stats alongside real
+/// extractor runs. The angle-brackets keep the name from ever
+/// colliding with a real extractor slug.
+pub(super) const RECEIPTS_FORWARD_SINK_NAME: &str = "<sink:receipts-forward>";
 
 pub(super) fn file_subscription_artifact(
     extractor: &str,
@@ -804,5 +826,68 @@ END:VCALENDAR\r
             1,
             "expected exactly one event file, got {entries:?}"
         );
+    }
+
+    /// Point Sendmail at a binary that does not exist; the forward
+    /// call must fail and the router must record a Failed stats event
+    /// under the synthetic sink name so the dashboard can surface it.
+    #[test]
+    fn receipts_forward_failure_records_stats_event() {
+        use crate::artifacts::{Artifact, Kind};
+        use crate::stats::{self, Recorder};
+        use crate::targets::mail_forward::MailForwarder;
+        use crate::targets::receipts::ReceiptSink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("events.ndjson");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let fwd = MailForwarder::sendmail(
+            "mailsift@example.org",
+            vec!["receipts@example.org".to_string()],
+            Some("/nonexistent/mailsift-test-sendmail".to_string()),
+            runtime.handle().clone(),
+        )
+        .unwrap();
+        let sink = ReceiptSink::Forward(fwd);
+
+        // A minimal receipt JSON on disk so file_receipt has something
+        // to hand to the forwarder before it tries to spawn sendmail.
+        let receipt_path = dir.path().join("dummy.receipt.json");
+        std::fs::write(
+            &receipt_path,
+            r#"{"merchant":{"name":"m"},"orderNumber":"1"}"#,
+        )
+        .unwrap();
+        let artifact = Artifact {
+            path: receipt_path,
+            kind: Kind::Receipt,
+            slug: "dummy".to_string(),
+            ext: "json".to_string(),
+        };
+
+        let mut summary = Summary::new(false);
+        let recorder = Recorder::File(log.clone());
+
+        file_receipt_artifact(
+            "test-extractor",
+            &artifact,
+            b"From: sender@example.com\r\nSubject: t\r\n\r\nbody\r\n",
+            &sink,
+            None,
+            &mut summary,
+            &recorder,
+            42,
+        );
+
+        let contents = std::fs::read_to_string(&log).expect("stats file should exist");
+        let event: stats::Event =
+            serde_json::from_str(contents.trim()).expect("one event was written");
+        assert_eq!(event.extractor, RECEIPTS_FORWARD_SINK_NAME);
+        assert_eq!(event.outcome, stats::Outcome::Failed);
+        assert_eq!(event.ts, 42);
     }
 }

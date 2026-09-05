@@ -524,6 +524,8 @@ pub fn run(
                     sink,
                     received_at_epoch,
                     &mut summary,
+                    recorder,
+                    now_ts,
                 );
             },
         );
