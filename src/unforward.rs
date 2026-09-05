@@ -308,9 +308,13 @@ fn extract_inner_plain(plain: &str, header_start: usize) -> String {
 }
 
 /// Extract Gmail's `<div class="gmail_quote ...">` (or blockquote)
-/// wrapper contents. Returns `None` when no wrapper is found; the
+/// wrapper contents. Returns `None` when no wrapper is found or when
+/// the input exceeds [`crate::pipeline::MAX_MESSAGE_BYTES`]; the
 /// synthetic message is then text/plain only.
 fn extract_inner_html(html: &str) -> Option<String> {
+    if html.len() > crate::pipeline::MAX_MESSAGE_BYTES {
+        return None;
+    }
     for tag in &["div", "blockquote"] {
         let marker = format!("<{tag} class=\"gmail_quote");
         let lower = html.to_lowercase();
@@ -697,5 +701,17 @@ body
         let unwrapped = try_unwrap_forwarded(&raw, &trusted).expect("should unwrap");
         let text = String::from_utf8(unwrapped.inner).unwrap();
         assert!(!text.contains("X-Injected"));
+    }
+
+    #[test]
+    fn extract_inner_html_returns_none_when_input_exceeds_size_cap() {
+        let mut html = String::with_capacity(crate::pipeline::MAX_MESSAGE_BYTES + 128);
+        html.push_str("<div class=\"gmail_quote\">start");
+        while html.len() <= crate::pipeline::MAX_MESSAGE_BYTES {
+            html.push('x');
+        }
+        html.push_str("</div>");
+        assert!(html.len() > crate::pipeline::MAX_MESSAGE_BYTES);
+        assert!(extract_inner_html(&html).is_none());
     }
 }
