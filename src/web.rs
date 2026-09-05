@@ -237,6 +237,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/subscriptions.json", get(api_subscriptions))
         .route("/api/reservations.json", get(api_reservations))
         .route("/api/stats.json", get(api_stats))
+        .route("/api/recent-failures.json", get(api_recent_failures))
         .with_state(state)
 }
 
@@ -1506,6 +1507,8 @@ async fn show_stats(State(state): State<Arc<AppState>>) -> Result<Html<String>, 
         })
         .collect::<Vec<_>>()
         .join("");
+    let failures = crate::stats::aggregate_recent_failures(&log_path).unwrap_or_default();
+    let failures_section = render_recent_failures(&failures);
     let body = format!(
         "<table><thead><tr>\
          <th>extractor</th>\
@@ -1519,10 +1522,46 @@ async fn show_stats(State(state): State<Arc<AppState>>) -> Result<Html<String>, 
          </tr></thead><tbody>{rows}</tbody></table>\
          <p class=\"muted\">Aggregated from <code>{}</code>. \
          Skipped folds headers/body/DKIM prefilter reasons; mean ms is over runs \
-         that actually forked the extractor.</p>",
+         that actually forked the extractor.</p>\
+         {failures_section}",
         esc(&log_path.display().to_string()),
     );
     Ok(Html(page(&state, "Stats", &body)))
+}
+
+/// Render the most-recent failures as a table, or an empty-state note
+/// when there are none. Timestamps are shown as ISO-8601 UTC so a
+/// browser without JS still gets a sortable string.
+fn render_recent_failures(failures: &[crate::stats::RecentFailure]) -> String {
+    if failures.is_empty() {
+        return "<h2>Recent failures</h2>\
+                <div class=\"empty\">no extractor failures recorded</div>"
+            .to_string();
+    }
+    let rows = failures
+        .iter()
+        .map(|f| {
+            let when = chrono::DateTime::<chrono::Utc>::from_timestamp(f.ts, 0)
+                .map(|d| d.format("%Y-%m-%d %H:%M:%SZ").to_string())
+                .unwrap_or_else(|| f.ts.to_string());
+            let domain = f.from_domain.as_deref().unwrap_or("-");
+            let err = f.error.as_deref().unwrap_or("");
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td></tr>",
+                esc(&when),
+                esc(&f.extractor),
+                esc(domain),
+                esc(err),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        "<h2>Recent failures</h2>\
+         <table><thead><tr>\
+         <th>when</th><th>extractor</th><th>from</th><th>error</th>\
+         </tr></thead><tbody>{rows}</tbody></table>"
+    )
 }
 
 async fn api_stats(State(_state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
@@ -1534,6 +1573,17 @@ async fn api_stats(State(_state): State<Arc<AppState>>) -> Result<Json<Value>, A
     }
     let stats = crate::stats::aggregate(&log_path)?;
     Ok(Json(serde_json::to_value(stats)?))
+}
+
+async fn api_recent_failures(State(_state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
+    let Some(log_path) = crate::stats::default_log_path() else {
+        return Ok(Json(Value::Array(vec![])));
+    };
+    if !log_path.exists() {
+        return Ok(Json(Value::Array(vec![])));
+    }
+    let failures = crate::stats::aggregate_recent_failures(&log_path)?;
+    Ok(Json(serde_json::to_value(failures)?))
 }
 
 /// (filename, parsed JSON) for every `*.json` directly under `dir`.
