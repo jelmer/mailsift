@@ -339,12 +339,17 @@ pub fn run(
                         },
                     });
                 }
+                let mut err_snippet = format!("{e:#}");
+                if err_snippet.len() > stats::MAX_ERROR_SNIPPET {
+                    err_snippet.truncate(stats::MAX_ERROR_SNIPPET);
+                }
                 recorder.record(&stats::Event {
                     ts: now_ts,
                     extractor: ex.name.clone(),
                     outcome: stats::Outcome::Failed,
                     duration_ms: Some(stats::duration_to_ms(elapsed)),
                     from_domain: from_domain.clone(),
+                    error: Some(err_snippet),
                 });
                 continue;
             }
@@ -407,6 +412,7 @@ pub fn run(
             },
             duration_ms: Some(stats::duration_to_ms(elapsed)),
             from_domain: from_domain.clone(),
+            error: None,
         });
 
         for artifact in events {
@@ -702,6 +708,7 @@ fn record_skip(
         outcome: stats_outcome,
         duration_ms: None,
         from_domain: from_domain.map(str::to_string),
+        error: None,
     });
 }
 

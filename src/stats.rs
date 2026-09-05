@@ -68,7 +68,21 @@ pub struct Event {
     /// of extractors that match more than one sender domain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_domain: Option<String>,
+    /// Short error snippet for `Failed` outcomes; unset otherwise.
+    /// Truncated by the caller to keep the whole log line under
+    /// `PIPE_BUF` (4 KiB) so concurrent appends stay atomic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
+
+/// Cap on the `error` string a caller should include in a `Failed`
+/// event. Chosen so a log line stays well under `PIPE_BUF`.
+pub const MAX_ERROR_SNIPPET: usize = 500;
+
+/// Cap on how many recent failure records `aggregate_recent_failures`
+/// returns. Bounded so the memory used by the dashboard stays sane
+/// even on a huge log.
+pub const RECENT_FAILURES_KEEP: usize = 50;
 
 /// Where (if anywhere) per-run events get appended. Wired into
 /// [`crate::pipeline::PipelineTargets`] so every callpath that runs
@@ -214,6 +228,64 @@ pub fn aggregate(path: &Path) -> Result<Vec<ExtractorStats>> {
     Ok(stats)
 }
 
+/// One extractor-failure record surfaced to the dashboard. Includes
+/// everything a human needs to triage: when, which extractor, which
+/// sender domain, and the (truncated) error the pipeline logged.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentFailure {
+    pub ts: i64,
+    pub extractor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Scan the event log and return the most recent [`RECENT_FAILURES_KEEP`]
+/// `Failed` records, newest first. Bounded memory: we only keep the
+/// tail while streaming.
+pub fn aggregate_recent_failures(path: &Path) -> Result<Vec<RecentFailure>> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut out: Vec<RecentFailure> = Vec::new();
+    let mut parse_errors = 0u64;
+
+    for (lineno, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("reading line {}", lineno + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: Event = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(_) => {
+                parse_errors += 1;
+                continue;
+            }
+        };
+        if event.outcome != Outcome::Failed {
+            continue;
+        }
+        out.push(RecentFailure {
+            ts: event.ts,
+            extractor: event.extractor,
+            from_domain: event.from_domain,
+            error: event.error,
+        });
+    }
+
+    if parse_errors > 0 {
+        warn!(
+            count = parse_errors,
+            "skipped malformed event lines while aggregating recent failures"
+        );
+    }
+
+    // Sort descending by ts; ties broken by extractor for stable output.
+    out.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.extractor.cmp(&b.extractor)));
+    out.truncate(RECENT_FAILURES_KEEP);
+    Ok(out)
+}
+
 /// Running sums + capped recent-domains list, one per extractor.
 /// Kept private; only [`aggregate`] uses it as an intermediate.
 #[derive(Default)]
@@ -307,6 +379,7 @@ mod tests {
             outcome,
             duration_ms,
             from_domain: None,
+            error: None,
         }
     }
 
@@ -369,6 +442,7 @@ mod tests {
                 outcome: Outcome::Produced,
                 duration_ms: Some(10),
                 from_domain: Some((*dom).into()),
+                error: None,
             });
         }
         let (_d, path) = write_events(&events);
@@ -391,6 +465,45 @@ mod tests {
         assert_eq!(stats[0].runs, 2);
         assert_eq!(stats[0].produced, 1);
         assert_eq!(stats[0].failed, 1);
+    }
+
+    fn failure(extractor: &str, ts: i64, error: &str, domain: Option<&str>) -> Event {
+        Event {
+            ts,
+            extractor: extractor.into(),
+            outcome: Outcome::Failed,
+            duration_ms: Some(5),
+            from_domain: domain.map(String::from),
+            error: Some(error.into()),
+        }
+    }
+
+    #[test]
+    fn recent_failures_returns_only_failed_events_newest_first() {
+        let (_d, path) = write_events(&[
+            failure("a", 10, "boom-a", Some("a.example")),
+            event("a", Outcome::Produced, 11, Some(1)),
+            failure("b", 20, "boom-b", Some("b.example")),
+            event("a", Outcome::SkippedHeaders, 12, None),
+            failure("c", 15, "boom-c", None),
+        ]);
+        let fails = aggregate_recent_failures(&path).unwrap();
+        let names: Vec<&str> = fails.iter().map(|f| f.extractor.as_str()).collect();
+        assert_eq!(names, vec!["b", "c", "a"]);
+        assert_eq!(fails[0].error.as_deref(), Some("boom-b"));
+        assert_eq!(fails[2].from_domain.as_deref(), Some("a.example"));
+    }
+
+    #[test]
+    fn recent_failures_are_bounded() {
+        let events: Vec<Event> = (0..(RECENT_FAILURES_KEEP as i64 + 10))
+            .map(|i| failure("x", i, "e", None))
+            .collect();
+        let (_d, path) = write_events(&events);
+        let fails = aggregate_recent_failures(&path).unwrap();
+        assert_eq!(fails.len(), RECENT_FAILURES_KEEP);
+        // Newest ts first.
+        assert_eq!(fails[0].ts, (RECENT_FAILURES_KEEP as i64) + 9);
     }
 
     #[test]
