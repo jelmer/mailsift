@@ -16,6 +16,13 @@ mod router;
 
 const DEFAULT_EXTRACTOR_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Upper bound on message size accepted by [`run`] and on HTML fragments
+/// pulled out of inline forwards. 25 MiB comfortably covers personal
+/// mail (including PDFs and photo attachments) while keeping a
+/// pathological message from ballooning extractor memory or blocking on
+/// stdin.
+pub const MAX_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
+
 /// Where the pipeline routes each artifact kind for a single message.
 ///
 /// Borrowed so that the milter / imap-scan paths can hold an owned
@@ -199,6 +206,16 @@ pub fn run(
         recorder,
         seen,
     } = targets;
+
+    if raw.len() > MAX_MESSAGE_BYTES {
+        warn!(
+            source,
+            bytes = raw.len(),
+            limit = MAX_MESSAGE_BYTES,
+            "skipping oversized message; exceeds MAX_MESSAGE_BYTES"
+        );
+        return Ok(());
+    }
 
     if extractors.is_empty() {
         warn!("no extractors configured; nothing to do");
@@ -891,5 +908,101 @@ Content-Type: application/pdf; name=\"invoice.pdf\"\r\n\
 %PDF-1.4\r\n";
         let parts = parts_from(raw);
         assert_eq!(parts.attachment_filenames, vec!["invoice.pdf"]);
+    }
+
+    #[test]
+    fn run_short_circuits_oversized_message_without_invoking_extractors() {
+        use std::path::PathBuf;
+
+        // Load real fixture extractors so `run` has something it could
+        // otherwise dispatch to. The size check must fire first.
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let extractors_dir = manifest_dir.join("tests/fixtures/extractors");
+        let extractors = extractor::discover(&[extractors_dir]).expect("discover extractors");
+        assert!(!extractors.is_empty(), "fixture extractors present");
+
+        let events_dir = tempfile::tempdir().expect("events tempdir");
+        let sink = EventSinkKind::LocalDir(events_dir.path().to_path_buf());
+
+        // File-backed recorder that only creates its path on the first
+        // record(). If any extractor ran, this file would exist.
+        let stats_dir = tempfile::tempdir().expect("stats tempdir");
+        let stats_path = stats_dir.path().join("events.ndjson");
+        let recorder = stats::Recorder::File(stats_path.clone());
+
+        let raw = vec![b'x'; MAX_MESSAGE_BYTES + 1];
+        let mut explain: Vec<ExplainRecord> = Vec::new();
+
+        let result = run(
+            &raw,
+            "test oversized",
+            &extractors,
+            PipelineTargets {
+                event_sink: &sink,
+                bills_dir: None,
+                parcels_dir: None,
+                subscriptions_dir: None,
+                reservations_dir: None,
+                receipts: None,
+                tickets: None,
+                firefly: None,
+                trackers: None,
+                trusted_forwarders: &[],
+                recorder: &recorder,
+                seen: None,
+            },
+            DkimPolicy::Skip,
+            false,
+            Some(&mut explain),
+        );
+
+        assert!(result.is_ok(), "oversized input must not be an error");
+        assert!(
+            explain.is_empty(),
+            "no extractor should have produced an explain record"
+        );
+        assert!(
+            !stats_path.exists(),
+            "no extractor should have recorded a stats event"
+        );
+        let events: Vec<_> = std::fs::read_dir(events_dir.path())
+            .expect("read events dir")
+            .collect();
+        assert!(events.is_empty(), "no artifacts should have been filed");
+    }
+
+    #[test]
+    fn run_accepts_message_at_the_limit() {
+        // A message exactly at MAX_MESSAGE_BYTES must be accepted (the
+        // guard only rejects strictly greater). We don't need extractors
+        // to prove this; an empty list returns Ok after the size check.
+        let events_dir = tempfile::tempdir().expect("events tempdir");
+        let sink = EventSinkKind::LocalDir(events_dir.path().to_path_buf());
+        let raw = vec![b'x'; MAX_MESSAGE_BYTES];
+
+        let result = run(
+            &raw,
+            "test at-limit",
+            &[],
+            PipelineTargets {
+                event_sink: &sink,
+                bills_dir: None,
+                parcels_dir: None,
+                subscriptions_dir: None,
+                reservations_dir: None,
+                receipts: None,
+                tickets: None,
+                firefly: None,
+                trackers: None,
+                trusted_forwarders: &[],
+                recorder: &stats::Recorder::Disabled,
+                seen: None,
+            },
+            DkimPolicy::Skip,
+            false,
+            None,
+        );
+
+        assert!(result.is_ok(), "at-limit input must be accepted");
     }
 }
