@@ -209,11 +209,14 @@ pub fn run(
     // for the inner RFC822 bytes so DKIM checks, prefilter matching,
     // and extractor stdin all see the original vendor mail. The
     // `_unwrapped` binding keeps the inner bytes alive for the rest of
-    // `run`.
+    // `run`. When the unwrap was authorized purely by the outer
+    // sender's trust (attachment form has DKIM stripped, inline forwards
+    // have no signature at all), also bypass `require_dkim` below: the
+    // trust list is standing in for the vendor's signature.
     let _unwrapped = crate::unforward::try_unwrap_forwarded(raw, trusted_forwarders);
-    let raw: &[u8] = match _unwrapped.as_deref() {
-        Some(inner) => inner,
-        None => raw,
+    let (raw, dkim_via_forwarder): (&[u8], bool) = match &_unwrapped {
+        Some(u) => (u.inner.as_slice(), u.from_trusted_forwarder),
+        None => (raw, false),
     };
 
     // Parse headers once and reuse them for everything we need from
@@ -293,7 +296,7 @@ pub fn run(
             continue;
         }
 
-        if !ex.require_dkim.is_empty() {
+        if !ex.require_dkim.is_empty() && !dkim_via_forwarder {
             match dkim_policy {
                 DkimPolicy::Skip => {
                     // No-op: caller has chosen to skip DKIM checks. We
