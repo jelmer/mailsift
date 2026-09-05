@@ -176,14 +176,73 @@ pub struct CaldavConfig {
     pub password_file: Option<PathBuf>,
 }
 
+/// Fields accepted at the top level of the config. Kept in sync with
+/// [`Config`]'s serde fields; only used by [`misplaced_top_level_hint`]
+/// to catch top-level keys accidentally nested under a `[table]`
+/// header. Nothing else reads this list, so ordering doesn't matter.
+const TOP_LEVEL_FIELDS: &[&str] = &[
+    "extractors_dir",
+    "bills_dir",
+    "parcels_dir",
+    "subscriptions_dir",
+    "reservations_dir",
+    "receipts_dir",
+    "receipts_webdav",
+    "receipts_forward",
+    "tickets_dir",
+    "tickets_webdav",
+    "events_dir",
+    "caldav",
+    "karrio",
+    "seventeentrack",
+    "firefly",
+    "trusted_forwarders",
+];
+
+/// If `body` contains a top-level key nested inside a `[table]`, return
+/// a hint pointing the user at the fix. Returns `None` when no such
+/// misplacement is present, so the caller can fall back to the raw
+/// parse error.
+fn misplaced_top_level_hint(body: &str) -> Option<String> {
+    let value: toml::Value = toml::from_str(body).ok()?;
+    let table = value.as_table()?;
+    for (section, entry) in table {
+        let Some(inner) = entry.as_table() else {
+            continue;
+        };
+        for key in inner.keys() {
+            if TOP_LEVEL_FIELDS.contains(&key.as_str()) {
+                return Some(format!(
+                    "`{key}` is a top-level config key but appears inside `[{section}]`; \
+                     move it above any `[table]` header"
+                ));
+            }
+        }
+    }
+    None
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let body = fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let config: Config =
-            toml::from_str(&body).with_context(|| format!("parsing config {}", path.display()))?;
-        config.validate()?;
-        Ok(config)
+        Self::from_str(&body).with_context(|| format!("parsing config {}", path.display()))
+    }
+
+    fn from_str(body: &str) -> Result<Self> {
+        match toml::from_str::<Config>(body) {
+            Ok(config) => {
+                config.validate()?;
+                Ok(config)
+            }
+            Err(e) => {
+                if let Some(hint) = misplaced_top_level_hint(body) {
+                    Err(anyhow::anyhow!("{e}\nhint: {hint}"))
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
     }
 
     /// Reject configs whose targets conflict before we get deep into
@@ -449,6 +508,69 @@ smtp_url = "smtps://mailsift@mail.example.org/"
         .unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("sendmail` and `smtp_url"), "{err}");
+    }
+
+    #[test]
+    fn hint_when_trusted_forwarders_nested_under_caldav() {
+        let body = r#"
+[caldav]
+url = "https://cal.example.org/"
+trusted_forwarders = ["forwarder@example.org"]
+"#;
+        let err = Config::from_str(body).unwrap_err().to_string();
+        assert!(err.contains("trusted_forwarders"), "{err}");
+        assert!(err.contains("[caldav]"), "{err}");
+        assert!(err.contains("top-level"), "{err}");
+    }
+
+    #[test]
+    fn hint_when_bills_dir_nested_under_caldav() {
+        let body = r#"
+[caldav]
+url = "https://cal.example.org/"
+bills_dir = "/tmp/bills"
+"#;
+        let err = Config::from_str(body).unwrap_err().to_string();
+        assert!(err.contains("bills_dir"), "{err}");
+        assert!(err.contains("[caldav]"), "{err}");
+    }
+
+    #[test]
+    fn hint_when_top_level_key_nested_under_receipts_webdav() {
+        let body = r#"
+[receipts_webdav]
+url = "https://dav.example.org/receipts/"
+reservations_dir = "/tmp/reservations"
+"#;
+        let err = Config::from_str(body).unwrap_err().to_string();
+        assert!(err.contains("reservations_dir"), "{err}");
+        assert!(err.contains("[receipts_webdav]"), "{err}");
+    }
+
+    #[test]
+    fn no_hint_for_plain_unknown_field() {
+        let body = r#"
+[caldav]
+url = "https://cal.example.org/"
+bogus = "value"
+"#;
+        let err = Config::from_str(body).unwrap_err().to_string();
+        assert!(!err.contains("hint:"), "{err}");
+    }
+
+    #[test]
+    fn from_str_accepts_valid_config() {
+        let body = r#"
+bills_dir = "/tmp/bills"
+trusted_forwarders = ["forwarder@example.org"]
+
+[caldav]
+url = "https://cal.example.org/"
+"#;
+        let config = Config::from_str(body).unwrap();
+        assert_eq!(config.bills_dir, Some(PathBuf::from("/tmp/bills")));
+        assert_eq!(config.trusted_forwarders, vec!["forwarder@example.org"]);
+        assert_eq!(config.caldav.unwrap().url, "https://cal.example.org/");
     }
 
     #[test]
