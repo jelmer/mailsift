@@ -355,6 +355,7 @@ pub(super) fn file_receipt_artifact(
                     outcome: crate::stats::Outcome::Failed,
                     duration_ms: None,
                     from_domain: None,
+                    error: Some(format!("{e:#}")),
                 });
             }
         }
