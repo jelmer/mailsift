@@ -627,6 +627,20 @@ fn discover_into(dir: &Path, out: &mut Vec<Extractor>) -> Result<()> {
     Ok(())
 }
 
+/// Truncate `line` so the emitted log record can't be flooded by a huge
+/// blob (a JSON dump, a stack trace with embedded payload, etc.). Cuts on
+/// a char boundary and appends an ellipsis marker.
+fn cap_log_line(line: &str, max: usize) -> String {
+    if line.len() <= max {
+        return line.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &line[..end])
+}
+
 /// Run one extractor with the raw RFC822 on stdin and a fresh tempdir as
 /// cwd. Returns the discovered artifacts; the tempdir is kept alive in the
 /// returned struct so the caller can read the artifact files before drop.
@@ -700,13 +714,27 @@ pub fn run_one(extractor: &Extractor, raw: &[u8], timeout: Duration) -> Result<E
     let _ = writer.join();
 
     let stderr = String::from_utf8_lossy(&stderr_buf);
-    if !stderr.trim().is_empty() {
+    let trimmed_stderr = stderr.trim();
+    if !trimmed_stderr.is_empty() {
         for line in stderr.lines() {
-            info!(extractor = %extractor.name, "stderr: {line}");
+            let capped = cap_log_line(line, 500);
+            if status.success() {
+                info!(extractor = %extractor.name, "stderr: {capped}");
+            } else {
+                warn!(extractor = %extractor.name, "stderr: {capped}");
+            }
         }
     }
     if !status.success() {
-        bail!("extractor {} exited with status {}", extractor.name, status);
+        if trimmed_stderr.is_empty() {
+            bail!("extractor {} exited with status {}", extractor.name, status);
+        }
+        bail!(
+            "extractor {} exited with status {}: {}",
+            extractor.name,
+            status,
+            trimmed_stderr
+        );
     }
 
     let (result, unknown) = scan(tempdir.path())?;
@@ -1226,5 +1254,91 @@ mod tests {
         let run = run_one(&ex, &big, Duration::from_secs(10))
             .expect("large stdin to a non-reading extractor should not deadlock");
         assert_eq!(run.result.artifacts.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_one_success_with_stderr_output_does_not_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("noisy-stderr.py");
+        fs::write(
+            &script,
+            "#!/usr/bin/env python3\nimport sys\nsys.stderr.write('a benign warning\\n')\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let ex = Extractor {
+            name: "noisy-stderr".into(),
+            script,
+            order: 100,
+            require_dkim: Vec::new(),
+            from_domains: Vec::new(),
+            subject_regex: None,
+            body_requirements: Vec::new(),
+        };
+        let run = run_one(&ex, b"From: x\r\n\r\n", Duration::from_secs(10))
+            .expect("stderr on a successful run must not turn into an error");
+        assert_eq!(run.result.artifacts.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_one_failure_surfaces_stderr_in_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("boom.py");
+        fs::write(
+            &script,
+            "#!/usr/bin/env python3\nimport sys\nsys.stderr.write('kaboom detail line\\n')\nsys.exit(2)\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let ex = Extractor {
+            name: "boom".into(),
+            script,
+            order: 100,
+            require_dkim: Vec::new(),
+            from_domains: Vec::new(),
+            subject_regex: None,
+            body_requirements: Vec::new(),
+        };
+        let err = match run_one(&ex, b"From: x\r\n\r\n", Duration::from_secs(10)) {
+            Err(e) => e,
+            Ok(_) => panic!("non-zero exit must be an error"),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("kaboom detail line"), "got: {msg}");
+        assert!(msg.contains("boom"), "got: {msg}");
+    }
+
+    #[test]
+    fn cap_log_line_leaves_short_lines_untouched() {
+        assert_eq!(cap_log_line("hello", 500), "hello");
+        assert_eq!(cap_log_line(&"x".repeat(500), 500), "x".repeat(500));
+    }
+
+    #[test]
+    fn cap_log_line_truncates_long_lines_and_marks_them() {
+        let s = "x".repeat(600);
+        let out = cap_log_line(&s, 500);
+        assert_eq!(out.len(), 503);
+        assert!(out.ends_with("..."));
+        assert!(out.starts_with(&"x".repeat(500)));
+    }
+
+    #[test]
+    fn cap_log_line_respects_char_boundaries() {
+        // Multi-byte chars right at the cutoff must not be split.
+        let mut s = "a".repeat(499);
+        s.push('\u{1F600}'); // 4-byte codepoint straddling byte 500
+        s.push_str(&"b".repeat(100));
+        let out = cap_log_line(&s, 500);
+        assert!(out.ends_with("..."));
+        // The truncated prefix must still be valid UTF-8 (implicit: it's a String).
+        // The 4-byte emoji starts at byte 499, so cap at 500 should back off to 499.
+        assert_eq!(&out[..out.len() - 3], &"a".repeat(499));
     }
 }

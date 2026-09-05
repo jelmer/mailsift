@@ -349,12 +349,17 @@ pub(super) fn file_receipt_artifact(
             // are the ones a human might want to see on the dashboard,
             // so we record them under a synthetic extractor name.
             if matches!(sink, receipts::ReceiptSink::Forward(_)) {
+                let mut err_snippet = format!("{e:#}");
+                if err_snippet.len() > crate::stats::MAX_ERROR_SNIPPET {
+                    err_snippet.truncate(crate::stats::MAX_ERROR_SNIPPET);
+                }
                 recorder.record(&crate::stats::Event {
                     ts: now_ts,
                     extractor: RECEIPTS_FORWARD_SINK_NAME.to_string(),
                     outcome: crate::stats::Outcome::Failed,
                     duration_ms: None,
                     from_domain: None,
+                    error: Some(err_snippet),
                 });
             }
         }
