@@ -13,17 +13,21 @@
 //!    ("---------- Forwarded message ---------" attribution line
 //!    followed by pseudo-headers, then the quoted body). We
 //!    reconstruct a synthetic RFC822 from the parsed pseudo-headers
-//!    and, when available, the HTML fragment the client quoted. DKIM
-//!    cannot be verified on inline-forwarded mail; no signature
-//!    survives. The trust here comes entirely from the outer sender
-//!    being on `trusted_forwarders`, which is why the caller is told
-//!    to bypass `require_dkim` when we return
-//!    `from_trusted_forwarder`.
+//!    and, when available, the HTML fragment the client quoted. The
+//!    synthesized message also carries a stable synthetic
+//!    `Message-ID` derived from the pseudo-headers, so downstream
+//!    dedup / bookkeeping keyed on Message-ID has something
+//!    deterministic to grip. DKIM cannot be verified on
+//!    inline-forwarded mail; no signature survives. The trust here
+//!    comes entirely from the outer sender being on
+//!    `trusted_forwarders`, which is why the caller is told to bypass
+//!    `require_dkim` when we return `from_trusted_forwarder`.
 //!
 //! Random forwarded mail from senders not on the list keeps flowing
 //! through the normal pipeline against the outer envelope.
 
 use mailparse::{ParsedMail, parse_mail};
+use sha2::{Digest, Sha256};
 use tracing::debug;
 
 /// Result of a successful unwrap.
@@ -340,12 +344,31 @@ fn extract_inner_html(html: &str) -> Option<String> {
     None
 }
 
+/// Stable synthetic Message-ID derived from the pseudo-headers so
+/// downstream dedup keyed on Message-ID gets the same value on replay
+/// but different values for distinct forwards.
+fn synthetic_message_id(headers: &InnerHeaders) -> String {
+    let from = headers.from.as_deref().unwrap_or("");
+    let date = headers.date.as_deref().unwrap_or("");
+    let subject = headers.subject.as_deref().unwrap_or("");
+    let mut hasher = Sha256::new();
+    hasher.update(from.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(date.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(subject.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("<mailsift-inline-forward-{hex}@synthesized.mailsift.local>")
+}
+
 /// Build a minimal RFC822 message from parsed pseudo-headers plus one
 /// or both bodies. The result carries enough shape for the downstream
 /// pipeline (mailparse, body-shape prefilter, extractor stdin) to
 /// treat it like any other incoming mail.
 fn build_synthetic_rfc822(headers: &InnerHeaders, plain: &str, html: Option<&str>) -> Vec<u8> {
     let mut out = String::new();
+    push_header(&mut out, "Message-ID", &synthetic_message_id(headers));
     if let Some(v) = &headers.from {
         push_header(&mut out, "From", v);
     }
@@ -603,6 +626,57 @@ body
         let raw = make_inline_forward("Joe <joe@example.com>", plain, None);
         let trusted = vec!["joe@example.com".to_string()];
         assert!(try_unwrap_forwarded(&raw, &trusted).is_none());
+    }
+
+    fn synth_from_inline(plain: &str) -> String {
+        let raw = make_inline_forward("Joe <joe@example.com>", plain, None);
+        let trusted = vec!["joe@example.com".to_string()];
+        let unwrapped = try_unwrap_forwarded(&raw, &trusted).expect("should unwrap");
+        String::from_utf8(unwrapped.inner).unwrap()
+    }
+
+    fn extract_message_id(msg: &str) -> String {
+        for line in msg.lines() {
+            if let Some(rest) = line.strip_prefix("Message-ID:") {
+                return rest.trim().to_string();
+            }
+            if line.is_empty() {
+                break;
+            }
+        }
+        panic!("no Message-ID header in synthesized message: {msg}");
+    }
+
+    #[test]
+    fn synthesized_message_id_has_expected_shape() {
+        let text = synth_from_inline(GMAIL_PLAIN);
+        let first_line = text.lines().next().unwrap();
+        assert!(
+            first_line.starts_with("Message-ID: <mailsift-inline-forward-"),
+            "expected Message-ID first, got: {first_line}"
+        );
+        assert!(first_line.ends_with("@synthesized.mailsift.local>"));
+        let id = extract_message_id(&text);
+        let hex = id
+            .trim_start_matches("<mailsift-inline-forward-")
+            .trim_end_matches("@synthesized.mailsift.local>");
+        assert_eq!(hex.len(), 16);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn synthesized_message_id_is_stable_across_identical_forwards() {
+        let a = synth_from_inline(GMAIL_PLAIN);
+        let b = synth_from_inline(GMAIL_PLAIN);
+        assert_eq!(extract_message_id(&a), extract_message_id(&b));
+    }
+
+    #[test]
+    fn synthesized_message_id_differs_when_subject_differs() {
+        let other = GMAIL_PLAIN.replace("Subject: Your order", "Subject: Different order");
+        let a = synth_from_inline(GMAIL_PLAIN);
+        let b = synth_from_inline(&other);
+        assert_ne!(extract_message_id(&a), extract_message_id(&b));
     }
 
     #[test]
