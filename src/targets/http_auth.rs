@@ -15,6 +15,7 @@
 //! - Otherwise return the original 401 to the caller, who decides
 //!   whether to error or accept.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[cfg(feature = "gssapi")]
@@ -22,7 +23,7 @@ use anyhow::anyhow;
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, RETRY_AFTER, WWW_AUTHENTICATE};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Maximum number of send attempts against a single request. One attempt
 /// plus this many additional retries on transient failure.
@@ -82,6 +83,19 @@ impl AttemptScheme {
             Auth::Negotiate { .. } => Self::Negotiate,
             #[cfg(feature = "gssapi")]
             Auth::Both { .. } => Self::Negotiate,
+        }
+    }
+
+    /// Pick a fallback for when the preferred scheme couldn't even be
+    /// applied locally. Unlike [`Self::fallback`] there's no server
+    /// challenge to consult, so this only fires when we hold complete
+    /// credentials for the other scheme.
+    #[cfg_attr(not(feature = "gssapi"), allow(unused_variables))]
+    fn local_failure_fallback(auth: &Auth, attempted: Self) -> Option<Self> {
+        match (auth, attempted) {
+            #[cfg(feature = "gssapi")]
+            (Auth::Both { .. }, Self::Negotiate) => Some(Self::Basic),
+            _ => None,
         }
     }
 
@@ -190,6 +204,10 @@ pub fn apply_auth(
     }
 }
 
+/// Set once we've reported that the preferred scheme can't be applied
+/// locally, so a bulk run doesn't repeat the same warning per request.
+static LOCAL_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// Send a request, retrying once with a fallback scheme on 401 when the
 /// server's `WWW-Authenticate` invites it, and up to
 /// [`MAX_TRANSIENT_RETRIES`] times with exponential backoff on transient
@@ -233,7 +251,31 @@ where
     F: Fn(&Client) -> RequestBuilder,
 {
     let preferred = AttemptScheme::preferred(auth);
-    let response = send_once(client, auth, build_request, preferred).await?;
+    let response = match send_once(client, auth, build_request, preferred).await {
+        Ok(response) => response,
+        // Negotiate can fail before anything is sent (no Kerberos
+        // ticket, unreadable credential cache). That's a local
+        // condition, not a server rejection, so the 401-driven
+        // fallback below never gets a chance to run. When we also hold
+        // Basic credentials, use them rather than failing the request.
+        Err(error) => match AttemptScheme::local_failure_fallback(auth, preferred) {
+            Some(fallback) => {
+                // A bulk backfill makes this per request; say it once
+                // at WARN and keep the rest for debug.
+                if !LOCAL_FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        scheme = ?preferred,
+                        error = %format!("{error:#}"),
+                        "auth scheme unavailable locally; falling back for this and later requests"
+                    );
+                } else {
+                    debug!(scheme = ?preferred, "auth scheme unavailable locally; falling back");
+                }
+                return send_once(client, auth, build_request, fallback).await;
+            }
+            None => return Err(error),
+        },
+    };
     if response.status() != StatusCode::UNAUTHORIZED {
         return Ok(response);
     }
@@ -430,5 +472,37 @@ mod tests {
     #[test]
     fn retry_after_absent_returns_none() {
         assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
+
+    #[cfg(feature = "gssapi")]
+    #[test]
+    fn negotiate_failing_locally_falls_back_to_basic() {
+        // A missing or unreadable Kerberos cache makes Negotiate fail
+        // before the request is sent, so there's no 401 to drive the
+        // usual fallback. With Basic credentials in hand we should
+        // still use them.
+        let auth = Auth::Both {
+            user: "jelmer".into(),
+            password: "secret".into(),
+            host: "cal.example".into(),
+        };
+        assert_eq!(
+            AttemptScheme::local_failure_fallback(&auth, AttemptScheme::Negotiate),
+            Some(AttemptScheme::Basic)
+        );
+    }
+
+    #[cfg(feature = "gssapi")]
+    #[test]
+    fn negotiate_only_has_no_local_fallback() {
+        // Without a password there is nothing to fall back to; the
+        // error must surface rather than being swallowed.
+        let auth = Auth::Negotiate {
+            host: "cal.example".into(),
+        };
+        assert_eq!(
+            AttemptScheme::local_failure_fallback(&auth, AttemptScheme::Negotiate),
+            None
+        );
     }
 }
