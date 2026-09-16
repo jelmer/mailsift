@@ -3,7 +3,8 @@
 //! Recognises the same set of reservation types the schema-ld extractor
 //! emits: `FlightReservation`, `TrainReservation`, `BusReservation`,
 //! `BoatReservation`, `LodgingReservation`, `EventReservation`,
-//! `FoodEstablishmentReservation`. Unknown / unparseable inputs are
+//! `FoodEstablishmentReservation`, `RentalCarReservation`. Unknown /
+//! unparseable inputs are
 //! skipped silently so the caller can move on without aborting the batch.
 //!
 //! The UID is derived from the reservation identifier (typically
@@ -46,6 +47,8 @@ enum Reservation {
     Event(EventReservation),
     #[serde(rename = "FoodEstablishmentReservation")]
     Food(FoodReservation),
+    #[serde(rename = "RentalCarReservation")]
+    RentalCar(RentalCarReservation),
     #[serde(other)]
     Unknown,
 }
@@ -154,6 +157,27 @@ struct LodgingReservation {
     checkin_time: Option<DateTimeField>,
     #[serde(default, alias = "checkoutDate")]
     checkout_time: Option<DateTimeField>,
+}
+
+/// Car hire. Schema.org models the pickup/dropoff as `pickupTime` /
+/// `dropoffTime` with their own locations, and the vehicle itself
+/// under `reservationFor`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RentalCarReservation {
+    #[serde(flatten)]
+    id: ReservationId,
+    /// The vehicle. Rental mail quotes a model "or similar", so this
+    /// is a class rather than a specific car.
+    #[serde(default)]
+    reservation_for: Option<Place>,
+    #[serde(default)]
+    pickup_location: Option<Place>,
+    #[serde(default)]
+    dropoff_location: Option<Place>,
+    pickup_time: DateTimeField,
+    #[serde(default)]
+    dropoff_time: Option<DateTimeField>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -483,6 +507,41 @@ fn render(r: Reservation) -> Option<SingleEvent> {
                 .and_then(|p| p.address.as_ref())
                 .and_then(Address::render);
             ("restaurant", summary, f.start_time, None, location, f.id)
+        }
+        Reservation::RentalCar(r) => {
+            // Prefer the pickup branch's name for the summary: "Hire
+            // car from Porto Airport" reads better on a calendar than
+            // the vehicle class, which the description covers.
+            let pickup = r
+                .pickup_location
+                .as_ref()
+                .and_then(|p| p.name.clone())
+                .unwrap_or_else(|| "rental".to_string());
+            let location = r
+                .pickup_location
+                .as_ref()
+                .and_then(|p| p.address.as_ref())
+                .and_then(Address::render);
+            let vehicle = r.reservation_for.as_ref().and_then(|p| p.name.clone());
+            // One-way hires return the car somewhere else, which is
+            // worth saying up front; same-location hires stay terse.
+            let dropoff = r.dropoff_location.as_ref().and_then(|p| p.name.clone());
+            let route = match dropoff {
+                Some(d) if d != pickup => format!("{pickup} to {d}"),
+                _ => pickup,
+            };
+            let summary = match vehicle {
+                Some(v) => format!("Hire car ({v}) from {route}"),
+                None => format!("Hire car from {route}"),
+            };
+            (
+                "car",
+                summary,
+                r.pickup_time,
+                r.dropoff_time,
+                location,
+                r.id,
+            )
         }
         Reservation::Unknown => return None,
     };
@@ -853,5 +912,67 @@ mod tests {
             other => panic!("expected Floating, got {other:?}"),
         }
         assert!(parse_date_time("2025-08-28 12:00").is_some());
+    }
+
+    #[test]
+    fn rental_car_reservation_renders_pickup_to_dropoff() {
+        let v = serde_json::json!({
+            "@type": "RentalCarReservation",
+            "reservationNumber": "H2050421475",
+            "pickupTime": "2017-03-10T18:00:00",
+            "dropoffTime": "2017-03-19T18:00:00",
+            "reservationFor": {"name": "Kia Picanto or similar"},
+            "pickupLocation": {
+                "name": "Grand Cayman, Georgetown - Cayman Airport",
+                "address": "250 Owens Robert Drive, Grand Cayman"
+            }
+        });
+        let ev = first(convert(&v).unwrap());
+        assert_eq!(ev.uid, "car-H2050421475@mailsift");
+        assert!(ev.body.contains("DTSTART:20170310T180000"));
+        assert!(ev.body.contains("DTEND:20170319T180000"));
+        assert!(ev.body.contains("LOCATION:250 Owens Robert Drive"));
+        assert!(
+            ev.body
+                .contains("SUMMARY:Hire car (Kia Picanto or similar) from Grand Cayman"),
+            "got: {}",
+            ev.body
+        );
+    }
+
+    #[test]
+    fn rental_car_one_way_names_both_ends() {
+        let v = serde_json::json!({
+            "@type": "RentalCarReservation",
+            "reservationNumber": "ONEWAY1",
+            "pickupTime": "2026-08-09T12:00:00",
+            "pickupLocation": {"name": "Porto"},
+            "dropoffLocation": {"name": "Lisbon"}
+        });
+        let ev = first(convert(&v).unwrap());
+        assert!(
+            ev.body.contains("SUMMARY:Hire car from Porto to Lisbon"),
+            "got: {}",
+            ev.body
+        );
+    }
+
+    #[test]
+    fn rental_car_same_location_is_not_repeated() {
+        // Round trips list the same branch twice; saying "Porto to
+        // Porto" would be noise.
+        let v = serde_json::json!({
+            "@type": "RentalCarReservation",
+            "reservationNumber": "ROUND1",
+            "pickupTime": "2026-08-09T12:00:00",
+            "pickupLocation": {"name": "Porto"},
+            "dropoffLocation": {"name": "Porto"}
+        });
+        let ev = first(convert(&v).unwrap());
+        assert!(
+            ev.body.contains("SUMMARY:Hire car from Porto\r\n"),
+            "got: {}",
+            ev.body
+        );
     }
 }
