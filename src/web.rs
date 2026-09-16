@@ -1018,12 +1018,14 @@ async fn list_bills(State(state): State<Arc<AppState>>) -> Result<Html<String>, 
             .unwrap_or_default();
         let href = state.url(&format!("/bills/{}/{}.json", year, slug));
         let vendor = vendor_url(&value);
+        // Records with no date in the payload fall back to the shard
+        // year, which is then the only date they carry.
+        let due = due.unwrap_or_else(|| year.clone());
         let cells = format!(
-            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
-            esc(&year),
+            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
             esc(&payee.unwrap_or_default()),
             esc(&invoice.unwrap_or_default()),
-            esc(&due.unwrap_or_default()),
+            esc(&due),
             esc(&amount),
             links_cell(&href, vendor.as_deref()),
         );
@@ -1038,7 +1040,7 @@ async fn list_bills(State(state): State<Arc<AppState>>) -> Result<Html<String>, 
         )));
     }
     let body = format!(
-        "<table><thead><tr><th>year</th><th>payee</th><th>invoice</th><th>due</th><th>amount</th><th></th></tr></thead>\
+        "<table><thead><tr><th>payee</th><th>invoice</th><th>due</th><th>amount</th><th></th></tr></thead>\
          <tbody>{}</tbody></table>",
         rows.into_iter()
             .map(|(_, _, cells)| format!("<tr>{cells}</tr>"))
@@ -1124,11 +1126,10 @@ async fn list_receipts(State(state): State<Arc<AppState>>) -> Result<Html<String
     for (year, slug, value) in walk_year_json(dir)? {
         let merchant = pick_str(&value, &["merchant", "seller"]).unwrap_or_default();
         let order = pick_str(&value, &["orderNumber", "identifier"]).unwrap_or_default();
-        let date = pick_str(&value, &["orderDate", "date"]).unwrap_or_default();
+        let date = pick_str(&value, &["orderDate", "date"]).unwrap_or_else(|| year.clone());
         let vendor = vendor_url(&value);
         let cells = format!(
-            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
-            esc(&year),
+            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
             esc(&merchant),
             esc(&order),
             esc(&date),
@@ -1148,7 +1149,7 @@ async fn list_receipts(State(state): State<Arc<AppState>>) -> Result<Html<String
         )));
     }
     let body = format!(
-        "<table><thead><tr><th>year</th><th>merchant</th><th>order</th><th>date</th><th></th></tr></thead>\
+        "<table><thead><tr><th>merchant</th><th>order</th><th>date</th><th></th></tr></thead>\
          <tbody>{}</tbody></table>",
         rows.into_iter()
             .map(|(_, _, c)| format!("<tr>{c}</tr>"))
