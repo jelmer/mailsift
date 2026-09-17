@@ -1016,6 +1016,36 @@ mod tests {
         assert!(!e.body_could_match(&parts(false, false, &[("text", "calendar")], &[])));
     }
 
+    /// An [`Extractor`] backed by a checked-in script from
+    /// `tests/fixtures/scripts`.
+    ///
+    /// These are committed rather than written into a tempdir per test
+    /// on purpose: `execve` fails with `ETXTBSY` while any process
+    /// holds the file open for writing, and under `cargo test`'s
+    /// thread pool a `fork` in one thread inherits the write fd
+    /// another thread has open between its own write and close. With
+    /// nothing writing them, there is no window to lose.
+    #[cfg(unix)]
+    fn script_fixture(name: &str) -> Extractor {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/scripts")
+            .join(name);
+        assert!(
+            script.exists(),
+            "missing fixture script: {}",
+            script.display()
+        );
+        Extractor {
+            name: name.trim_end_matches(".py").into(),
+            script,
+            order: 100,
+            require_dkim: Vec::new(),
+            from_domains: Vec::new(),
+            subject_regex: None,
+            body_requirements: Vec::new(),
+        }
+    }
+
     /// Build a temporary extractors directory with one manifest +
     /// executable script. Returns the directory (kept alive) so the
     /// caller can run `discover` on it.
@@ -1239,25 +1269,7 @@ mod tests {
         // An extractor that writes far more to stdout than a pipe
         // buffer holds (64KiB on Linux) must not wedge the parent:
         // the child blocks in write() until someone drains the pipe.
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("noisy.py");
-        fs::write(
-            &script,
-            "#!/usr/bin/env python3\nimport sys\nsys.stdout.write('x' * (2 * 1024 * 1024))\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let ex = Extractor {
-            name: "noisy".into(),
-            script,
-            order: 100,
-            require_dkim: Vec::new(),
-            from_domains: Vec::new(),
-            subject_regex: None,
-            body_requirements: Vec::new(),
-        };
+        let ex = script_fixture("noisy-stdout.py");
         let run = run_one(&ex, b"From: x\r\n\r\n", Duration::from_secs(10))
             .expect("extractor writing a lot to stdout should not deadlock");
         assert_eq!(run.result.artifacts.len(), 0);
@@ -1268,21 +1280,7 @@ mod tests {
     fn run_one_handles_extractor_that_never_reads_stdin() {
         // A large message fed to an extractor that exits without
         // reading stdin must not block the parent in write_all().
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("ignores-stdin.py");
-        fs::write(&script, "#!/usr/bin/env python3\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let ex = Extractor {
-            name: "ignores-stdin".into(),
-            script,
-            order: 100,
-            require_dkim: Vec::new(),
-            from_domains: Vec::new(),
-            subject_regex: None,
-            body_requirements: Vec::new(),
-        };
+        let ex = script_fixture("ignores-stdin.py");
         let big = vec![b'x'; 4 * 1024 * 1024];
         let run = run_one(&ex, &big, Duration::from_secs(10))
             .expect("large stdin to a non-reading extractor should not deadlock");
@@ -1292,25 +1290,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_one_success_with_stderr_output_does_not_fail() {
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("noisy-stderr.py");
-        fs::write(
-            &script,
-            "#!/usr/bin/env python3\nimport sys\nsys.stderr.write('a benign warning\\n')\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let ex = Extractor {
-            name: "noisy-stderr".into(),
-            script,
-            order: 100,
-            require_dkim: Vec::new(),
-            from_domains: Vec::new(),
-            subject_regex: None,
-            body_requirements: Vec::new(),
-        };
+        let ex = script_fixture("noisy-stderr.py");
         let run = run_one(&ex, b"From: x\r\n\r\n", Duration::from_secs(10))
             .expect("stderr on a successful run must not turn into an error");
         assert_eq!(run.result.artifacts.len(), 0);
@@ -1319,32 +1299,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_one_failure_surfaces_stderr_in_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("boom.py");
-        fs::write(
-            &script,
-            "#!/usr/bin/env python3\nimport sys\nsys.stderr.write('kaboom detail line\\n')\nsys.exit(2)\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let ex = Extractor {
-            name: "boom".into(),
-            script,
-            order: 100,
-            require_dkim: Vec::new(),
-            from_domains: Vec::new(),
-            subject_regex: None,
-            body_requirements: Vec::new(),
-        };
+        let ex = script_fixture("fails-with-stderr.py");
         let err = match run_one(&ex, b"From: x\r\n\r\n", Duration::from_secs(10)) {
             Err(e) => e,
             Ok(_) => panic!("non-zero exit must be an error"),
         };
         let msg = format!("{err}");
         assert!(msg.contains("kaboom detail line"), "got: {msg}");
-        assert!(msg.contains("boom"), "got: {msg}");
+        assert!(msg.contains("fails-with-stderr"), "got: {msg}");
     }
 
     #[test]
