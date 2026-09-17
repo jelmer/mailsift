@@ -721,6 +721,14 @@ fn record_skip(
             outcome: explain_outcome,
         });
     }
+    // A header prefilter rejects every extractor a message doesn't
+    // match, so recording those grows the log with (messages x
+    // extractors) rather than with work actually done -- in practice
+    // ~96% of all events. `--explain` still reports them above; only
+    // the on-disk log leaves them out.
+    if stats_outcome == stats::Outcome::SkippedHeaders {
+        return;
+    }
     recorder.record(&stats::Event {
         ts,
         extractor: ex.name.clone(),
@@ -917,6 +925,54 @@ Content-Type: application/pdf; name=\"invoice.pdf\"\r\n\
 %PDF-1.4\r\n";
         let parts = parts_from(raw);
         assert_eq!(parts.attachment_filenames, vec!["invoice.pdf"]);
+    }
+
+    /// Header-prefilter skips dominate the event log (one per
+    /// non-matching extractor per message), so they're deliberately
+    /// left out of it while still showing up in `--explain`.
+    #[test]
+    fn record_skip_keeps_header_skips_out_of_the_log() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let extractors_dir = manifest_dir.join("tests/fixtures/extractors");
+        let extractors = extractor::discover(&[extractors_dir]).expect("discover extractors");
+        let ex = extractors.first().expect("at least one fixture extractor");
+
+        let stats_dir = tempfile::tempdir().expect("stats tempdir");
+        let stats_path = stats_dir.path().join("events.ndjson");
+        let recorder = stats::Recorder::File(stats_path.clone());
+
+        let mut explain: Vec<ExplainRecord> = Vec::new();
+        record_skip(
+            Some(&mut explain),
+            &recorder,
+            ex,
+            1,
+            Some("example.com"),
+            ExplainOutcome::SkippedHeaders,
+            stats::Outcome::SkippedHeaders,
+        );
+        assert_eq!(explain.len(), 1);
+        assert!(
+            !stats_path.exists(),
+            "header skip must not be written to the event log"
+        );
+
+        // The other two skip kinds are bounded by messages that got
+        // far enough to be worth reporting on, so they still record.
+        record_skip(
+            Some(&mut explain),
+            &recorder,
+            ex,
+            2,
+            Some("example.com"),
+            ExplainOutcome::SkippedBody,
+            stats::Outcome::SkippedBody,
+        );
+        assert_eq!(explain.len(), 2);
+        let logged = stats::aggregate(&stats_path).expect("aggregate");
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].skipped_body, 1);
+        assert_eq!(logged[0].skipped_headers, 0);
     }
 
     #[test]
