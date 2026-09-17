@@ -102,6 +102,33 @@ credential cache. Without a user in the URL the current OS user is
 used. Selects the mailbox **read-only**: no flags set, nothing
 expunged.
 
+`--extractor NAME` restricts the run to one extractor; repeat it to
+select several. Unknown names are an error rather than a silently
+smaller run.
+
+Every scan already prefilters before fetching bodies: each batch first
+asks for `BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)]` and `BODYSTRUCTURE`,
+and only messages some extractor could match are fetched in full.
+Narrowing with `--extractor` tightens that automatically. On top of it,
+when every selected extractor declares `from_domains`, the `UID SEARCH`
+itself is narrowed to those senders:
+
+```sh
+mailsift imap-scan imaps://jelmer@mail.example.org/INBOX \
+    --since 01-Jan-2026 --extractor parcel-dhl
+# UID SEARCH SINCE 01-Jan-2026 HEADER FROM "dhl.com"
+```
+
+so the server never returns the other UIDs at all. The `HEADER FROM`
+terms are a deliberate superset of the manifest's matching rule (a
+substring test over the whole header, so `*.dhl.com` and `dhl.com`
+alike become `dhl.com`); the exact check still runs per message
+afterwards. Servers that dislike the query are no problem: the scan
+warns and retries unnarrowed, with unchanged results.
+
+The narrowing is off whenever a selected extractor declares no
+`from_domains`, since it could match mail from anyone.
+
 #### Gmail
 
 Gmail rejects your normal password over IMAP, so you have two ways in.

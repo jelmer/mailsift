@@ -376,6 +376,14 @@ struct ImapScanArgs {
     /// Directory containing extractor scripts.
     #[arg(long)]
     extractors: Option<PathBuf>,
+    /// Only run the named extractor. Repeat to select several.
+    ///
+    /// When every selected extractor declares `from_domains`, the
+    /// `UID SEARCH` is narrowed to those senders so the server never
+    /// returns the other messages. Falls back to the unnarrowed
+    /// search if the server rejects the query.
+    #[arg(long = "extractor", value_name = "NAME")]
+    only: Vec<String>,
     #[command(flatten)]
     target: EventTargetArgs,
     #[command(flatten)]
@@ -1412,6 +1420,7 @@ fn run() -> Result<()> {
                 before,
                 limit,
                 extractors,
+                only,
                 target,
                 artifacts,
                 trackers,
@@ -1423,6 +1432,7 @@ fn run() -> Result<()> {
             let sink = target.build_sink(&config, runtime.handle())?;
             let extractors_dir = resolve_extractors(extractors, &config);
             let extractors = discover_required(&extractors_dir)?;
+            let extractors = select_extractors(extractors, &only)?;
             let dirs = artifacts.resolve(&config, runtime.handle())?;
             let trackers = build_trackers(&trackers, &config, runtime.handle())?;
             let firefly = build_firefly(&firefly, &config, runtime.handle())?;

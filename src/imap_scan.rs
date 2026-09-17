@@ -156,12 +156,41 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
         "selected (read-only)"
     );
 
-    let query = build_search_query(config.since, config.before);
-    let mut uids: Vec<u32> = session
-        .uid_search(&query)
-        .with_context(|| format!("UID SEARCH {query}"))?
-        .into_iter()
-        .collect();
+    let base_query = build_search_query(config.since, config.before);
+    // When every selected extractor names the senders it cares about,
+    // let the server drop everything else: no UID for a message we'd
+    // only discard in the prefilter. Correctness never rests on this,
+    // so a server that rejects the query just costs us the speedup.
+    let mut from_restriction = build_from_restriction(config.extractors);
+    let query = match &from_restriction {
+        Some(r) => format!("{base_query} {r}"),
+        None => base_query.clone(),
+    };
+    let mut uids: Vec<u32> = match session.uid_search(&query) {
+        Ok(found) => found.into_iter().collect(),
+        // Only a NO/BAD tagged response means the server disliked the
+        // query itself. Anything else is a transport failure, which
+        // retrying with a different query wouldn't fix and shouldn't
+        // hide.
+        Err(imap::Error::No(_) | imap::Error::Bad(_)) if from_restriction.is_some() => {
+            warn!(
+                query,
+                "narrowed UID SEARCH rejected by the server; falling back to the unnarrowed query"
+            );
+            // Don't narrow the watch loop's searches either: a failure
+            // there is treated as a transport error and triggers a
+            // reconnect, so a query this server dislikes would spin.
+            from_restriction = None;
+            session
+                .uid_search(&base_query)
+                .with_context(|| format!("UID SEARCH {base_query}"))?
+                .into_iter()
+                .collect()
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("UID SEARCH {query}")));
+        }
+    };
     uids.sort_unstable();
     info!(matched = uids.len(), "UIDs returned by search");
 
@@ -200,7 +229,14 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
         mailbox = config.mailbox,
         cursor, "entering watch mode (IDLE)"
     );
-    watch_loop(session, &mut cursor, uid_validity, &config, &interrupted)
+    watch_loop(
+        session,
+        &mut cursor,
+        uid_validity,
+        &config,
+        from_restriction.as_deref(),
+        &interrupted,
+    )
 }
 
 /// Open a fresh connection and authenticate. Used by both the initial
@@ -422,6 +458,10 @@ fn watch_loop(
     cursor: &mut u32,
     mut uid_validity: Option<u32>,
     config: &ImapScanConfig<'_>,
+    // Sender restriction to append to each cursor search, or `None`
+    // when the selected extractors don't allow narrowing (or the
+    // server rejected it during the initial scan).
+    from_restriction: Option<&str>,
     interrupted: &Arc<AtomicBool>,
 ) -> Result<()> {
     let mut backoff = Duration::from_secs(1);
@@ -464,7 +504,7 @@ fn watch_loop(
         // tick, ask the server for everything past the cursor. Doing
         // this on every wakeup also rescues us from servers that
         // occasionally swallow notifications.
-        let new_uids = match search_after(&mut session, *cursor) {
+        let new_uids = match search_after(&mut session, *cursor, from_restriction) {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "UID SEARCH after cursor failed; reconnecting");
@@ -510,8 +550,12 @@ fn watch_loop(
 /// The set may briefly include `cursor` itself if the server's `*`
 /// quirk resolves to it; we strip that explicitly so the watch loop
 /// never re-processes the cursor message.
-fn search_after(session: &mut Session<imap::Connection>, cursor: u32) -> Result<Vec<u32>> {
-    let query = search_after_query(cursor);
+fn search_after(
+    session: &mut Session<imap::Connection>,
+    cursor: u32,
+    from_restriction: Option<&str>,
+) -> Result<Vec<u32>> {
+    let query = search_after_query(cursor, from_restriction);
     let mut v: Vec<u32> = session
         .uid_search(&query)
         .with_context(|| format!("UID SEARCH {query}"))?
@@ -524,8 +568,12 @@ fn search_after(session: &mut Session<imap::Connection>, cursor: u32) -> Result<
 
 /// Build the `UID N:*` search query for [`search_after`]. Extracted so
 /// the format is unit-testable without a live IMAP connection.
-fn search_after_query(cursor: u32) -> String {
-    format!("UID {}:*", cursor.saturating_add(1))
+fn search_after_query(cursor: u32, from_restriction: Option<&str>) -> String {
+    let range = format!("UID {}:*", cursor.saturating_add(1));
+    match from_restriction {
+        Some(r) => format!("{range} {r}"),
+        None => range,
+    }
 }
 
 /// Reconnect with exponential backoff up to [`RECONNECT_BACKOFF_MAX`].
@@ -588,6 +636,63 @@ fn build_search_query(since: Option<&str>, before: Option<&str>) -> String {
         (None, Some(b)) => format!("BEFORE {b}"),
         (None, None) => "ALL".to_string(),
     }
+}
+
+/// The sender restriction to append to a `UID SEARCH`, built from the
+/// selected extractors' `from_domains`.
+///
+/// `None` means "no restriction is safe": some extractor declares no
+/// `from_domains` at all and so could match a message from any sender.
+/// Otherwise the result is an `OR`-chain of `HEADER FROM` terms.
+///
+/// IMAP's `OR` is strictly binary (RFC 3501 s6.4.4), so N terms become
+/// N-1 prefix `OR`s: `OR OR a b c`. The terms are a deliberate
+/// superset of what [`Extractor::matches_headers`] accepts -- a
+/// substring test against the whole `From` header, so it also matches
+/// display names and lookalike domains -- which is fine because the
+/// per-message prefilter still applies the exact rule afterwards.
+///
+/// [`Extractor::matches_headers`]: crate::extractor::Extractor::matches_headers
+fn build_from_restriction(extractors: &[crate::extractor::Extractor]) -> Option<String> {
+    if extractors.is_empty() {
+        return None;
+    }
+    let mut domains: Vec<&str> = Vec::new();
+    for ex in extractors {
+        let roots = ex.from_domain_roots();
+        if roots.is_empty() {
+            // A hint-less extractor matches any sender; narrowing the
+            // search would hide messages it wants.
+            return None;
+        }
+        domains.extend(roots);
+    }
+    domains.sort_unstable();
+    domains.dedup();
+
+    let mut terms = domains
+        .iter()
+        .map(|d| format!("HEADER FROM {}", quote_imap_string(d)));
+    let mut query = terms.next()?;
+    for term in terms {
+        query = format!("OR {query} {term}");
+    }
+    Some(query)
+}
+
+/// Render `s` as an IMAP quoted string (RFC 3501 s4.3): wrapped in
+/// double quotes with `\` and `"` backslash-escaped.
+fn quote_imap_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '\\' || c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 /// Flatten an IMAP `BODYSTRUCTURE` response into the [`BodyParts`]
@@ -741,17 +846,91 @@ mod tests {
         assert_eq!(uid_set(&[1, 2, 3, 5, 7, 8, 10]), "1:3,5,7:8,10");
     }
 
+    fn fixture_extractors(names: &[&str]) -> Vec<crate::extractor::Extractor> {
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extractors");
+        crate::extractor::discover(&[dir])
+            .unwrap()
+            .into_iter()
+            .filter(|ex| names.contains(&ex.name.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn from_restriction_for_a_single_extractor() {
+        assert_eq!(
+            build_from_restriction(&fixture_extractors(&["fixture-flight"])).as_deref(),
+            Some(r#"HEADER FROM "flight.fixture.test""#)
+        );
+    }
+
+    #[test]
+    fn from_restriction_ors_several_domains() {
+        // Two extractors, one domain each: a single binary OR.
+        assert_eq!(
+            build_from_restriction(&fixture_extractors(&["fixture-flight", "fixture-lodging"]))
+                .as_deref(),
+            Some(r#"OR HEADER FROM "flight.fixture.test" HEADER FROM "lodging.fixture.test""#)
+        );
+    }
+
+    #[test]
+    fn from_restriction_nests_ors_for_three_domains() {
+        // N terms need N-1 prefix ORs; check the nesting shape.
+        assert_eq!(
+            build_from_restriction(&fixture_extractors(&[
+                "fixture-flight",
+                "fixture-lodging",
+                "fixture-parcel-status",
+            ]))
+            .as_deref(),
+            Some(
+                r#"OR OR HEADER FROM "flight.fixture.test" HEADER FROM "lodging.fixture.test" HEADER FROM "parcel.fixture.test""#
+            )
+        );
+    }
+
+    #[test]
+    fn from_restriction_is_none_when_an_extractor_names_no_senders() {
+        // `fixture-ics-pass` declares only `requires:`, so it could
+        // match a message from anyone; narrowing would hide those.
+        assert_eq!(
+            build_from_restriction(&fixture_extractors(&["fixture-flight", "fixture-ics-pass"])),
+            None
+        );
+    }
+
+    #[test]
+    fn from_restriction_is_none_without_extractors() {
+        assert_eq!(build_from_restriction(&[]), None);
+    }
+
+    #[test]
+    fn quote_imap_string_escapes_quotes_and_backslashes() {
+        assert_eq!(quote_imap_string("plain.example"), r#""plain.example""#);
+        assert_eq!(quote_imap_string(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(quote_imap_string(r"a\b"), r#""a\\b""#);
+    }
+
+    #[test]
+    fn search_after_query_appends_the_from_restriction() {
+        assert_eq!(
+            search_after_query(42, Some(r#"HEADER FROM "x.example""#)),
+            r#"UID 43:* HEADER FROM "x.example""#
+        );
+    }
+
     #[test]
     fn search_after_query_from_zero() {
         // Initial watch on an empty (or not-yet-scanned) mailbox.
         // `UID 1:*` is the standard "everything that exists" form.
-        assert_eq!(search_after_query(0), "UID 1:*");
+        assert_eq!(search_after_query(0, None), "UID 1:*");
     }
 
     #[test]
     fn search_after_query_from_nonzero_cursor() {
         // Typical watch tick after some UIDs are already processed.
-        assert_eq!(search_after_query(42), "UID 43:*");
+        assert_eq!(search_after_query(42, None), "UID 43:*");
     }
 
     #[test]
@@ -759,7 +938,10 @@ mod tests {
         // Defensive: u32::MAX as cursor would overflow naively. The
         // resulting query is silly (UID MAX:*) but the function must
         // not panic; the server will return an empty set.
-        assert_eq!(search_after_query(u32::MAX), format!("UID {}:*", u32::MAX));
+        assert_eq!(
+            search_after_query(u32::MAX, None),
+            format!("UID {}:*", u32::MAX)
+        );
     }
 
     #[test]
