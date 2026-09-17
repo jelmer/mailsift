@@ -236,6 +236,39 @@ impl Extractor {
         true
     }
 
+    /// The base domain of each `from_domains` entry, for callers that
+    /// want to push the hint into a coarser upstream filter (the IMAP
+    /// `UID SEARCH`).
+    ///
+    /// Both pattern forms collapse to the same string: `example.com`
+    /// and `*.example.com` alike yield `example.com`. That is a
+    /// deliberate over-match -- as an IMAP `HEADER FROM` substring
+    /// test it admits `notexample.com` and any subdomain -- because
+    /// the upstream filter only has to be a superset. Every surviving
+    /// message is still put through [`matches_headers`], which applies
+    /// the real per-pattern semantics.
+    ///
+    /// [`matches_headers`]: Self::matches_headers
+    pub fn from_domain_roots(&self) -> Vec<&str> {
+        self.from_domains
+            .iter()
+            .map(|p| match p {
+                FromDomainPattern::Exact(d) | FromDomainPattern::Wildcard(d) => d.as_str(),
+            })
+            .collect()
+    }
+
+    /// Return `true` when this extractor declares any `from_domains`
+    /// or `subject_regex` hint, i.e. [`matches_headers`] can rule it
+    /// out from headers alone. An extractor without hints matches
+    /// every message, so a scan including it can't narrow anything
+    /// down from headers.
+    ///
+    /// [`matches_headers`]: Self::matches_headers
+    pub fn constrains_headers(&self) -> bool {
+        !self.from_domains.is_empty() || self.subject_regex.is_some()
+    }
+
     /// Return `true` when the manifest's `requires:` body constraints
     /// are satisfied by the given parts summary. Every requirement
     /// must hold; an empty requirement list always matches.

@@ -102,6 +102,33 @@ credential cache. Without a user in the URL the current OS user is
 used. Selects the mailbox **read-only**: no flags set, nothing
 expunged.
 
+`--extractor NAME` restricts the run to one extractor; repeat it to
+select several. Unknown names are an error rather than a silently
+smaller run.
+
+Every scan already prefilters before fetching bodies: each batch first
+asks for `BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)]` and `BODYSTRUCTURE`,
+and only messages some extractor could match are fetched in full.
+Narrowing with `--extractor` tightens that automatically. On top of it,
+when every selected extractor declares `from_domains`, the `UID SEARCH`
+itself is narrowed to those senders:
+
+```sh
+mailsift imap-scan imaps://jelmer@mail.example.org/INBOX \
+    --since 01-Jan-2026 --extractor parcel-dhl
+# UID SEARCH SINCE 01-Jan-2026 HEADER FROM "dhl.com"
+```
+
+so the server never returns the other UIDs at all. The `HEADER FROM`
+terms are a deliberate superset of the manifest's matching rule (a
+substring test over the whole header, so `*.dhl.com` and `dhl.com`
+alike become `dhl.com`); the exact check still runs per message
+afterwards. Servers that dislike the query are no problem: the scan
+warns and retries unnarrowed, with unchanged results.
+
+The narrowing is off whenever a selected extractor declares no
+`from_domains`, since it could match mail from anyone.
+
 #### Gmail
 
 Gmail rejects your normal password over IMAP, so you have two ways in.
@@ -199,6 +226,7 @@ mailbox); restart manually in that case.
 mailsift maildir-scan /srv/mail/jelmer/Maildir
 mailsift maildir-scan /srv/mail/jelmer/Maildir --recurse
 mailsift maildir-scan /srv/mail/jelmer/Maildir --recurse --since 2026-01-01
+mailsift maildir-scan /srv/mail/jelmer/Maildir --recurse --extractor parcel-dhl
 ```
 
 Reads `cur/` and `new/` (`tmp/` is skipped) and runs each message
@@ -207,6 +235,24 @@ subfolders (`.name/cur`, `.name/new`); non-Maildir dotdirs are skipped.
 Useful for one-off backfills against archived mail without going through
 an IMAP server. Like `imap-scan`, this mode bypasses the milter's dedup
 store and stats recorder; upstream sinks (CalDAV etc.) are idempotent.
+
+`--extractor NAME` restricts the run to one extractor; repeat it to
+select several. Unknown names are an error rather than a silently
+smaller run.
+
+Backfilling a single extractor over a large archive doesn't have to read
+every message: when every selected extractor declares `from_domains` or
+`subject_regex` in its manifest, the scan first reads just the header
+block of each file and drops the messages no selected extractor could
+match, so only the survivors are parsed and dispatched in full. This is
+the on-disk counterpart to `imap-scan`'s `BODY[HEADER.FIELDS]`
+prefilter. A message whose header block is implausibly large, or that
+can't be read, is passed through to the pipeline rather than dropped.
+
+The narrowing is off whenever any selected extractor declares neither
+hint, since such an extractor matches every message and the bodies would
+have to be read anyway. The run logs how many messages the prefilter
+dropped, so it's visible when it applied.
 
 ### `milter`: Postfix milter
 

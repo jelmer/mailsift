@@ -376,6 +376,14 @@ struct ImapScanArgs {
     /// Directory containing extractor scripts.
     #[arg(long)]
     extractors: Option<PathBuf>,
+    /// Only run the named extractor. Repeat to select several.
+    ///
+    /// When every selected extractor declares `from_domains`, the
+    /// `UID SEARCH` is narrowed to those senders so the server never
+    /// returns the other messages. Falls back to the unnarrowed
+    /// search if the server rejects the query.
+    #[arg(long = "extractor", value_name = "NAME")]
+    only: Vec<String>,
     #[command(flatten)]
     target: EventTargetArgs,
     #[command(flatten)]
@@ -485,6 +493,14 @@ enum Command {
         /// Directory containing extractor scripts.
         #[arg(long)]
         extractors: Option<PathBuf>,
+        /// Only run the named extractor. Repeat to select several.
+        ///
+        /// When every selected extractor declares `from_domains` or
+        /// `subject_regex` in its manifest, the scan reads just each
+        /// message's headers and skips the ones no selected extractor
+        /// could match, rather than parsing every message in full.
+        #[arg(long = "extractor", value_name = "NAME")]
+        only: Vec<String>,
         #[command(flatten)]
         target: EventTargetArgs,
         #[command(flatten)]
@@ -983,6 +999,50 @@ fn discover_required(dirs: &[PathBuf]) -> Result<Vec<mailsift::extractor::Extrac
     Ok(extractors)
 }
 
+/// Narrow a discovered extractor set to the names given on the command
+/// line. An empty `names` keeps everything. Every name must match a
+/// discovered extractor; a typo would otherwise silently scan with a
+/// smaller set than the user asked for.
+fn select_extractors(
+    extractors: Vec<mailsift::extractor::Extractor>,
+    names: &[String],
+) -> Result<Vec<mailsift::extractor::Extractor>> {
+    if names.is_empty() {
+        return Ok(extractors);
+    }
+    let mut unknown: Vec<&str> = names
+        .iter()
+        .filter(|n| !extractors.iter().any(|ex| &ex.name == *n))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        unknown.dedup();
+        let mut available: Vec<&str> = extractors.iter().map(|ex| ex.name.as_str()).collect();
+        available.sort_unstable();
+        return Err(usage_error!(
+            "unknown extractor{} {}; available: {}",
+            if unknown.len() == 1 { "" } else { "s" },
+            unknown.join(", "),
+            available.join(", ")
+        ));
+    }
+    let selected: Vec<_> = extractors
+        .into_iter()
+        .filter(|ex| names.iter().any(|n| n == &ex.name))
+        .collect();
+    tracing::info!(
+        "selected {} of the discovered extractors: {}",
+        selected.len(),
+        selected
+            .iter()
+            .map(|ex| ex.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(selected)
+}
+
 /// Parse a `YYYY-MM-DD` date into the local-midnight `SystemTime` we
 /// compare Maildir mtimes against.
 fn parse_since_date(s: &str) -> Result<std::time::SystemTime> {
@@ -1360,6 +1420,7 @@ fn run() -> Result<()> {
                 before,
                 limit,
                 extractors,
+                only,
                 target,
                 artifacts,
                 trackers,
@@ -1371,6 +1432,7 @@ fn run() -> Result<()> {
             let sink = target.build_sink(&config, runtime.handle())?;
             let extractors_dir = resolve_extractors(extractors, &config);
             let extractors = discover_required(&extractors_dir)?;
+            let extractors = select_extractors(extractors, &only)?;
             let dirs = artifacts.resolve(&config, runtime.handle())?;
             let trackers = build_trackers(&trackers, &config, runtime.handle())?;
             let firefly = build_firefly(&firefly, &config, runtime.handle())?;
@@ -1479,6 +1541,7 @@ fn run() -> Result<()> {
             since,
             limit,
             extractors,
+            only,
             target,
             artifacts,
             trackers,
@@ -1489,6 +1552,7 @@ fn run() -> Result<()> {
             let sink = target.build_sink(&config, runtime.handle())?;
             let extractors_dir = resolve_extractors(extractors, &config);
             let extractors = discover_required(&extractors_dir)?;
+            let extractors = select_extractors(extractors, &only)?;
             let dirs = artifacts.resolve(&config, runtime.handle())?;
             let trackers = build_trackers(&trackers, &config, runtime.handle())?;
             let firefly = build_firefly(&firefly, &config, runtime.handle())?;
