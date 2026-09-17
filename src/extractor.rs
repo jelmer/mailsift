@@ -236,6 +236,17 @@ impl Extractor {
         true
     }
 
+    /// Return `true` when this extractor declares any `from_domains`
+    /// or `subject_regex` hint, i.e. [`matches_headers`] can rule it
+    /// out from headers alone. An extractor without hints matches
+    /// every message, so a scan including it can't narrow anything
+    /// down from headers.
+    ///
+    /// [`matches_headers`]: Self::matches_headers
+    pub fn constrains_headers(&self) -> bool {
+        !self.from_domains.is_empty() || self.subject_regex.is_some()
+    }
+
     /// Return `true` when the manifest's `requires:` body constraints
     /// are satisfied by the given parts summary. Every requirement
     /// must hold; an empty requirement list always matches.

@@ -199,6 +199,7 @@ mailbox); restart manually in that case.
 mailsift maildir-scan /srv/mail/jelmer/Maildir
 mailsift maildir-scan /srv/mail/jelmer/Maildir --recurse
 mailsift maildir-scan /srv/mail/jelmer/Maildir --recurse --since 2026-01-01
+mailsift maildir-scan /srv/mail/jelmer/Maildir --recurse --extractor parcel-dhl
 ```
 
 Reads `cur/` and `new/` (`tmp/` is skipped) and runs each message
@@ -207,6 +208,24 @@ subfolders (`.name/cur`, `.name/new`); non-Maildir dotdirs are skipped.
 Useful for one-off backfills against archived mail without going through
 an IMAP server. Like `imap-scan`, this mode bypasses the milter's dedup
 store and stats recorder; upstream sinks (CalDAV etc.) are idempotent.
+
+`--extractor NAME` restricts the run to one extractor; repeat it to
+select several. Unknown names are an error rather than a silently
+smaller run.
+
+Backfilling a single extractor over a large archive doesn't have to read
+every message: when every selected extractor declares `from_domains` or
+`subject_regex` in its manifest, the scan first reads just the header
+block of each file and drops the messages no selected extractor could
+match, so only the survivors are parsed and dispatched in full. This is
+the on-disk counterpart to `imap-scan`'s `BODY[HEADER.FIELDS]`
+prefilter. A message whose header block is implausibly large, or that
+can't be read, is passed through to the pipeline rather than dropped.
+
+The narrowing is off whenever any selected extractor declares neither
+hint, since such an extractor matches every message and the bodies would
+have to be read anyway. The run logs how many messages the prefilter
+dropped, so it's visible when it applied.
 
 ### `milter`: Postfix milter
 
