@@ -440,6 +440,18 @@ fn process_uid_set(
 /// how many failures have accumulated, without DDoSing the server.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// Maximum backoff after a failed fetch. Unlike a failed connect, this
+/// can mean the server is rate-limiting us, which on Gmail lasts hours
+/// rather than seconds; retrying every minute would keep us in the
+/// penalty box, so this backs off much further.
+const FETCH_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+
+/// Double a backoff, capped at `max`. Extracted so the progression is
+/// unit-testable without a live connection.
+fn grow_backoff(current: Duration, max: Duration) -> Duration {
+    (current * 2).min(max)
+}
+
 /// IDLE keepalive interval. RFC 2177 says servers may log out clients
 /// after 29 minutes; we DONE+IDLE more frequently so we (a) stay well
 /// under that limit, (b) get a chance to check the interrupt flag, and
@@ -465,6 +477,9 @@ fn watch_loop(
     interrupted: &Arc<AtomicBool>,
 ) -> Result<()> {
     let mut backoff = Duration::from_secs(1);
+    // Tracked separately from `backoff`: a throttled server still
+    // accepts connections, so only a successful fetch clears this.
+    let mut fetch_backoff = Duration::from_secs(1);
     loop {
         if interrupted.load(Ordering::SeqCst) {
             info!("interrupted, leaving watch mode");
@@ -528,8 +543,44 @@ fn watch_loop(
         }
         info!(count = new_uids.len(), "new messages while watching");
         let pb = make_progress_bar(new_uids.len() as u64);
-        let stats = process_uid_set(&mut session, &new_uids, config, &pb)?;
+        let fetch_result = process_uid_set(&mut session, &new_uids, config, &pb);
         pb.finish_and_clear();
+        let stats = match fetch_result {
+            Ok(stats) => stats,
+            // A fetch can die mid-batch when the server throttles us or
+            // drops the connection. Treat it like the IDLE and SEARCH
+            // failures above: back off and rebuild the session rather
+            // than exiting, which would leave systemd restarting us at
+            // a flat rate and burning its start limit. The cursor is
+            // left alone so the same UIDs are retried after reconnect.
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    ?fetch_backoff,
+                    "fetching new messages failed; backing off and reconnecting"
+                );
+                // Reconnecting usually succeeds even while the server
+                // is throttling fetches, so `reconnect`'s own backoff
+                // never grows. Sleep here instead, and keep growing it
+                // until a fetch actually works.
+                std::thread::sleep(fetch_backoff);
+                if interrupted.load(Ordering::SeqCst) {
+                    let _ = session.logout();
+                    return Ok(());
+                }
+                fetch_backoff = grow_backoff(fetch_backoff, FETCH_BACKOFF_MAX);
+                session = match reconnect(config, &mut backoff, interrupted) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+                if let Some(new_validity) = reselect(&mut session, config, uid_validity)? {
+                    uid_validity = Some(new_validity);
+                }
+                continue;
+            }
+        };
+        // Fetches are working again, so start over from 1 s.
+        fetch_backoff = Duration::from_secs(1);
         if stats.prefilter_skipped > 0 {
             info!(
                 skipped = stats.prefilter_skipped,
@@ -600,7 +651,7 @@ fn reconnect(
             }
             Err(e) => {
                 warn!(error = %e, "reconnect failed");
-                *backoff = (*backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                *backoff = grow_backoff(*backoff, RECONNECT_BACKOFF_MAX);
             }
         }
     }
@@ -1041,5 +1092,32 @@ mod tests {
         .into();
         assert!(err.is::<MailboxNotFound>());
         assert_eq!(err.to_string(), "no such mailbox: archive");
+    }
+
+    #[test]
+    fn fetch_backoff_grows_to_half_an_hour() {
+        // A throttled Gmail session stays throttled for hours, so the
+        // fetch backoff has to climb well past the reconnect cap.
+        let mut d = Duration::from_secs(1);
+        let mut seen = vec![d];
+        for _ in 0..12 {
+            d = grow_backoff(d, FETCH_BACKOFF_MAX);
+            seen.push(d);
+        }
+        assert_eq!(seen[0], Duration::from_secs(1));
+        assert_eq!(seen[1], Duration::from_secs(2));
+        assert_eq!(seen[10], Duration::from_secs(1024));
+        // Capped, not unbounded.
+        assert_eq!(d, FETCH_BACKOFF_MAX);
+        assert_eq!(grow_backoff(d, FETCH_BACKOFF_MAX), FETCH_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn reconnect_backoff_still_caps_at_a_minute() {
+        let mut d = Duration::from_secs(1);
+        for _ in 0..10 {
+            d = grow_backoff(d, RECONNECT_BACKOFF_MAX);
+        }
+        assert_eq!(d, RECONNECT_BACKOFF_MAX);
     }
 }
