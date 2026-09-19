@@ -12,19 +12,26 @@
 //! inbox) and the extractor daemons write to these dirs while the web
 //! server runs, so a rescan avoids showing stale data.
 
+use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use axum::extract::{Path as UrlPath, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{Path as UrlPath, Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{NaiveDate, NaiveDateTime, Utc};
+use futures_util::stream::Stream;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::info;
 
@@ -50,10 +57,57 @@ impl Listen {
     }
 }
 
+/// A notification payload representing a new or updated item discovered on disk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationItem {
+    pub id: u64,
+    pub kind: String,
+    pub title: String,
+    pub subtitle: String,
+    pub date: String,
+    pub href: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor_url: Option<String>,
+    pub is_update: bool,
+    pub timestamp: i64,
+}
+
+/// Shared notification broker state. Tracks known items across directory scans,
+/// retains recent notification history for catch-up / polling, and provides a broadcast
+/// channel for live SSE streaming.
+pub struct NotificationState {
+    /// Maps item `href` -> `subtitle`. `None` prior to the initial directory scan.
+    pub known_items: Mutex<Option<HashMap<String, String>>>,
+    /// Bounded ring-buffer of recent notifications for catch-up queries.
+    pub history: Mutex<Vec<NotificationItem>>,
+    /// Broadcast channel sender for live SSE clients.
+    pub tx: tokio::sync::broadcast::Sender<NotificationItem>,
+    /// Monotonically increasing notification ID counter.
+    pub next_id: AtomicU64,
+}
+
+impl NotificationState {
+    pub fn new() -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(256);
+        Self {
+            known_items: Mutex::new(None),
+            history: Mutex::new(Vec::new()),
+            tx,
+            next_id: AtomicU64::new(1),
+        }
+    }
+}
+
+impl Default for NotificationState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared handler state: the mailsift config plus URL-generation
 /// context. Every artifact directory the UI reads from lives on the
 /// [`Config`]; there's no separate copy.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     /// URL prefix under which the app is mounted, without a trailing
@@ -61,6 +115,24 @@ pub struct AppState {
     /// generated URL so links work behind a reverse proxy that only
     /// forwards a sub-path (e.g. `location /mailsift/`).
     pub base_path: String,
+    /// Live notification state.
+    pub notifications: Arc<NotificationState>,
+}
+
+impl AppState {
+    pub fn new(config: Arc<Config>, base_path: String) -> Self {
+        Self {
+            config,
+            base_path,
+            notifications: Arc::new(NotificationState::new()),
+        }
+    }
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new(Arc::new(Config::default()), String::new())
+    }
 }
 
 impl AppState {
@@ -141,7 +213,25 @@ pub async fn serve(
     base_path: String,
     socket_mode: Option<u32>,
 ) -> Result<()> {
-    let state = Arc::new(AppState { config, base_path });
+    let state = Arc::new(AppState::new(config, base_path));
+
+    // Seed known items on startup so existing artifacts are not alerted
+    if let Err(err) = check_for_updates(&state) {
+        tracing::warn!(error = %err, "initial notification indexing failed");
+    }
+
+    // Spawn background task to periodically scan artifact dirs for updates
+    let bg_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            if let Err(err) = check_for_updates(&bg_state) {
+                tracing::debug!(error = %err, "periodic notification check failed");
+            }
+        }
+    });
+
     let app = router(state);
 
     match listen {
@@ -238,6 +328,10 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/reservations.json", get(api_reservations))
         .route("/api/stats.json", get(api_stats))
         .route("/api/recent-failures.json", get(api_recent_failures))
+        .route("/api/feed.json", get(api_feed))
+        .route("/api/notifications/stream", get(notifications_stream))
+        .route("/api/notifications/poll", get(api_notifications_poll))
+        .route("/api/notifications/latest", get(api_notifications_latest))
         .with_state(state)
 }
 
@@ -299,9 +393,21 @@ fn read_status(path: &Path, err: io::Error) -> AppError {
 
 const CSS: &str = r#"
 body { font-family: system-ui, sans-serif; margin: 0; color: #222; background: #fafafa; }
-header { background: #2a3f5f; color: #fff; padding: 0.75rem 1.25rem; }
-header a { color: #fff; text-decoration: none; margin-right: 1rem; font-weight: 500; }
-header a:hover { text-decoration: underline; }
+header { background: #2a3f5f; color: #fff; padding: 0.75rem 1.25rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.75rem; }
+.nav-links { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }
+.nav-links a, header a { color: #fff; text-decoration: none; font-weight: 500; }
+.nav-links a:hover, header a:hover { text-decoration: underline; }
+.notify-btn { background: rgba(255, 255, 255, 0.15); color: #fff; border: 1px solid rgba(255, 255, 255, 0.35); border-radius: 4px; padding: 0.3rem 0.65rem; font-size: 0.85rem; font-weight: 500; cursor: pointer; display: inline-flex; align-items: center; gap: 0.4rem; transition: background 0.15s, border-color 0.15s; }
+.notify-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.28); }
+.notify-btn.active { background: #2e7d32; border-color: #4caf50; }
+.notify-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+.toast-container { position: fixed; bottom: 1.5rem; right: 1.5rem; display: flex; flex-direction: column; gap: 0.5rem; z-index: 1000; max-width: 380px; }
+.toast { background: #2a3f5f; color: #fff; padding: 0.75rem 1rem; border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.25); font-size: 0.9rem; animation: slide-in 0.2s ease-out; transition: opacity 0.3s ease-out, transform 0.3s ease-out; }
+.toast.fade-out { opacity: 0; transform: translateY(8px); }
+.toast-title { font-weight: 600; }
+.toast-sub { color: #ccd6e0; }
+.toast a { color: #70b0ff; margin-left: 0.5rem; font-weight: 500; }
+@keyframes slide-in { from { transform: translateY(12px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 main { max-width: 960px; margin: 1.5rem auto; padding: 0 1.25rem; }
 h1 { margin-top: 0; }
 table { border-collapse: collapse; width: 100%; background: #fff; }
@@ -320,6 +426,237 @@ pre { background: #f5f5f7; padding: 1rem; overflow: auto; }
 a { color: #2a3f5f; }
 footer { max-width: 960px; margin: 3rem auto 1.5rem; padding: 1rem 1.25rem; border-top: 1px solid #e0e0e0; color: #777; font-size: 0.85rem; }
 footer a { color: #777; }
+"#;
+
+const SCRIPT: &str = r#"
+(function() {
+  var btn = document.getElementById('notify-btn');
+  var toastContainer = document.getElementById('toast-container');
+  var basePath = document.body.dataset.basePath || '';
+  var streamUrl = basePath + '/api/notifications/stream';
+  var pollUrl = basePath + '/api/notifications/poll';
+
+  var STORAGE_KEY = 'mailsift_web_notifications_enabled';
+  var SEEN_ID_KEY = 'mailsift_last_notif_id';
+
+  if (!('Notification' in window)) {
+    if (btn) btn.style.display = 'none';
+    return;
+  }
+
+  var pageLatestId = document.body.dataset.latestNotifId;
+  if (pageLatestId && localStorage.getItem(SEEN_ID_KEY) === null) {
+    localStorage.setItem(SEEN_ID_KEY, pageLatestId);
+  }
+
+  function updateButtonState() {
+    if (!btn) return;
+    var perm = Notification.permission;
+    var isEnabled = localStorage.getItem(STORAGE_KEY) === 'true';
+
+    btn.classList.remove('active', 'blocked');
+
+    var icon = btn.querySelector('.notify-icon');
+    var label = btn.querySelector('.notify-label');
+
+    if (perm === 'denied') {
+      btn.classList.add('blocked');
+      btn.title = 'Notifications are blocked in your browser site settings';
+      if (icon) icon.textContent = '🔕';
+      if (label) label.textContent = 'Notifications blocked';
+      btn.disabled = true;
+    } else if (perm === 'granted' && isEnabled) {
+      btn.classList.add('active');
+      btn.title = 'Browser notifications are active. Click to pause.';
+      if (icon) icon.textContent = '🔔';
+      if (label) label.textContent = 'Notifications on';
+      btn.disabled = false;
+    } else if (perm === 'granted' && !isEnabled) {
+      btn.title = 'Notifications are paused. Click to resume.';
+      if (icon) icon.textContent = '🔕';
+      if (label) label.textContent = 'Notifications paused';
+      btn.disabled = false;
+    } else {
+      btn.title = 'Get browser notifications when new items arrive';
+      if (icon) icon.textContent = '🔔';
+      if (label) label.textContent = 'Enable notifications';
+      btn.disabled = false;
+    }
+  }
+
+  function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function showToast(item) {
+    if (!toastContainer) return;
+    var toast = document.createElement('div');
+    toast.className = 'toast';
+    var prefix = item.is_update ? 'Updated ' : 'New ';
+    var titleText = prefix + item.kind + (item.title ? ': ' + item.title : '');
+    var subText = item.subtitle ? ' &mdash; ' + escapeHtml(item.subtitle) : '';
+    toast.innerHTML = '<span class="toast-title">' + escapeHtml(titleText) + '</span>' +
+                      '<span class="toast-sub">' + subText + '</span>' +
+                      ' <a href="' + escapeHtml(item.href) + '">view</a>';
+    toastContainer.appendChild(toast);
+    setTimeout(function() {
+      toast.classList.add('fade-out');
+      setTimeout(function() { toast.remove(); }, 300);
+    }, 6000);
+  }
+
+  function handleIncomingNotification(item) {
+    if (!item || !item.id) return;
+    var lastSeen = parseInt(localStorage.getItem(SEEN_ID_KEY) || '0', 10);
+    if (item.id <= lastSeen) return;
+    localStorage.setItem(SEEN_ID_KEY, String(item.id));
+
+    showToast(item);
+
+    var perm = Notification.permission;
+    var isEnabled = localStorage.getItem(STORAGE_KEY) === 'true';
+    if (perm === 'granted' && isEnabled) {
+      var tabDedupeKey = 'mailsift_notified_' + item.id;
+      var lastNotifiedTime = parseInt(localStorage.getItem(tabDedupeKey) || '0', 10);
+      var now = Date.now();
+      if (now - lastNotifiedTime < 3000) {
+        return;
+      }
+      localStorage.setItem(tabDedupeKey, String(now));
+
+      var prefix = item.is_update ? 'Updated ' : 'New ';
+      var title = prefix + item.kind + (item.title ? ': ' + item.title : '');
+      var bodyParts = [];
+      if (item.subtitle) bodyParts.push(item.subtitle);
+      if (item.date) bodyParts.push(item.date);
+      var body = bodyParts.join(' \u2022 ');
+
+      try {
+        var notif = new Notification(title, {
+          body: body,
+          tag: item.href
+        });
+        notif.onclick = function() {
+          window.focus();
+          window.location.href = item.href;
+        };
+      } catch (e) {
+        console.warn('Error displaying Notification:', e);
+      }
+    }
+  }
+
+  var eventSource = null;
+  var pollTimer = null;
+
+  function startListening() {
+    stopListening();
+
+    if ('EventSource' in window) {
+      try {
+        var lastId = localStorage.getItem(SEEN_ID_KEY) || '0';
+        var url = streamUrl + '?after=' + encodeURIComponent(lastId);
+        eventSource = new EventSource(url);
+
+        eventSource.addEventListener('new_item', function(e) {
+          try {
+            var data = JSON.parse(e.data);
+            handleIncomingNotification(data);
+          } catch (err) {
+            console.error('Failed to parse SSE notification:', err);
+          }
+        });
+
+        eventSource.onerror = function() {
+          startPolling();
+        };
+
+        eventSource.onopen = function() {
+          if (pollTimer) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+          }
+        };
+      } catch (err) {
+        console.warn('EventSource failed, using polling fallback', err);
+        startPolling();
+      }
+    } else {
+      startPolling();
+    }
+  }
+
+  function stopListening() {
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  function startPolling() {
+    if (pollTimer) return;
+    pollTimer = setInterval(function() {
+      var lastId = localStorage.getItem(SEEN_ID_KEY) || '0';
+      fetch(pollUrl + '?after=' + encodeURIComponent(lastId))
+        .then(function(res) { return res.json(); })
+        .then(function(items) {
+          if (Array.isArray(items)) {
+            items.forEach(handleIncomingNotification);
+          }
+        })
+        .catch(function(err) {
+          console.debug('Notification poll error:', err);
+        });
+    }, 4000);
+  }
+
+  if (btn) {
+    btn.addEventListener('click', function() {
+      if (Notification.permission === 'default') {
+        Notification.requestPermission().then(function(permission) {
+          if (permission === 'granted') {
+            localStorage.setItem(STORAGE_KEY, 'true');
+            var currentLatest = document.body.dataset.latestNotifId || '0';
+            localStorage.setItem(SEEN_ID_KEY, currentLatest);
+            startListening();
+          }
+          updateButtonState();
+        });
+      } else if (Notification.permission === 'granted') {
+        var currentlyEnabled = localStorage.getItem(STORAGE_KEY) === 'true';
+        if (currentlyEnabled) {
+          localStorage.setItem(STORAGE_KEY, 'false');
+          stopListening();
+        } else {
+          localStorage.setItem(STORAGE_KEY, 'true');
+          startListening();
+        }
+        updateButtonState();
+      }
+    });
+  }
+
+  if (Notification.permission === 'granted') {
+    if (localStorage.getItem(STORAGE_KEY) === null) {
+      localStorage.setItem(STORAGE_KEY, 'true');
+    }
+    if (localStorage.getItem(STORAGE_KEY) === 'true') {
+      startListening();
+    }
+  }
+
+  updateButtonState();
+})();
 "#;
 
 fn page(state: &AppState, title: &str, body: &str) -> String {
@@ -354,20 +691,37 @@ fn page(state: &AppState, title: &str, body: &str) -> String {
             ));
         }
     }
+    let latest_id = state
+        .notifications
+        .next_id
+        .load(Ordering::SeqCst)
+        .saturating_sub(1);
     format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <title>{title} - mailsift</title>\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <style>{CSS}</style>\n</head>\n<body>\n\
-         <header>\n{nav}</header>\n\
-         <main>\n<h1>{title}</h1>\n{body}\n</main>\n\
+         <style>{CSS}</style>\n</head>\n\
+         <body data-base-path=\"{base_path}\" data-latest-notif-id=\"{latest_id}\">\n\
+         <header>\n<nav class=\"nav-links\">\n{nav}</nav>\n\
+         <div class=\"nav-actions\">\n\
+         <button id=\"notify-btn\" class=\"notify-btn\" type=\"button\" title=\"Enable browser notifications for incoming items\">\n\
+         <span class=\"notify-icon\">🔔</span>\n\
+         <span class=\"notify-label\">Enable notifications</span>\n\
+         </button>\n\
+         </div>\n\
+         </header>\n\
+         <main>\n<div id=\"toast-container\" class=\"toast-container\"></div>\n\
+         <h1>{title}</h1>\n{body}\n</main>\n\
          <footer>\n\
          <a href=\"https://github.com/jelmer/mailsift\">mailsift</a> \
          &copy; 2025-2026 Jelmer Vernoo&#307;j \
          &lt;<a href=\"mailto:jelmer@jelmer.uk\">jelmer@jelmer.uk</a>&gt;\n\
          </footer>\n\
+         <script>{SCRIPT}</script>\n\
          </body>\n</html>",
         title = esc(title),
+        base_path = esc(&state.base_path),
+        latest_id = latest_id,
     )
 }
 
@@ -1587,6 +1941,214 @@ async fn api_recent_failures(State(_state): State<Arc<AppState>>) -> Result<Json
     Ok(Json(serde_json::to_value(failures)?))
 }
 
+/// Merged feed items as JSON array.
+async fn api_feed(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
+    let feed = build_feed(&state)?;
+    let items: Vec<Value> = feed
+        .into_iter()
+        .map(|item| {
+            serde_json::json!({
+                "kind": item.kind,
+                "title": item.title,
+                "subtitle": item.subtitle,
+                "date": item.date.to_string(),
+                "href": state.url(&item.href),
+                "vendor_url": item.vendor_url,
+            })
+        })
+        .collect();
+    Ok(Json(Value::Array(items)))
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamParams {
+    after: Option<u64>,
+}
+
+/// Server-Sent Events stream delivering live notifications whenever new items arrive.
+/// Supports `Last-Event-ID` header or `?after=<id>` query parameter to replay missed events.
+async fn notifications_stream(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<StreamParams>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + Send + 'static>, AppError> {
+    let _ = check_for_updates(&state);
+
+    let last_event_id: Option<u64> = headers
+        .get("Last-Event-ID")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .or(params.after);
+
+    let mut pending = VecDeque::new();
+    if let Some(after_id) = last_event_id
+        && let Ok(history) = state.notifications.history.lock()
+    {
+        for item in history.iter() {
+            if item.id > after_id {
+                pending.push_back(item.clone());
+            }
+        }
+    }
+
+    let rx = state.notifications.tx.subscribe();
+
+    let stream = futures_util::stream::unfold((rx, pending), |(mut rx, mut pending)| async move {
+        if let Some(item) = pending.pop_front() {
+            let event = Event::default()
+                .event("new_item")
+                .id(item.id.to_string())
+                .json_data(&item)
+                .ok()?;
+            return Some((Ok::<_, Infallible>(event), (rx, pending)));
+        }
+
+        loop {
+            match rx.recv().await {
+                Ok(item) => {
+                    let event = Event::default()
+                        .event("new_item")
+                        .id(item.id.to_string())
+                        .json_data(&item)
+                        .ok()?;
+                    return Some((Ok::<_, Infallible>(event), (rx, pending)));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return None;
+                }
+            }
+        }
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+#[derive(Debug, Deserialize)]
+struct PollParams {
+    after: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// JSON polling endpoint returning recent notifications.
+///
+/// Query params:
+/// - `after`: only return notifications with ID greater than this value. Defaults to 0.
+/// - `limit`: maximum number of notifications to return. Defaults to 50.
+async fn api_notifications_poll(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PollParams>,
+) -> Result<Json<Vec<NotificationItem>>, AppError> {
+    let _ = check_for_updates(&state);
+
+    let after_id = params.after.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50);
+
+    let history = state
+        .notifications
+        .history
+        .lock()
+        .map_err(|e| anyhow::anyhow!("mutex poisoned: {e}"))?;
+
+    let items: Vec<NotificationItem> = history
+        .iter()
+        .filter(|item| item.id > after_id)
+        .take(limit)
+        .cloned()
+        .collect();
+
+    Ok(Json(items))
+}
+
+/// Return the ID of the most recent notification.
+async fn api_notifications_latest(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, AppError> {
+    let _ = check_for_updates(&state);
+    let last_id = state
+        .notifications
+        .next_id
+        .load(Ordering::SeqCst)
+        .saturating_sub(1);
+    Ok(Json(serde_json::json!({
+        "latest_id": last_id,
+    })))
+}
+
+/// Scan all configured artifact directories, detect any items that were added
+/// or updated since the previous scan, record them in the notification history,
+/// and broadcast them to active SSE subscribers.
+///
+/// On the very first call, existing items are indexed into `known_items` without
+/// emitting notifications so historical items don't trigger alerts on server start.
+pub fn check_for_updates(state: &AppState) -> Result<Vec<NotificationItem>> {
+    let feed = build_feed(state)?;
+    let mut known_guard = state
+        .notifications
+        .known_items
+        .lock()
+        .map_err(|e| anyhow::anyhow!("mutex poisoned: {e}"))?;
+    let now = Utc::now().timestamp();
+
+    let mut new_notifications = Vec::new();
+
+    match known_guard.as_mut() {
+        None => {
+            let mut map = HashMap::new();
+            for item in feed {
+                map.insert(item.href, item.subtitle);
+            }
+            *known_guard = Some(map);
+        }
+        Some(known) => {
+            let mut current_map = HashMap::new();
+            for item in feed {
+                let prev_subtitle = known.get(&item.href);
+                let is_new = prev_subtitle.is_none();
+                let is_update = prev_subtitle.is_some_and(|sub| sub != &item.subtitle);
+
+                if is_new || is_update {
+                    let id = state.notifications.next_id.fetch_add(1, Ordering::SeqCst);
+                    let notif = NotificationItem {
+                        id,
+                        kind: item.kind.to_string(),
+                        title: item.title,
+                        subtitle: item.subtitle.clone(),
+                        date: item.date.to_string(),
+                        href: state.url(&item.href),
+                        vendor_url: item.vendor_url,
+                        is_update,
+                        timestamp: now,
+                    };
+                    new_notifications.push(notif);
+                }
+                current_map.insert(item.href, item.subtitle);
+            }
+            *known = current_map;
+        }
+    }
+
+    if !new_notifications.is_empty() {
+        let mut hist = state
+            .notifications
+            .history
+            .lock()
+            .map_err(|e| anyhow::anyhow!("mutex poisoned: {e}"))?;
+        for item in &new_notifications {
+            let _ = state.notifications.tx.send(item.clone());
+            hist.push(item.clone());
+        }
+        if hist.len() > 100 {
+            let excess = hist.len() - 100;
+            hist.drain(0..excess);
+        }
+    }
+
+    Ok(new_notifications)
+}
+
 /// (filename, parsed JSON) for every `*.json` directly under `dir`.
 fn walk_flat_json(dir: &Path) -> Result<Vec<(String, Value)>> {
     let mut out = Vec::new();
@@ -1798,10 +2360,7 @@ mod tests {
     }
 
     fn state_with(config: Config, base_path: &str) -> Arc<AppState> {
-        Arc::new(AppState {
-            config: Arc::new(config),
-            base_path: base_path.into(),
-        })
+        Arc::new(AppState::new(Arc::new(config), base_path.into()))
     }
 
     async fn get(app: &Router, uri: &str) -> (StatusCode, String) {
@@ -2447,5 +3006,190 @@ tickets_dir = "/var/mailsift/tickets"
         let (status, body) = get(&app, "/").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains(">stats</a>"), "no stats link in nav: {body}");
+    }
+
+    #[tokio::test]
+    async fn check_for_updates_initial_scan_records_without_notifying() {
+        let (_tmp, config) = fixture();
+        let state = state_with(config, "");
+        let updates = check_for_updates(&state).unwrap();
+        // First scan seeds existing items, should not emit notifications.
+        assert!(
+            updates.is_empty(),
+            "expected no notifications on first scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_for_updates_detects_new_item() {
+        let (tmp, config) = fixture();
+        let state = state_with(config, "");
+        // First scan to index fixtures
+        let _ = check_for_updates(&state).unwrap();
+
+        // Add a new bill
+        let new_bill = tmp.path().join("bills/2026/new-bill.json");
+        fs::write(
+            &new_bill,
+            br#"{"payee":"Water Corp","invoiceNumber":"W101","dueDate":"2026-06-01"}"#,
+        )
+        .unwrap();
+
+        let updates = check_for_updates(&state).unwrap();
+        assert_eq!(updates.len(), 1);
+        let item = &updates[0];
+        assert_eq!(item.id, 1);
+        assert_eq!(item.kind, "bill");
+        assert_eq!(item.title, "Water Corp");
+        assert_eq!(item.subtitle, "W101");
+        assert_eq!(item.href, "/bills/2026/new-bill.json");
+        assert!(!item.is_update);
+    }
+
+    #[tokio::test]
+    async fn check_for_updates_detects_parcel_status_update() {
+        let (tmp, config) = fixture();
+        let state = state_with(config, "");
+        // First scan
+        let _ = check_for_updates(&state).unwrap();
+
+        // Update fixture parcel status from OutForDelivery to Delivered
+        let parcel_path = tmp.path().join("parcels/TQ123GB.json");
+        fs::write(
+            &parcel_path,
+            br#"{"trackingNumber":"TQ123GB","deliveryStatus":"Delivered"}"#,
+        )
+        .unwrap();
+
+        let updates = check_for_updates(&state).unwrap();
+        assert_eq!(updates.len(), 1);
+        let item = &updates[0];
+        assert_eq!(item.kind, "parcel");
+        assert_eq!(item.title, "TQ123GB");
+        assert_eq!(item.subtitle, "Delivered");
+        assert!(item.is_update);
+    }
+
+    #[tokio::test]
+    async fn api_notifications_poll_and_latest() {
+        let (tmp, config) = fixture();
+        let state = state_with(config, "");
+        let app = router(state.clone());
+
+        // Initial latest_id is 0
+        let (status, body) = get(&app, "/api/notifications/latest").await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["latest_id"], 0);
+
+        // Add a new bill (bills_dir is configured in fixture)
+        let bills_dir = tmp.path().join("bills/2026");
+        fs::write(
+            bills_dir.join("order-99.json"),
+            br#"{"payee":"Bookstore","invoiceNumber":"BK-99","dueDate":"2026-09-19"}"#,
+        )
+        .unwrap();
+
+        // Poll should detect and return the new bill
+        let (status, body) = get(&app, "/api/notifications/poll?after=0").await;
+        assert_eq!(status, StatusCode::OK);
+        let items: Vec<NotificationItem> = serde_json::from_str(&body).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "bill");
+        assert_eq!(items[0].title, "Bookstore");
+        assert_eq!(items[0].id, 1);
+
+        // Polling with after=1 should return empty
+        let (status, body) = get(&app, "/api/notifications/poll?after=1").await;
+        assert_eq!(status, StatusCode::OK);
+        let items_after: Vec<NotificationItem> = serde_json::from_str(&body).unwrap();
+        assert!(items_after.is_empty());
+
+        // latest_id should now be 1
+        let (_, body) = get(&app, "/api/notifications/latest").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["latest_id"], 1);
+    }
+
+    #[tokio::test]
+    async fn api_feed_serves_json() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/api/feed.json").await;
+        assert_eq!(status, StatusCode::OK);
+        let items: Value = serde_json::from_str(&body).unwrap();
+        assert!(items.as_array().is_some());
+        assert!(!items.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn notifications_stream_serves_sse() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/notifications/stream")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn html_page_includes_notification_controls_and_script() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("id=\"notify-btn\""),
+            "missing notify-btn: {body}"
+        );
+        assert!(
+            body.contains("id=\"toast-container\""),
+            "missing toast-container: {body}"
+        );
+        assert!(
+            body.contains("data-latest-notif-id="),
+            "missing data-latest-notif-id: {body}"
+        );
+        assert!(
+            body.contains("/api/notifications/stream"),
+            "missing stream url in script: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn base_path_prefixes_notification_urls() {
+        let (tmp, config) = fixture();
+        let state = state_with(config, "/mailsift");
+        let app = router(state.clone());
+
+        // First index
+        let _ = check_for_updates(&state).unwrap();
+
+        // Add a bill
+        let new_bill = tmp.path().join("bills/2026/prefixed-bill.json");
+        fs::write(
+            &new_bill,
+            br#"{"payee":"Energy Corp","invoiceNumber":"E55","dueDate":"2026-07-01"}"#,
+        )
+        .unwrap();
+
+        let (status, body) = get(&app, "/api/notifications/poll?after=0").await;
+        assert_eq!(status, StatusCode::OK);
+        let items: Vec<NotificationItem> = serde_json::from_str(&body).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].href, "/mailsift/bills/2026/prefixed-bill.json");
+
+        let (_, html) = get(&app, "/").await;
+        assert!(html.contains("data-base-path=\"/mailsift\""));
     }
 }
