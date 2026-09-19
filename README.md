@@ -259,10 +259,17 @@ mailsift web --listen unix:/run/mailsift.sock  # unix socket
 
 The dashboard rescans the artifact directories on every request, so it
 happily sits alongside a running milter or `imap-scan --watch`. JSON
-views for scripting live at `/api/bills.json`, `/api/parcels.json`,
-`/api/receipts.json`, `/api/subscriptions.json` and
+views for scripting live at `/api/feed.json`, `/api/bills.json`,
+`/api/parcels.json`, `/api/receipts.json`, `/api/subscriptions.json` and
 `/api/reservations.json`; raw `.ics` and ticket blobs are served with
 their proper Content-Type.
+
+The web UI also supports real-time desktop Web Notifications in the
+browser: click "Enable notifications" in the header to be alerted whenever
+new items arrive (or parcels update), even when the dashboard tab is in
+the background. Live updates stream via Server-Sent Events at
+`/api/notifications/stream`, with fallback polling at
+`/api/notifications/poll`.
 
 No authentication is built in; bind to loopback (or put it behind a
 reverse proxy) if the artifacts are personal.
