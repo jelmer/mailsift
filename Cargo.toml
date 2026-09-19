@@ -18,7 +18,7 @@ smtp = ["lettre/smtp-transport", "lettre/tokio1-rustls-tls"]
 # JMAP (RFC 8620/8621) mailbox watcher (`mailsift jmap-watch`).
 jmap = ["dep:jmap-client", "dep:futures-util"]
 # Read-only HTTP dashboard for the artifact directories (`mailsift web`).
-web = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-service", "dep:utoipa", "dep:utoipa-axum", "dep:utoipa-swagger-ui"]
+web = ["dep:axum", "dep:futures-util", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-service", "dep:utoipa", "dep:utoipa-axum", "dep:utoipa-swagger-ui"]
 
 [dependencies]
 anyhow = "1"
@@ -29,7 +29,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 clap = { version = "4", features = ["derive"] }
 # Randomness for OAuth2 PKCE verifier + CSRF state.
 getrandom = "0.2"
-futures-util = { version = "0.3", default-features = false, optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
 # Cross-platform SIGINT/SIGTERM handler for the long-running daemons.
 ctrlc = "3"
 hyper = { version = "1", features = ["server", "http1"], optional = true }
