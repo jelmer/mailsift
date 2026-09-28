@@ -1244,6 +1244,15 @@ fn main() -> Result<()> {
             eprintln!("error: {err}");
             std::process::exit(2);
         }
+        // A dead refresh token (Google's 7-day cutoff for testing-mode
+        // apps, or a manual revocation) can't be fixed by retrying, only
+        // by re-consent. Print one clear actionable line and exit with a
+        // dedicated code so systemd's Restart=on-failure can be filtered
+        // against it if desired (e.g. RestartPreventExitStatus=75).
+        Err(err) if err.is::<mailsift::oauth2::PermanentRefreshError>() => {
+            eprintln!("error: {err}");
+            std::process::exit(75);
+        }
         other => other,
     }
 }
