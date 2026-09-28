@@ -24,11 +24,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
-use crate::targets::http_client::{body_on_success, build_client};
+use crate::targets::http_client::{body_on_success, build_client, truncate};
 
 /// A known OAuth2 provider, carrying its token endpoint and the default
 /// IMAP scope. Derived from the IMAP host where possible so the common
@@ -243,6 +244,61 @@ struct TokenResponse {
     expires_in: Option<u64>,
 }
 
+/// RFC 6749 error body from a token endpoint. Servers respond `400` with
+/// this shape for grant-level failures (`invalid_grant`,
+/// `invalid_client`, ...), distinct from transport failures or 5xx.
+#[derive(Deserialize)]
+struct ErrorResponse {
+    error: String,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+/// A refresh grant failed in a way that will not fix itself. Callers
+/// downcast [`anyhow::Error`] to this to render a single actionable line
+/// instead of a full context chain, and to hold off restart retries that
+/// would just repeat the same 400.
+///
+/// Per RFC 6749 s5.2, these are the errors the client cannot recover from
+/// by retrying with the same credentials: the refresh token was revoked
+/// or expired (`invalid_grant`), the client credentials no longer
+/// authenticate (`invalid_client`), the client isn't allowed the
+/// grant (`unauthorized_client`), or the grant type isn't supported
+/// (`unsupported_grant_type`). Everything else (network, 5xx, malformed
+/// response) stays a plain `anyhow::Error` and is treated as transient.
+#[derive(Debug)]
+pub struct PermanentRefreshError {
+    pub error: String,
+    pub description: Option<String>,
+}
+
+impl std::fmt::Display for PermanentRefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OAuth2 refresh rejected as {}", self.error)?;
+        if let Some(desc) = &self.description {
+            write!(f, " ({desc})")?;
+        }
+        write!(
+            f,
+            ": re-run `mailsift imap-auth` to obtain a fresh refresh token"
+        )
+    }
+}
+
+impl std::error::Error for PermanentRefreshError {}
+
+impl PermanentRefreshError {
+    /// Is this RFC 6749 error code one where the same credentials will
+    /// never succeed? Anything else (or an unrecognised code) is treated
+    /// as transient.
+    fn is_permanent(code: &str) -> bool {
+        matches!(
+            code,
+            "invalid_grant" | "invalid_client" | "unauthorized_client" | "unsupported_grant_type"
+        )
+    }
+}
+
 /// Fallback access-token lifetime when the token endpoint omits
 /// `expires_in`. One hour matches Google and Microsoft defaults; erring
 /// short just means an extra refresh, never a stale token.
@@ -260,6 +316,11 @@ impl TokenProvider {
     /// POST the `refresh_token` grant to the token endpoint and parse
     /// the response. Microsoft public clients must omit the secret;
     /// Google desktop apps include it.
+    ///
+    /// RFC 6749 s5.2 grant-level errors (400 with a well-formed
+    /// `{"error":"invalid_grant",...}` body) surface as
+    /// [`PermanentRefreshError`] so callers can distinguish "the token is
+    /// dead, re-consent needed" from a transient network / 5xx failure.
     async fn refresh(&self) -> Result<TokenResponse> {
         let client = build_client("OAuth2 token")?;
         let mut form = vec![
@@ -276,11 +337,29 @@ impl TokenProvider {
             .send()
             .await
             .with_context(|| format!("POST {}", self.config.token_endpoint))?;
-        let body = body_on_success(
-            response,
-            &format!("OAuth2 token endpoint {}", self.config.token_endpoint),
-        )
-        .await?;
+        let status = response.status();
+        let body = response.text().await.with_context(|| {
+            format!(
+                "reading token response body from {}",
+                self.config.token_endpoint
+            )
+        })?;
+        if status == StatusCode::BAD_REQUEST
+            && let Ok(err) = serde_json::from_str::<ErrorResponse>(&body)
+            && PermanentRefreshError::is_permanent(&err.error)
+        {
+            return Err(anyhow!(PermanentRefreshError {
+                error: err.error,
+                description: err.error_description,
+            }));
+        }
+        if !status.is_success() {
+            bail!(
+                "OAuth2 token endpoint {} returned {status}: {}",
+                self.config.token_endpoint,
+                truncate(&body, 200)
+            );
+        }
         serde_json::from_str(&body)
             .with_context(|| format!("parsing token response from {}", self.config.token_endpoint))
     }
@@ -289,6 +368,11 @@ impl TokenProvider {
 impl TokenSource for TokenProvider {
     /// Return a usable access token, refreshing if the cached one is
     /// missing or within [`EXPIRY_MARGIN`] of expiry.
+    ///
+    /// A [`PermanentRefreshError`] is returned unwrapped so the caller
+    /// can `downcast_ref` for it; any other refresh failure is wrapped in
+    /// a `refreshing OAuth2 access token` context so tracebacks locate
+    /// the call site.
     fn access_token(&self) -> Result<String> {
         let mut cached = self.cached.lock().expect("token cache mutex poisoned");
         if let Some(tok) = cached.as_ref()
@@ -297,10 +381,11 @@ impl TokenSource for TokenProvider {
             return Ok(tok.access_token.clone());
         }
 
-        let response = self
-            .runtime
-            .block_on(self.refresh())
-            .context("refreshing OAuth2 access token")?;
+        let response = match self.runtime.block_on(self.refresh()) {
+            Ok(r) => r,
+            Err(e) if e.is::<PermanentRefreshError>() => return Err(e),
+            Err(e) => return Err(e.context("refreshing OAuth2 access token")),
+        };
         let lifetime = response
             .expires_in
             .map(Duration::from_secs)
@@ -803,6 +888,54 @@ mod tests {
         assert!(!json.contains("client_secret"), "{json}");
         let back: OAuth2Config = serde_json::from_str(&json).unwrap();
         assert_eq!(back.client_secret, None);
+    }
+
+    #[test]
+    fn permanent_refresh_error_covers_rfc6749_grant_failures() {
+        assert!(PermanentRefreshError::is_permanent("invalid_grant"));
+        assert!(PermanentRefreshError::is_permanent("invalid_client"));
+        assert!(PermanentRefreshError::is_permanent("unauthorized_client"));
+        assert!(PermanentRefreshError::is_permanent(
+            "unsupported_grant_type"
+        ));
+    }
+
+    #[test]
+    fn permanent_refresh_error_rejects_transient_and_unknown_codes() {
+        // 5xx / rate-limit style errors aren't in the RFC error set;
+        // whatever the server returns as `error=` we should still treat
+        // unknown codes as transient rather than eating the daemon.
+        assert!(!PermanentRefreshError::is_permanent("server_error"));
+        assert!(!PermanentRefreshError::is_permanent(
+            "temporarily_unavailable"
+        ));
+        assert!(!PermanentRefreshError::is_permanent(""));
+    }
+
+    #[test]
+    fn permanent_refresh_error_display_is_actionable() {
+        let err = PermanentRefreshError {
+            error: "invalid_grant".to_string(),
+            description: Some("Token has been expired or revoked.".to_string()),
+        };
+        assert_eq!(
+            err.to_string(),
+            "OAuth2 refresh rejected as invalid_grant (Token has been expired or revoked.): \
+             re-run `mailsift imap-auth` to obtain a fresh refresh token"
+        );
+    }
+
+    #[test]
+    fn permanent_refresh_error_display_without_description() {
+        let err = PermanentRefreshError {
+            error: "invalid_client".to_string(),
+            description: None,
+        };
+        assert_eq!(
+            err.to_string(),
+            "OAuth2 refresh rejected as invalid_client: \
+             re-run `mailsift imap-auth` to obtain a fresh refresh token"
+        );
     }
 
     #[test]
