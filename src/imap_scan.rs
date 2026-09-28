@@ -210,7 +210,24 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
     let uid_validity = mbox.uid_validity;
 
     let pb = make_progress_bar(initial_uids.len() as u64);
-    let stats = process_uid_set(&mut session, initial_uids, &config, &pb)?;
+    let stats = if config.watch {
+        // Under --watch, a fetch failure mid-scan is treated the same as
+        // one inside the watch loop: back off, reconnect, resume from the
+        // next unprocessed chunk. Without this, a mid-scan disconnect
+        // (server drop, TLS close_notify race) would exit the process,
+        // and while systemd will restart us the next scan hits the same
+        // large initial backlog again.
+        process_uids_with_resume(
+            &mut session,
+            initial_uids,
+            &config,
+            &pb,
+            uid_validity,
+            &interrupted,
+        )?
+    } else {
+        process_uid_set(&mut session, initial_uids, &config, &pb)?
+    };
     pb.finish_and_clear();
     if stats.prefilter_skipped > 0 {
         info!(
@@ -222,6 +239,11 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
 
     if !config.watch {
         session.logout().context("IMAP LOGOUT")?;
+        return Ok(());
+    }
+
+    if interrupted.load(Ordering::SeqCst) {
+        let _ = session.logout();
         return Ok(());
     }
 
@@ -237,6 +259,74 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
         from_restriction.as_deref(),
         &interrupted,
     )
+}
+
+/// Wrap [`process_uid_set`] with the same fetch-backoff / reconnect /
+/// reselect story that [`watch_loop`] uses. Chunk-level errors during the
+/// initial scan drop the current session, sleep the current fetch backoff,
+/// reconnect, re-EXAMINE, and resume from the next unprocessed chunk.
+///
+/// Only used under `--watch`: a one-shot scan surfaces errors so the
+/// caller sees them. Under `--watch` we can't afford to exit here because
+/// systemd would then restart the process and repeat the same expensive
+/// initial SEARCH + prefilter over the whole backlog.
+fn process_uids_with_resume(
+    session_slot: &mut Session<imap::Connection>,
+    uids: &[u32],
+    config: &ImapScanConfig<'_>,
+    pb: &ProgressBar,
+    initial_uid_validity: Option<u32>,
+    interrupted: &Arc<AtomicBool>,
+) -> Result<ScanStats> {
+    let mut total = ScanStats::default();
+    let mut done = 0usize;
+    let mut fetch_backoff = Duration::from_secs(1);
+    let mut reconnect_backoff = Duration::from_secs(1);
+    let mut uid_validity = initial_uid_validity;
+    while done < uids.len() {
+        if interrupted.load(Ordering::SeqCst) {
+            return Ok(total);
+        }
+        let before = done;
+        let result =
+            process_uid_set_with_progress(session_slot, &uids[done..], config, pb, &mut done);
+        match result {
+            Ok(stats) => {
+                total.processed += stats.processed;
+                total.prefilter_skipped += stats.prefilter_skipped;
+                return Ok(total);
+            }
+            Err(e) => {
+                // Any forward progress means the connection was healthy
+                // right up to the failing chunk; only a chunk that fails
+                // on the very first attempt after a reconnect charges
+                // against the backoff.
+                if done > before {
+                    fetch_backoff = Duration::from_secs(1);
+                }
+                warn!(
+                    error = %e,
+                    done,
+                    total = uids.len(),
+                    ?fetch_backoff,
+                    "initial scan fetch failed; backing off and reconnecting"
+                );
+                std::thread::sleep(fetch_backoff);
+                if interrupted.load(Ordering::SeqCst) {
+                    return Ok(total);
+                }
+                fetch_backoff = grow_backoff(fetch_backoff, FETCH_BACKOFF_MAX);
+                *session_slot = match reconnect(config, &mut reconnect_backoff, interrupted) {
+                    Some(s) => s,
+                    None => return Ok(total),
+                };
+                if let Some(new_validity) = reselect(session_slot, config, uid_validity)? {
+                    uid_validity = Some(new_validity);
+                }
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// Open a fresh connection and authenticate. Used by both the initial
@@ -333,6 +423,21 @@ fn process_uid_set(
     uids: &[u32],
     config: &ImapScanConfig<'_>,
     pb: &ProgressBar,
+) -> Result<ScanStats> {
+    let mut done = 0usize;
+    process_uid_set_with_progress(session, uids, config, pb, &mut done)
+}
+
+/// Body of [`process_uid_set`] with an out parameter for how many UIDs
+/// have been fully consumed. The callers in one-shot mode discard it;
+/// [`process_uids_with_resume`] reads it after a failure so it can resume
+/// from the next chunk on the next connection.
+fn process_uid_set_with_progress(
+    session: &mut Session<imap::Connection>,
+    uids: &[u32],
+    config: &ImapScanConfig<'_>,
+    pb: &ProgressBar,
+    done: &mut usize,
 ) -> Result<ScanStats> {
     let mut stats = ScanStats::default();
     for chunk in uids.chunks(FETCH_BATCH) {
@@ -431,6 +536,12 @@ fn process_uid_set(
             }
             pb.inc(1);
         });
+        // A chunk is only counted as done once every UID in it has been
+        // fully processed (either prefiltered out or fetched and pushed
+        // through the pipeline). If we return with an error, `*done`
+        // still points at the first UID of the failing chunk, so a
+        // resuming caller retries that chunk on the fresh connection.
+        *done += chunk.len();
     }
     Ok(stats)
 }
