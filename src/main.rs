@@ -57,12 +57,11 @@ fn xoauth2_user(resolved_user: Option<&str>) -> Result<&str> {
     })
 }
 
-/// clap value parser for `--socket-mode`. Accepts octal digits with or
-/// without a `0`/`0o` prefix (`0666`, `0o660`, `660` all mean 0o660).
+/// clap value parser for `--socket-mode`. Accepts octal digits with an
+/// optional `0o` prefix (`0666`, `0o660`, `660` all parse the same).
 #[cfg(feature = "web")]
 fn parse_octal_mode(raw: &str) -> Result<u32, String> {
-    let s = raw.trim_start_matches("0o").trim_start_matches('0');
-    let s = if s.is_empty() { "0" } else { s };
+    let s = raw.strip_prefix("0o").unwrap_or(raw);
     u32::from_str_radix(s, 8).map_err(|e| format!("invalid octal mode {raw:?}: {e}"))
 }
 
