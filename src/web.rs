@@ -1606,7 +1606,7 @@ async fn list_parcels(
         // parcels), fall back to the newest history entry's `seen_at`
         // - roughly the pipeline's last touch, close enough for a
         // list row.
-        let terminal = is_terminal_parcel_status(&status);
+        let terminal = crate::targets::parcels::ParcelStatus::from_raw(&status).is_terminal();
         let mut due_keys: Vec<&str> = vec![
             "actualDeliveryTime",
             "expectedArrivalUntil",
@@ -1721,7 +1721,8 @@ async fn view_parcel(
     // list-page fallback so both views tell the same story.
     let terminal = pick_str(&value, &["deliveryStatus"])
         .as_deref()
-        .is_some_and(is_terminal_parcel_status);
+        .map(crate::targets::parcels::ParcelStatus::from_raw)
+        .is_some_and(|s| s.is_terminal());
     let received_display = pick_str(&value, &["receivedAt"])
         .or_else(|| terminal.then(|| last_history_seen_at(&value)).flatten())
         .map(|s| short_date(&s));
@@ -2045,19 +2046,6 @@ fn parse_iso_duration_days(iso: &str) -> Option<u32> {
     }
 }
 
-/// Format a subscription/bill/receipt `price` field as `"1.59 GBP"`.
-/// Renders `"free"` when the price parses as exactly zero, and an empty
-/// string when the payload has no numeric price at all.
-/// Whether a `deliveryStatus` string represents a terminal outcome
-/// (delivered or returned). Matches the schema.org spellings the
-/// parcels sink treats as final in [`crate::targets::parcels`].
-fn is_terminal_parcel_status(status: &str) -> bool {
-    matches!(
-        status,
-        "OrderDelivered" | "Delivered" | "OrderReturned" | "Returned" | "ReturnedToSender"
-    )
-}
-
 /// The `seen_at` timestamp of the last history entry on a parcel
 /// record, if any. Records filed before `receivedAt` stamping was
 /// added carry only this pipeline timestamp; the parcel list uses it
@@ -2073,6 +2061,9 @@ fn last_history_seen_at(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Format a subscription/bill/receipt `price` field as `"1.59 GBP"`.
+/// Renders `"free"` when the price parses as exactly zero, and an empty
+/// string when the payload has no numeric price at all.
 fn format_price(value: &Value) -> String {
     let Some(raw) = value.get("price") else {
         return String::new();
