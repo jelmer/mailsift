@@ -23,12 +23,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use tracing::info;
 
 use super::FileOutcome;
 use super::firefly::{self, BillForFirefly, FireflySink};
-use super::json_target::{derive_year, first_non_empty};
-use super::sink::{sanitize_ext, slugify, write_atomic};
+use super::json_target::{derive_year, first_non_empty, read_and_parse};
+use super::sink::{log_file_outcome, sanitize_ext, slugify, write_atomic};
 
 /// Shape we read out of a `.bill.json` artifact. Loosely schema.org
 /// `Invoice`-shaped; unknown fields are ignored so extractors can emit
@@ -87,10 +86,7 @@ pub fn file_bill(
     firefly: Option<&FireflySink>,
     received_at_epoch: Option<i64>,
 ) -> Result<FileOutcome> {
-    let body = fs::read_to_string(src)
-        .with_context(|| format!("reading bill source {}", src.display()))?;
-    let bill: Bill = serde_json::from_str(&body)
-        .with_context(|| format!("parsing bill JSON {}", src.display()))?;
+    let (body, bill) = read_and_parse::<Bill>(src, "bill")?;
 
     let payee = bill
         .payee()
@@ -123,14 +119,7 @@ pub fn file_bill(
     // the bill's amount and due-date on the Firefly server too.
     register_with_firefly(firefly, payee, &bill);
 
-    let label = target.display().to_string();
-    if existed {
-        info!(target = %label, "bill updated");
-        Ok(FileOutcome::Updated(label))
-    } else {
-        info!(target = %label, "bill created");
-        Ok(FileOutcome::Created(label))
-    }
+    Ok(log_file_outcome(&target, existed, "bill"))
 }
 
 /// Translate a parsed [`Bill`] to a [`BillForFirefly`] and fire the
@@ -192,14 +181,7 @@ pub fn file_bill_blob(
     let existed = target.exists();
     write_atomic(&target, &body)?;
 
-    let label = target.display().to_string();
-    if existed {
-        info!(target = %label, "bill blob updated");
-        Ok(FileOutcome::Updated(label))
-    } else {
-        info!(target = %label, "bill blob created");
-        Ok(FileOutcome::Created(label))
-    }
+    Ok(log_file_outcome(&target, existed, "bill blob"))
 }
 
 /// Parse `body` as a bill JSON and return the paired

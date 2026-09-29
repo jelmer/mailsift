@@ -5,6 +5,26 @@
 //! bits (slugify, atomic write) live in [`super::sink`] alongside the
 //! shared `FileOutcome`.
 
+use std::fs;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+
+/// Read a JSON artifact from disk and parse it as `T`, keeping the raw
+/// body so the caller can also write it back out or transform it. Error
+/// messages name `kind` (`"bill"`, `"receipt"`, ...) so they carry
+/// through to the pipeline log.
+pub fn read_and_parse<T>(src: &Path, kind: &str) -> Result<(String, T)>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    let body = fs::read_to_string(src)
+        .with_context(|| format!("reading {kind} source {}", src.display()))?;
+    let parsed = serde_json::from_str(&body)
+        .with_context(|| format!("parsing {kind} JSON {}", src.display()))?;
+    Ok((body, parsed))
+}
+
 /// First non-empty (after trim) entry from a small list of candidates.
 pub fn first_non_empty<const N: usize>(candidates: [Option<&str>; N]) -> Option<&str> {
     candidates.into_iter().flatten().find_map(|s| {

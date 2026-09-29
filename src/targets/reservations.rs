@@ -17,13 +17,13 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::warn;
 
 use super::FileOutcome;
-use super::json_target::{derive_year, first_non_empty};
-use super::sink::{slugify, write_atomic};
+use super::json_target::{derive_year, first_non_empty, read_and_parse};
+use super::sink::{log_file_outcome, slugify, write_atomic};
 
 /// Identifying fields we pull out of a `.reservation.json` artifact.
 ///
@@ -99,6 +99,21 @@ impl Scalar {
             Scalar::Other(_) => None,
         }
     }
+
+    /// Rendered value, but only when it isn't blank. Useful for `find`
+    /// chains that want to skip empty scalars silently.
+    fn non_empty(&self) -> Option<String> {
+        self.as_str().filter(|s| !s.trim().is_empty())
+    }
+}
+
+/// First scalar in `candidates` whose rendering is non-empty. The
+/// preferred way to pull one string out of a set of alias fields.
+fn first_non_empty_scalar<'a, I>(candidates: I) -> Option<String>
+where
+    I: IntoIterator<Item = Option<&'a Scalar>>,
+{
+    candidates.into_iter().flatten().find_map(Scalar::non_empty)
 }
 
 /// A schema.org node that may be given as a bare string or as an
@@ -149,15 +164,11 @@ impl Reservation {
     /// Booking reference. This is what makes a follow-up mail about
     /// the same trip overwrite the existing record.
     fn number(&self) -> Option<String> {
-        [
+        first_non_empty_scalar([
             self.reservation_number.as_ref(),
             self.reservation_id.as_ref(),
             self.identifier.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(Scalar::as_str)
-        .find(|s| !s.trim().is_empty())
+        ])
     }
 
     /// Who the booking is with. Prefers the airline name, then the
@@ -171,12 +182,7 @@ impl Reservation {
             self.broker.as_ref().and_then(Named::name),
         ])
         .map(str::to_string)
-        .or_else(|| {
-            for_.name
-                .as_ref()
-                .and_then(Scalar::as_str)
-                .filter(|s| !s.trim().is_empty())
-        })
+        .or_else(|| for_.name.as_ref().and_then(Scalar::non_empty))
     }
 
     /// The `YYYY-MM-DD` prefix of this leg's own date, when it has
@@ -184,9 +190,8 @@ impl Reservation {
     /// trip: both legs share the airline and the booking reference,
     /// so the date is the only thing that tells them apart.
     fn day(&self) -> Option<String> {
-        let candidates = self.date_candidates();
-        let raw = candidates.first()?.trim();
-        let day = raw.get(..10)?;
+        let raw = self.date_candidates().next()?;
+        let day = raw.trim().get(..10)?;
         let mut parts = day.split('-');
         let ok = matches!(parts.next(), Some(y) if y.len() == 4 && y.bytes().all(|b| b.is_ascii_digit()))
             && parts.clone().count() == 2
@@ -196,7 +201,7 @@ impl Reservation {
 
     /// Date candidates, most specific first. Owned because a scalar
     /// may have been a JSON number that we rendered to a string.
-    fn date_candidates(&self) -> Vec<String> {
+    fn date_candidates(&self) -> impl Iterator<Item = String> + '_ {
         let for_ = &self.reservation_for;
         [
             for_.departure_time.as_ref(),
@@ -208,7 +213,13 @@ impl Reservation {
         .into_iter()
         .flatten()
         .filter_map(Scalar::as_str)
-        .collect()
+    }
+
+    /// The year to file this reservation under, from the first
+    /// parseable date candidate; falls back to the current year.
+    fn year(&self) -> i32 {
+        let dates: Vec<String> = self.date_candidates().collect();
+        derive_year(dates.iter().map(|s| Some(s.as_str())))
     }
 }
 
@@ -271,10 +282,7 @@ pub fn file_reservation(
     dir: &Path,
     received_at_epoch: Option<i64>,
 ) -> Result<Vec<FileOutcome>> {
-    let body = fs::read_to_string(src)
-        .with_context(|| format!("reading reservation source {}", src.display()))?;
-    let doc: serde_json::Value = serde_json::from_str(&body)
-        .with_context(|| format!("parsing reservation JSON {}", src.display()))?;
+    let (_body, doc) = read_and_parse::<serde_json::Value>(src, "reservation")?;
     // Each leg is kept as generic JSON so it can be written back out
     // with its own fields intact; the typed view below is only for
     // picking a filename, and is deliberately lossy.
@@ -342,8 +350,7 @@ fn file_one(
     let number = reservation
         .number()
         .ok_or_else(|| anyhow!("{}: missing 'reservationNumber'", src.display()))?;
-    let dates = reservation.date_candidates();
-    let year = derive_year(dates.iter().map(|s| Some(s.as_str())));
+    let year = reservation.year();
 
     let number_slug = slugify(&number, false);
     if number_slug.is_empty() {
@@ -373,14 +380,7 @@ fn file_one(
     let body_out = super::json_target::body_with_received_at(body, received_at_epoch);
     write_atomic(&target, body_out.as_bytes())?;
 
-    let label = target.display().to_string();
-    if existed {
-        info!(target = %label, "reservation updated");
-        Ok(FileOutcome::Updated(label))
-    } else {
-        info!(target = %label, "reservation created");
-        Ok(FileOutcome::Created(label))
-    }
+    Ok(log_file_outcome(&target, existed, "reservation"))
 }
 
 #[cfg(test)]
@@ -392,8 +392,7 @@ mod tests {
     }
 
     fn year_of(r: &Reservation) -> i32 {
-        let dates = r.date_candidates();
-        derive_year(dates.iter().map(|s| Some(s.as_str())))
+        r.year()
     }
 
     #[test]

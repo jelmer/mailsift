@@ -11,6 +11,33 @@ use anyhow::{Context, Result, anyhow, bail};
 use tracing::warn;
 use url::Url;
 
+/// Pull the userinfo out of `url` after refusing any embedded password.
+///
+/// The URL's userinfo is stripped from `url` itself when a username is
+/// present (so the caller can hand the sanitised URL to an HTTP client
+/// that can't handle userinfo). `password_flag` is the flag name the
+/// caller wants suggested in place of the URL password; it appears
+/// verbatim in the error message.
+fn take_userinfo(url: &mut Url, password_flag: &str) -> Result<Option<String>> {
+    if url.password().is_some() {
+        // Refuse: passwords in URLs end up in process listings and shell
+        // history.
+        bail!("password in URL is not supported; use {password_flag}");
+    }
+    if url.username().is_empty() {
+        return Ok(None);
+    }
+    let user = percent_encoding::percent_decode_str(url.username())
+        .decode_utf8()
+        .context("decoding username")?
+        .into_owned();
+    // Only Url::set_username on http(s)-shaped URLs actually clears the
+    // stored userinfo; for imap[s]:// the setter reports Err. The IMAP
+    // caller doesn't need the stripped URL, so we ignore that.
+    let _ = url.set_username("");
+    Ok(Some(user))
+}
+
 /// Connection parameters extracted from an `imap[s]://...` URL.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ImapTarget {
@@ -29,7 +56,7 @@ pub struct ImapTarget {
 /// `imap://` is accepted but logs a warning; plaintext IMAP is almost
 /// never what you want for a real account.
 pub fn parse_imap_url(input: &str) -> Result<ImapTarget> {
-    let url = Url::parse(input).with_context(|| format!("parsing IMAP URL {input}"))?;
+    let mut url = Url::parse(input).with_context(|| format!("parsing IMAP URL {input}"))?;
     match url.scheme() {
         "imaps" => {}
         "imap" => {
@@ -40,6 +67,8 @@ pub fn parse_imap_url(input: &str) -> Result<ImapTarget> {
         other => bail!("unsupported IMAP scheme {other:?}: use imaps:// (or imap://)"),
     }
 
+    let user = take_userinfo(&mut url, "--password-file")?;
+
     let host = url
         .host_str()
         .ok_or_else(|| anyhow!("IMAP URL {input} has no host"))?
@@ -48,23 +77,6 @@ pub fn parse_imap_url(input: &str) -> Result<ImapTarget> {
         "imap" => 143,
         _ => 993,
     });
-
-    let user = if url.username().is_empty() {
-        None
-    } else {
-        Some(
-            percent_encoding::percent_decode_str(url.username())
-                .decode_utf8()
-                .context("decoding username")?
-                .into_owned(),
-        )
-    };
-
-    if url.password().is_some() {
-        // Refuse: passwords in URLs end up in process listings and shell
-        // history. Use `--password-file` instead.
-        bail!("password in URL is not supported; use --password-file");
-    }
 
     let mailbox_path = url.path().trim_start_matches('/');
     let mailbox = if mailbox_path.is_empty() {
@@ -107,24 +119,7 @@ pub fn parse_caldav_url(input: &str) -> Result<CaldavTarget> {
             bail!("unsupported CalDAV scheme {other:?}: use https:// (or http:// for testing)")
         }
     }
-    if url.password().is_some() {
-        bail!("password in URL is not supported; use --caldav-password-file");
-    }
-
-    let user = if url.username().is_empty() {
-        None
-    } else {
-        Some(
-            percent_encoding::percent_decode_str(url.username())
-                .decode_utf8()
-                .context("decoding username")?
-                .into_owned(),
-        )
-    };
-    // Strip userinfo from the URL we hand to the HTTP client.
-    url.set_username("")
-        .map_err(|_| anyhow!("could not clear userinfo on {input}"))?;
-
+    let user = take_userinfo(&mut url, "--caldav-password-file")?;
     Ok(CaldavTarget {
         url: url.to_string(),
         user,

@@ -44,10 +44,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use tracing::info;
 
 use super::FileOutcome;
-use super::sink::{sanitize_ext, slugify, write_atomic};
+use super::sink::{log_file_outcome, sanitize_ext, slugify, write_atomic};
 use super::webdav::{PutOutcome, WebdavSink};
 
 /// Identifying fields copied from the sibling reservation artifact, if
@@ -144,60 +143,38 @@ impl TicketSink {
         }
         let ext = sanitize_ext(ext)?;
         let sidecar = sidecar_body(&slug, &ext, meta, received_at_epoch)?;
+        let body =
+            fs::read(src).with_context(|| format!("reading ticket source {}", src.display()))?;
+        let sidecar_filename = sidecar_name(&slug);
+        let blob_filename = format!("{slug}.{ext}");
 
         match self {
-            TicketSink::LocalDir(dir) => file_to_dir(src, &slug, &ext, year, dir, &sidecar),
-            TicketSink::Webdav(sink) => file_to_webdav(src, &slug, &ext, year, sink, &sidecar),
+            TicketSink::LocalDir(dir) => {
+                let year_dir = dir.join(format!("{year:04}"));
+                let target = year_dir.join(&blob_filename);
+                let existed = target.exists();
+                write_atomic(&target, &body)?;
+                write_atomic(&year_dir.join(&sidecar_filename), sidecar.as_bytes())?;
+                Ok(log_file_outcome(&target, existed, "ticket"))
+            }
+            TicketSink::Webdav(sink) => {
+                let outcome = sink.put(
+                    &format!("{year:04}/{blob_filename}"),
+                    content_type_for(&ext),
+                    body,
+                )?;
+                sink.put(
+                    &format!("{year:04}/{sidecar_filename}"),
+                    "application/json",
+                    sidecar.into_bytes(),
+                )?;
+                Ok(match outcome {
+                    PutOutcome::Created(url) => FileOutcome::Created(url),
+                    PutOutcome::Updated(url) => FileOutcome::Updated(url),
+                })
+            }
         }
     }
-}
-
-fn file_to_dir(
-    src: &Path,
-    slug: &str,
-    ext: &str,
-    year: i32,
-    dir: &Path,
-    sidecar: &str,
-) -> Result<FileOutcome> {
-    let year_dir = dir.join(format!("{year:04}"));
-    let target = year_dir.join(format!("{slug}.{ext}"));
-
-    let body = fs::read(src).with_context(|| format!("reading ticket source {}", src.display()))?;
-
-    let existed = target.exists();
-    write_atomic(&target, &body)?;
-    write_atomic(&year_dir.join(sidecar_name(slug)), sidecar.as_bytes())?;
-
-    if existed {
-        info!(target = %target.display(), "ticket updated");
-        Ok(FileOutcome::Updated(target.display().to_string()))
-    } else {
-        info!(target = %target.display(), "ticket created");
-        Ok(FileOutcome::Created(target.display().to_string()))
-    }
-}
-
-fn file_to_webdav(
-    src: &Path,
-    slug: &str,
-    ext: &str,
-    year: i32,
-    sink: &WebdavSink,
-    sidecar: &str,
-) -> Result<FileOutcome> {
-    let body = fs::read(src).with_context(|| format!("reading ticket source {}", src.display()))?;
-    let sub_path = format!("{year:04}/{slug}.{ext}");
-    let outcome = sink.put(&sub_path, content_type_for(ext), body)?;
-    sink.put(
-        &format!("{year:04}/{}", sidecar_name(slug)),
-        "application/json",
-        sidecar.as_bytes().to_vec(),
-    )?;
-    Ok(match outcome {
-        PutOutcome::Created(url) => FileOutcome::Created(url),
-        PutOutcome::Updated(url) => FileOutcome::Updated(url),
-    })
 }
 
 #[cfg(test)]

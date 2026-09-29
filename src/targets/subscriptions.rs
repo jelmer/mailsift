@@ -11,16 +11,17 @@
 //! recognise an `Offer` with a `subscriptionDuration` field can emit
 //! whatever they want, and unknown fields pass through.
 
-use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(test)]
+use std::fs;
+
+use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
-use tracing::info;
 
 use super::FileOutcome;
-use super::json_target::first_non_empty;
-use super::sink::{slugify, write_atomic};
+use super::json_target::{first_non_empty, read_and_parse};
+use super::sink::{log_file_outcome, slugify, write_atomic};
 
 /// Shape we read out of a `.subscription.json` artifact. Loosely
 /// schema.org-shaped (most fields mirror `Offer` / `Subscription`).
@@ -46,10 +47,7 @@ pub fn file_subscription(
     dir: &Path,
     received_at_epoch: Option<i64>,
 ) -> Result<FileOutcome> {
-    let body = fs::read_to_string(src)
-        .with_context(|| format!("reading subscription source {}", src.display()))?;
-    let parsed: Subscription = serde_json::from_str(&body)
-        .with_context(|| format!("parsing subscription JSON {}", src.display()))?;
+    let (body, parsed) = read_and_parse::<Subscription>(src, "subscription")?;
 
     let ident = parsed
         .identifier()
@@ -68,14 +66,7 @@ pub fn file_subscription(
     let body_out = super::json_target::body_with_received_at(&body, received_at_epoch);
     write_atomic(&target, body_out.as_bytes())?;
 
-    let label = target.display().to_string();
-    if existed {
-        info!(target = %label, "subscription updated");
-        Ok(FileOutcome::Updated(label))
-    } else {
-        info!(target = %label, "subscription created");
-        Ok(FileOutcome::Created(label))
-    }
+    Ok(log_file_outcome(&target, existed, "subscription"))
 }
 
 #[cfg(test)]

@@ -29,12 +29,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use tracing::info;
 
 use super::FileOutcome;
-use super::json_target::{derive_year, first_non_empty};
+use super::json_target::{derive_year, first_non_empty, read_and_parse};
 use super::mail_forward::{self, MailForwarder};
-use super::sink::{sanitize_ext, slugify, write_atomic};
+use super::sink::{log_file_outcome, sanitize_ext, slugify, write_atomic};
 use super::tickets::content_type_for;
 use super::webdav::{PutOutcome, WebdavSink};
 
@@ -87,10 +86,7 @@ impl ReceiptSink {
         raw_message: &[u8],
         received_at_epoch: Option<i64>,
     ) -> Result<FileOutcome> {
-        let body = fs::read_to_string(src)
-            .with_context(|| format!("reading receipt source {}", src.display()))?;
-        let receipt: Receipt = serde_json::from_str(&body)
-            .with_context(|| format!("parsing receipt JSON {}", src.display()))?;
+        let (body, receipt) = read_and_parse::<Receipt>(src, "receipt")?;
 
         let merchant = receipt
             .merchant()
@@ -109,27 +105,20 @@ impl ReceiptSink {
             );
         }
 
-        match self {
-            ReceiptSink::LocalDir(dir) => {
-                let body_out = super::json_target::body_with_received_at(&body, received_at_epoch);
-                file_to_dir(&merchant_slug, &order_slug, year, body_out.as_bytes(), dir)
-            }
-            ReceiptSink::Webdav(sink) => {
-                let body_out = super::json_target::body_with_received_at(&body, received_at_epoch);
-                file_to_webdav(
-                    &merchant_slug,
-                    &order_slug,
-                    year,
-                    body_out.into_bytes(),
-                    sink,
-                )
-            }
-            ReceiptSink::Forward(fwd) => {
-                let hint = mail_forward::subject_hint(raw_message);
-                fwd.forward(raw_message, &hint)?;
-                Ok(FileOutcome::Created(format!("forwarded ({hint})")))
-            }
+        if let ReceiptSink::Forward(fwd) = self {
+            let hint = mail_forward::subject_hint(raw_message);
+            fwd.forward(raw_message, &hint)?;
+            return Ok(FileOutcome::Created(format!("forwarded ({hint})")));
         }
+        let body_out = super::json_target::body_with_received_at(&body, received_at_epoch);
+        let filename = format!("{merchant_slug}-{order_slug}.json");
+        self.put_under_year(
+            year,
+            &filename,
+            "application/json",
+            body_out.into_bytes(),
+            "receipt",
+        )
     }
 
     /// File a companion blob (typically a PDF) alongside a receipt.
@@ -147,23 +136,58 @@ impl ReceiptSink {
         ext: &str,
         pair: (&str, &str, i32),
     ) -> Result<Option<FileOutcome>> {
+        // The forward variant has nothing to do for companion blobs; the
+        // original RFC822 was already forwarded on the JSON side. Short-
+        // circuit before reading the file so we don't slurp its bytes
+        // just to throw them away.
+        if matches!(self, ReceiptSink::Forward(_)) {
+            return Ok(None);
+        }
         let ext = sanitize_ext(ext)?;
         let (merchant, order, year) = pair;
         let name_stem = format!("{merchant}-{order}");
+        let body =
+            fs::read(src).with_context(|| format!("reading receipt blob {}", src.display()))?;
+        let filename = format!("{name_stem}.{ext}");
+        Ok(Some(self.put_under_year(
+            year,
+            &filename,
+            content_type_for(&ext),
+            body,
+            "receipt blob",
+        )?))
+    }
+
+    /// Write `body` to `<year>/<filename>` at whichever local or WebDAV
+    /// backend this sink wraps. Both blob and JSON call sites route
+    /// through here so a new backend only has to be added once. Not
+    /// callable on the forward variant; callers must short-circuit it
+    /// first.
+    fn put_under_year(
+        &self,
+        year: i32,
+        filename: &str,
+        content_type: &str,
+        body: Vec<u8>,
+        log_kind: &str,
+    ) -> Result<FileOutcome> {
         match self {
             ReceiptSink::LocalDir(dir) => {
-                let body = fs::read(src)
-                    .with_context(|| format!("reading receipt blob {}", src.display()))?;
-                Ok(Some(file_blob_to_dir(&name_stem, &ext, year, &body, dir)?))
+                let target = dir.join(format!("{year:04}")).join(filename);
+                let existed = target.exists();
+                write_atomic(&target, &body)?;
+                Ok(log_file_outcome(&target, existed, log_kind))
             }
             ReceiptSink::Webdav(sink) => {
-                let body = fs::read(src)
-                    .with_context(|| format!("reading receipt blob {}", src.display()))?;
-                Ok(Some(file_blob_to_webdav(
-                    &name_stem, &ext, year, body, sink,
-                )?))
+                let outcome = sink.put(&format!("{year:04}/{filename}"), content_type, body)?;
+                Ok(match outcome {
+                    PutOutcome::Created(url) => FileOutcome::Created(url),
+                    PutOutcome::Updated(url) => FileOutcome::Updated(url),
+                })
             }
-            ReceiptSink::Forward(_) => Ok(None),
+            ReceiptSink::Forward(_) => {
+                unreachable!("callers short-circuit the forward variant before reaching here")
+            }
         }
     }
 }
@@ -183,83 +207,6 @@ pub fn paired_name_from_json(body: &str) -> Option<(String, String, i32)> {
     }
     let year = derive_year(receipt.date_candidates());
     Some((merchant_slug, order_slug, year))
-}
-
-fn file_to_dir(
-    merchant_slug: &str,
-    order_slug: &str,
-    year: i32,
-    body: &[u8],
-    dir: &Path,
-) -> Result<FileOutcome> {
-    let target = dir
-        .join(format!("{year:04}"))
-        .join(format!("{merchant_slug}-{order_slug}.json"));
-
-    let existed = target.exists();
-    write_atomic(&target, body)?;
-
-    if existed {
-        info!(target = %target.display(), "receipt updated");
-        Ok(FileOutcome::Updated(target.display().to_string()))
-    } else {
-        info!(target = %target.display(), "receipt created");
-        Ok(FileOutcome::Created(target.display().to_string()))
-    }
-}
-
-fn file_to_webdav(
-    merchant_slug: &str,
-    order_slug: &str,
-    year: i32,
-    body: Vec<u8>,
-    sink: &WebdavSink,
-) -> Result<FileOutcome> {
-    let sub_path = format!("{year:04}/{merchant_slug}-{order_slug}.json");
-    let outcome = sink.put(&sub_path, "application/json", body)?;
-    Ok(match outcome {
-        PutOutcome::Created(url) => FileOutcome::Created(url),
-        PutOutcome::Updated(url) => FileOutcome::Updated(url),
-    })
-}
-
-fn file_blob_to_dir(
-    name_stem: &str,
-    ext: &str,
-    year: i32,
-    body: &[u8],
-    dir: &Path,
-) -> Result<FileOutcome> {
-    let target = dir
-        .join(format!("{year:04}"))
-        .join(format!("{name_stem}.{ext}"));
-
-    let existed = target.exists();
-    write_atomic(&target, body)?;
-
-    let label = target.display().to_string();
-    if existed {
-        info!(target = %label, "receipt blob updated");
-        Ok(FileOutcome::Updated(label))
-    } else {
-        info!(target = %label, "receipt blob created");
-        Ok(FileOutcome::Created(label))
-    }
-}
-
-fn file_blob_to_webdav(
-    name_stem: &str,
-    ext: &str,
-    year: i32,
-    body: Vec<u8>,
-    sink: &WebdavSink,
-) -> Result<FileOutcome> {
-    let sub_path = format!("{year:04}/{name_stem}.{ext}");
-    let outcome = sink.put(&sub_path, content_type_for(ext), body)?;
-    Ok(match outcome {
-        PutOutcome::Created(url) => FileOutcome::Created(url),
-        PutOutcome::Updated(url) => FileOutcome::Updated(url),
-    })
 }
 
 #[cfg(test)]
