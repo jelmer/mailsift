@@ -434,8 +434,9 @@ pub fn convert_file(path: &Path) -> Result<Vec<SingleEvent>> {
 /// `Unknown` types or for cases where the required date/time isn't
 /// parseable.
 fn render(r: Reservation) -> Option<SingleEvent> {
-    let (prefix, summary, dtstart, dtend, location, id) = match r {
+    let (prefix, summary, dtstart, dtend, location, id, leg) = match r {
         Reservation::Flight(f) => {
+            let leg = flight_leg_code(&f.reservation_for);
             let summary = flight_summary(&f.reservation_for);
             let dep_label = airport_label(f.reservation_for.departure_airport.as_ref());
             (
@@ -445,6 +446,7 @@ fn render(r: Reservation) -> Option<SingleEvent> {
                 f.reservation_for.arrival_time,
                 dep_label,
                 f.id,
+                leg,
             )
         }
         Reservation::Train(t) => line_event("Train", t),
@@ -469,6 +471,7 @@ fn render(r: Reservation) -> Option<SingleEvent> {
                 l.checkout_time,
                 location,
                 l.id,
+                None,
             )
         }
         Reservation::Event(e) => {
@@ -489,6 +492,7 @@ fn render(r: Reservation) -> Option<SingleEvent> {
                 e.reservation_for.end_date,
                 location,
                 e.id,
+                None,
             )
         }
         Reservation::Food(f) => {
@@ -506,7 +510,15 @@ fn render(r: Reservation) -> Option<SingleEvent> {
                 .as_ref()
                 .and_then(|p| p.address.as_ref())
                 .and_then(Address::render);
-            ("restaurant", summary, f.start_time, None, location, f.id)
+            (
+                "restaurant",
+                summary,
+                f.start_time,
+                None,
+                location,
+                f.id,
+                None,
+            )
         }
         Reservation::RentalCar(r) => {
             // Prefer the pickup branch's name for the summary: "Hire
@@ -541,12 +553,13 @@ fn render(r: Reservation) -> Option<SingleEvent> {
                 r.dropoff_time,
                 location,
                 r.id,
+                None,
             )
         }
         Reservation::Unknown => return None,
     };
 
-    let uid = uid_for(prefix, &id, &summary, &dtstart);
+    let uid = uid_for(prefix, &id, leg.as_deref(), &summary, &dtstart);
     let body = render_ics(
         &uid,
         &dtstart,
@@ -562,13 +575,7 @@ fn render(r: Reservation) -> Option<SingleEvent> {
 }
 
 fn flight_summary(f: &Flight) -> String {
-    let flight_no = f.flight_number.as_deref().unwrap_or_default();
-    let airline_code = f
-        .airline
-        .as_ref()
-        .and_then(|a| a.iata_code.as_deref())
-        .unwrap_or("");
-    let code = format!("{airline_code}{flight_no}");
+    let code = flight_leg_code(f).unwrap_or_default();
     let dep = airport_label(f.departure_airport.as_ref());
     let arr = airport_label(f.arrival_airport.as_ref());
     if code.is_empty() {
@@ -586,6 +593,23 @@ fn flight_summary(f: &Flight) -> String {
     }
 }
 
+/// The airline + flight number pair (`KL1012`) used to keep the legs of
+/// one booking apart in both the summary line and the calendar UID. All
+/// four legs of a return trip share the booking reference, so without
+/// this the UID would collapse and each leg's `.ics` file would clobber
+/// the last one written.
+fn flight_leg_code(f: &Flight) -> Option<String> {
+    let flight_no = f.flight_number.as_deref().unwrap_or("").trim();
+    let airline_code = f
+        .airline
+        .as_ref()
+        .and_then(|a| a.iata_code.as_deref())
+        .unwrap_or("")
+        .trim();
+    let code = format!("{airline_code}{flight_no}");
+    (!code.is_empty()).then_some(code)
+}
+
 fn line_event(
     kind: &str,
     r: LineReservation,
@@ -596,6 +620,7 @@ fn line_event(
     Option<DateTimeField>,
     Option<String>,
     ReservationId,
+    Option<String>,
 ) {
     let prefix: &'static str = match kind {
         "Train" => "train",
@@ -622,6 +647,7 @@ fn line_event(
         dep_label.as_deref().unwrap_or("?"),
         arr_label.as_deref().unwrap_or("?")
     );
+    let leg = (!number.is_empty()).then(|| number.to_string());
     (
         prefix,
         summary,
@@ -629,6 +655,7 @@ fn line_event(
         r.reservation_for.arrival_time,
         dep_label,
         r.id,
+        leg,
     )
 }
 
@@ -665,7 +692,13 @@ fn event_location_string(loc: Option<&EventLocation>) -> Option<String> {
     }
 }
 
-fn uid_for(prefix: &str, id: &ReservationId, summary: &str, dtstart: &DateTimeField) -> String {
+fn uid_for(
+    prefix: &str,
+    id: &ReservationId,
+    leg: Option<&str>,
+    summary: &str,
+    dtstart: &DateTimeField,
+) -> String {
     if let Some(value) = id
         .reservation_number
         .as_deref()
@@ -674,7 +707,14 @@ fn uid_for(prefix: &str, id: &ReservationId, summary: &str, dtstart: &DateTimeFi
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return format!("{prefix}-{value}@mailsift");
+        // Legs of one booking (a return flight, a multi-hop train) all
+        // share the reservation reference; append the flight number,
+        // train number, ... so each leg gets its own UID and doesn't
+        // overwrite its sibling on disk.
+        return match leg {
+            Some(l) => format!("{prefix}-{value}-{l}@mailsift"),
+            None => format!("{prefix}-{value}@mailsift"),
+        };
     }
     // Fallback: stable hash of the rendered summary and dtstart. The
     // typed model has already discarded fields we don't read, so we
@@ -743,7 +783,7 @@ mod tests {
             }
         });
         let ev = first(convert(&v).unwrap());
-        assert_eq!(ev.uid, "flight-ABCDEFG@mailsift");
+        assert_eq!(ev.uid, "flight-ABCDEFG-FR1234@mailsift");
         assert!(
             ev.body
                 .contains("SUMMARY:Flight FR1234: DUB (Dublin) -> BCN (Barcelona)")
@@ -842,8 +882,92 @@ mod tests {
         ]);
         let events = convert(&v).unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].uid, "flight-AAA@mailsift");
-        assert_eq!(events[1].uid, "flight-BBB@mailsift");
+        assert_eq!(events[0].uid, "flight-AAA-BA100@mailsift");
+        assert_eq!(events[1].uid, "flight-BBB-BA200@mailsift");
+    }
+
+    /// A four-leg return itinerary: outbound LHR-AMS-TRD, return
+    /// TRD-AMS-LHR. All four legs share the booking reference, so the
+    /// UID has to include the flight number for each leg to end up in
+    /// its own `.ics` file.
+    #[test]
+    fn multi_leg_itinerary_gets_a_uid_per_leg() {
+        let v = json!([
+            {
+                "@type": "FlightReservation",
+                "reservationNumber": "Y9ZO6Z",
+                "reservationFor": {
+                    "flightNumber": "1012",
+                    "airline": {"iataCode": "KL"},
+                    "departureAirport": {"iataCode": "LHR"},
+                    "arrivalAirport": {"iataCode": "AMS"},
+                    "departureTime": "2026-09-21T17:10:00"
+                }
+            },
+            {
+                "@type": "FlightReservation",
+                "reservationNumber": "Y9ZO6Z",
+                "reservationFor": {
+                    "flightNumber": "1155",
+                    "airline": {"iataCode": "KL"},
+                    "departureAirport": {"iataCode": "AMS"},
+                    "arrivalAirport": {"iataCode": "TRD"},
+                    "departureTime": "2026-09-21T20:40:00"
+                }
+            },
+            {
+                "@type": "FlightReservation",
+                "reservationNumber": "Y9ZO6Z",
+                "reservationFor": {
+                    "flightNumber": "1154",
+                    "airline": {"iataCode": "KL"},
+                    "departureAirport": {"iataCode": "TRD"},
+                    "arrivalAirport": {"iataCode": "AMS"},
+                    "departureTime": "2026-09-28T17:10:00"
+                }
+            },
+            {
+                "@type": "FlightReservation",
+                "reservationNumber": "Y9ZO6Z",
+                "reservationFor": {
+                    "flightNumber": "1017",
+                    "airline": {"iataCode": "KL"},
+                    "departureAirport": {"iataCode": "AMS"},
+                    "arrivalAirport": {"iataCode": "LHR"},
+                    "departureTime": "2026-09-28T20:40:00"
+                }
+            }
+        ]);
+        let uids: Vec<String> = convert(&v).unwrap().into_iter().map(|e| e.uid).collect();
+        assert_eq!(
+            uids,
+            vec![
+                "flight-Y9ZO6Z-KL1012@mailsift",
+                "flight-Y9ZO6Z-KL1155@mailsift",
+                "flight-Y9ZO6Z-KL1154@mailsift",
+                "flight-Y9ZO6Z-KL1017@mailsift",
+            ]
+        );
+    }
+
+    /// Without a flight number the UID stays at the bare reference.
+    /// Some extractors (the older KLM ticket mail) don't carry a
+    /// flight number per leg; falling back to the reference-only UID
+    /// keeps them at the current behaviour rather than inventing a
+    /// discriminator from thin air.
+    #[test]
+    fn flight_without_number_keeps_bare_uid() {
+        let v = json!({
+            "@type": "FlightReservation",
+            "reservationNumber": "AAA",
+            "reservationFor": {
+                "departureAirport": {"iataCode": "LHR"},
+                "arrivalAirport": {"iataCode": "AMS"},
+                "departureTime": "2026-01-01T10:00:00Z"
+            }
+        });
+        let ev = first(convert(&v).unwrap());
+        assert_eq!(ev.uid, "flight-AAA@mailsift");
     }
 
     #[test]
