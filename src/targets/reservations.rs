@@ -366,13 +366,23 @@ fn file_one(
         Some(provider_slug) if !provider_slug.is_empty() => {
             format!("{provider_slug}-{number_slug}")
         }
-        _ => number_slug,
+        _ => number_slug.clone(),
     };
     // Legs of one itinerary share a booking reference and usually the
     // airline too, so the reference alone would file the return on top
     // of the outbound. Append the leg's own date to keep them apart.
     if distinguish_by_day && let Some(day) = reservation.day() {
         stem = format!("{stem}-{day}");
+    }
+    // Some extractors emit one file per leg (KLM eticket, Air France,
+    // British Airways, ...) with a per-leg suffix already baked into
+    // the source filename, e.g. `klm-Y9ZO6Z-KL1012.reservation.json`
+    // vs. `klm-Y9ZO6Z-KL1155.reservation.json`. Without a discriminator
+    // both files would slug to the same target and clobber each other.
+    // Honour whatever suffix the extractor appended past the booking
+    // reference.
+    if let Some(discriminator) = source_discriminator(src, &number_slug) {
+        stem = format!("{stem}-{discriminator}");
     }
 
     let target = dir.join(format!("{year:04}")).join(format!("{stem}.json"));
@@ -381,6 +391,46 @@ fn file_one(
     write_atomic(&target, body_out.as_bytes())?;
 
     Ok(log_file_outcome(&target, existed, "reservation"))
+}
+
+/// The dash-separated tail of the source filename that follows the
+/// booking reference, if any. `klm-Y9ZO6Z-KL1012.reservation.json` with
+/// `number_slug = "y9zo6z"` yields `Some("kl1012")`. Returns `None` when
+/// the source filename carries no extra content past the reference: the
+/// caller keeps its provider-plus-reference stem in that case.
+fn source_discriminator(src: &Path, number_slug: &str) -> Option<String> {
+    let stem = src
+        .file_name()?
+        .to_str()?
+        .strip_suffix(".reservation.json")?;
+    let source_slug = slugify(stem, false);
+    let idx = find_token(&source_slug, number_slug)?;
+    let tail = source_slug
+        .get(idx + number_slug.len()..)?
+        .trim_matches('-');
+    (!tail.is_empty()).then(|| tail.to_string())
+}
+
+/// Locate `needle` in `haystack` at a dash-or-start boundary and a
+/// dash-or-end boundary. Prevents matching `abc` inside `xabc` or
+/// `abcd`; the discriminator only makes sense when the booking
+/// reference stands alone as its own token.
+fn find_token(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let mut start = 0;
+    while let Some(rel) = haystack[start..].find(needle) {
+        let idx = start + rel;
+        let left_ok = idx == 0 || haystack.as_bytes()[idx - 1] == b'-';
+        let end = idx + needle.len();
+        let right_ok = end == haystack.len() || haystack.as_bytes()[end] == b'-';
+        if left_ok && right_ok {
+            return Some(idx);
+        }
+        start = idx + 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -576,6 +626,81 @@ mod tests {
 
         file_reservation(&src, &dir, None).unwrap();
         assert!(dir.join("2026/klm-aaa.json").exists());
+    }
+
+    /// A per-leg extractor (KLM eticket, Air France, ...) emits one
+    /// file per flight with the flight number baked into the filename.
+    /// The four files share a booking reference, so without honouring
+    /// the source-filename suffix they'd all clobber one target.
+    #[test]
+    fn per_leg_source_filenames_keep_each_leg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out");
+        for (fname, dep) in [
+            ("klm-Y9ZO6Z-KL1012.reservation.json", "2026-09-21T17:10:00"),
+            ("klm-Y9ZO6Z-KL1155.reservation.json", "2026-09-21T20:40:00"),
+            ("klm-Y9ZO6Z-KL1154.reservation.json", "2026-09-28T17:10:00"),
+            ("klm-Y9ZO6Z-KL1017.reservation.json", "2026-09-28T20:40:00"),
+        ] {
+            let src = tmp.path().join(fname);
+            let body = format!(
+                r#"{{"reservationNumber":"Y9ZO6Z","reservationFor":{{
+                    "airline":{{"name":"KLM"}},"departureTime":"{dep}"}}}}"#
+            );
+            fs::write(&src, body).unwrap();
+            file_reservation(&src, &dir, None).unwrap();
+        }
+        assert!(dir.join("2026/klm-y9zo6z-kl1012.json").exists());
+        assert!(dir.join("2026/klm-y9zo6z-kl1155.json").exists());
+        assert!(dir.join("2026/klm-y9zo6z-kl1154.json").exists());
+        assert!(dir.join("2026/klm-y9zo6z-kl1017.json").exists());
+    }
+
+    /// The source filename carries no content past the reference (the
+    /// typical single-leg case). The discriminator must stay off so
+    /// follow-up mails update in place under the bare stem.
+    #[test]
+    fn source_stem_without_suffix_keeps_bare_stem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("klm-y9zo6z.reservation.json");
+        fs::write(
+            &src,
+            br#"{"reservationNumber":"Y9ZO6Z","provider":"KLM",
+                 "reservationFor":{"departureTime":"2026-09-21T17:10:00"}}"#,
+        )
+        .unwrap();
+        let dir = tmp.path().join("out");
+
+        file_reservation(&src, &dir, None).unwrap();
+        assert!(dir.join("2026/klm-y9zo6z.json").exists());
+    }
+
+    /// The reference has to sit as its own token in the filename. A
+    /// filename that just happens to contain the reference as a
+    /// substring (or a longer alnum run that starts with it) must not
+    /// trigger the discriminator.
+    #[test]
+    fn source_discriminator_needs_a_token_boundary() {
+        assert_eq!(
+            source_discriminator(Path::new("abc.reservation.json"), "abc"),
+            None
+        );
+        assert_eq!(
+            source_discriminator(Path::new("abcd.reservation.json"), "abc"),
+            None
+        );
+        assert_eq!(
+            source_discriminator(Path::new("xabc.reservation.json"), "abc"),
+            None
+        );
+        assert_eq!(
+            source_discriminator(Path::new("klm-abc-kl1.reservation.json"), "abc"),
+            Some("kl1".to_string())
+        );
+        assert_eq!(
+            source_discriminator(Path::new("abc-kl1.reservation.json"), "abc"),
+            Some("kl1".to_string())
+        );
     }
 
     #[test]
