@@ -99,6 +99,21 @@ impl Scalar {
             Scalar::Other(_) => None,
         }
     }
+
+    /// Rendered value, but only when it isn't blank. Useful for `find`
+    /// chains that want to skip empty scalars silently.
+    fn non_empty(&self) -> Option<String> {
+        self.as_str().filter(|s| !s.trim().is_empty())
+    }
+}
+
+/// First scalar in `candidates` whose rendering is non-empty. The
+/// preferred way to pull one string out of a set of alias fields.
+fn first_non_empty_scalar<'a, I>(candidates: I) -> Option<String>
+where
+    I: IntoIterator<Item = Option<&'a Scalar>>,
+{
+    candidates.into_iter().flatten().find_map(Scalar::non_empty)
 }
 
 /// A schema.org node that may be given as a bare string or as an
@@ -149,15 +164,11 @@ impl Reservation {
     /// Booking reference. This is what makes a follow-up mail about
     /// the same trip overwrite the existing record.
     fn number(&self) -> Option<String> {
-        [
+        first_non_empty_scalar([
             self.reservation_number.as_ref(),
             self.reservation_id.as_ref(),
             self.identifier.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(Scalar::as_str)
-        .find(|s| !s.trim().is_empty())
+        ])
     }
 
     /// Who the booking is with. Prefers the airline name, then the
@@ -171,12 +182,7 @@ impl Reservation {
             self.broker.as_ref().and_then(Named::name),
         ])
         .map(str::to_string)
-        .or_else(|| {
-            for_.name
-                .as_ref()
-                .and_then(Scalar::as_str)
-                .filter(|s| !s.trim().is_empty())
-        })
+        .or_else(|| for_.name.as_ref().and_then(Scalar::non_empty))
     }
 
     /// The `YYYY-MM-DD` prefix of this leg's own date, when it has
