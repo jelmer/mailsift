@@ -14,6 +14,15 @@
 //! Year derivation falls through `orderDate`, then `date`; failing
 //! both, the current year. Slug rules match the bills/tickets targets
 //! (lowercase ASCII alphanumerics plus `_`, `.`, `+`).
+//!
+//! Extractors may also emit companion blobs (`<slug>.receipt.pdf` etc.).
+//! Those go through [`ReceiptSink::file_receipt_blob`], which requires
+//! a same-slug `.receipt.json` sibling in the same run and files the
+//! pair under a common `<merchant>-<order>` name. Blobs without a
+//! sibling are dropped with a warning by the pipeline: the extractor
+//! should have emitted the structured record too. The
+//! [`ReceiptSink::Forward`] variant is a no-op for companion blobs:
+//! the original RFC822 was already forwarded on the JSON side.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,7 +34,8 @@ use tracing::info;
 use super::FileOutcome;
 use super::json_target::{derive_year, first_non_empty};
 use super::mail_forward::{self, MailForwarder};
-use super::sink::{slugify, write_atomic};
+use super::sink::{sanitize_ext, slugify, write_atomic};
+use super::tickets::content_type_for;
 use super::webdav::{PutOutcome, WebdavSink};
 
 /// Where to file `receipt` artifacts.
@@ -121,6 +131,58 @@ impl ReceiptSink {
             }
         }
     }
+
+    /// File a companion blob (typically a PDF) alongside a receipt.
+    ///
+    /// `pair` is the sanitised `(merchant_slug, order_slug, year)`
+    /// pulled from a same-slug `.receipt.json` sibling in the same
+    /// extractor run; the blob is filed under
+    /// `<year>/<merchant>-<order>.<ext>` so it sits beside the JSON.
+    ///
+    /// The [`ReceiptSink::Forward`] variant is a no-op here: the
+    /// original RFC822 was already forwarded on the JSON receipt.
+    pub fn file_receipt_blob(
+        &self,
+        src: &Path,
+        ext: &str,
+        pair: (&str, &str, i32),
+    ) -> Result<Option<FileOutcome>> {
+        let ext = sanitize_ext(ext)?;
+        let (merchant, order, year) = pair;
+        let name_stem = format!("{merchant}-{order}");
+        match self {
+            ReceiptSink::LocalDir(dir) => {
+                let body = fs::read(src)
+                    .with_context(|| format!("reading receipt blob {}", src.display()))?;
+                Ok(Some(file_blob_to_dir(&name_stem, &ext, year, &body, dir)?))
+            }
+            ReceiptSink::Webdav(sink) => {
+                let body = fs::read(src)
+                    .with_context(|| format!("reading receipt blob {}", src.display()))?;
+                Ok(Some(file_blob_to_webdav(
+                    &name_stem, &ext, year, body, sink,
+                )?))
+            }
+            ReceiptSink::Forward(_) => Ok(None),
+        }
+    }
+}
+
+/// Parse `body` as a receipt JSON and return the paired
+/// `(merchant_slug, order_slug, year)` that a companion blob should be
+/// filed under, or `None` if a required field is missing.
+///
+/// Used by the pipeline to resolve a sibling `.receipt.json` to the
+/// name a same-slug `.receipt.<ext>` blob should be filed under.
+pub fn paired_name_from_json(body: &str) -> Option<(String, String, i32)> {
+    let receipt: Receipt = serde_json::from_str(body).ok()?;
+    let merchant_slug = slugify(receipt.merchant()?, false);
+    let order_slug = slugify(receipt.order()?, false);
+    if merchant_slug.is_empty() || order_slug.is_empty() {
+        return None;
+    }
+    let year = derive_year(receipt.date_candidates());
+    Some((merchant_slug, order_slug, year))
 }
 
 fn file_to_dir(
@@ -155,6 +217,45 @@ fn file_to_webdav(
 ) -> Result<FileOutcome> {
     let sub_path = format!("{year:04}/{merchant_slug}-{order_slug}.json");
     let outcome = sink.put(&sub_path, "application/json", body)?;
+    Ok(match outcome {
+        PutOutcome::Created(url) => FileOutcome::Created(url),
+        PutOutcome::Updated(url) => FileOutcome::Updated(url),
+    })
+}
+
+fn file_blob_to_dir(
+    name_stem: &str,
+    ext: &str,
+    year: i32,
+    body: &[u8],
+    dir: &Path,
+) -> Result<FileOutcome> {
+    let target = dir
+        .join(format!("{year:04}"))
+        .join(format!("{name_stem}.{ext}"));
+
+    let existed = target.exists();
+    write_atomic(&target, body)?;
+
+    let label = target.display().to_string();
+    if existed {
+        info!(target = %label, "receipt blob updated");
+        Ok(FileOutcome::Updated(label))
+    } else {
+        info!(target = %label, "receipt blob created");
+        Ok(FileOutcome::Created(label))
+    }
+}
+
+fn file_blob_to_webdav(
+    name_stem: &str,
+    ext: &str,
+    year: i32,
+    body: Vec<u8>,
+    sink: &WebdavSink,
+) -> Result<FileOutcome> {
+    let sub_path = format!("{year:04}/{name_stem}.{ext}");
+    let outcome = sink.put(&sub_path, content_type_for(ext), body)?;
     Ok(match outcome {
         PutOutcome::Created(url) => FileOutcome::Created(url),
         PutOutcome::Updated(url) => FileOutcome::Updated(url),
@@ -200,5 +301,42 @@ mod tests {
         let expected = tmp.path().join("2024/amazon-abc123.json");
         assert_eq!(PathBuf::from(&path), expected);
         assert!(expected.exists());
+    }
+
+    #[test]
+    fn paired_name_from_json_derives_slugs_and_year() {
+        let body =
+            r#"{"merchant":"Digital Ocean","orderNumber":"INV-42","orderDate":"2026-08-01"}"#;
+        let (merchant, order, year) = paired_name_from_json(body).unwrap();
+        assert_eq!(merchant, "digital-ocean");
+        assert_eq!(order, "inv-42");
+        assert_eq!(year, 2026);
+    }
+
+    #[test]
+    fn paired_name_missing_fields_returns_none() {
+        let body = r#"{"orderNumber":"only-order"}"#;
+        assert!(paired_name_from_json(body).is_none());
+    }
+
+    #[test]
+    fn blob_paired_lands_beside_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("blob.pdf");
+        std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
+
+        let sink = ReceiptSink::LocalDir(tmp.path().to_path_buf());
+        let outcome = sink
+            .file_receipt_blob(&src, "pdf", ("digital-ocean", "inv-42", 2026))
+            .unwrap()
+            .unwrap();
+        let path = match outcome {
+            FileOutcome::Created(p) => p,
+            FileOutcome::Updated(_) => panic!("expected Created"),
+        };
+        assert_eq!(
+            PathBuf::from(&path),
+            tmp.path().join("2026/digital-ocean-inv-42.pdf")
+        );
     }
 }

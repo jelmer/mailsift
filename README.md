@@ -15,8 +15,10 @@ artifact files into a per-run tempdir:
 | `.event.ics`       | iCalendar event (parsed and re-emitted via the [`icalendar`] crate).                |
 | `.reservation.json`| schema.org reservation (Flight/Train/Bus/Lodging/Event/FoodEstablishment). Converted to a single VEVENT, and archived as JSON when `reservations_dir` is set. |
 | `.bill.json`       | Loosely schema.org `Invoice`-shaped record (payee, invoice number, due date, ...).  |
+| `.bill.<ext>`      | Companion blob for a bill (typically the vendor PDF). Must ship with a same-slug `.bill.json` in the same run; orphan blobs are dropped. |
 | `.parcel.json`     | schema.org `ParcelDelivery`-shaped record (merged across status-update mails).      |
 | `.receipt.json`    | Loosely schema.org `Order`-shaped record (merchant, order number, date, ...).       |
+| `.receipt.<ext>`   | Companion blob for a receipt (typically the vendor PDF). Must ship with a same-slug `.receipt.json` in the same run; orphan blobs are dropped. |
 | `.ticket.<ext>`    | Opaque ticket / boarding pass blob (`pdf`, `pkpass`, image formats). Filed with a `.meta.json` sidecar describing it. |
 
 Events go to a CalDAV inbox calendar or to a local `<UID>.ics` directory.

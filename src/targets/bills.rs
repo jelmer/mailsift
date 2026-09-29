@@ -10,6 +10,13 @@
 //! When a [`super::firefly::FireflySink`] is configured, every filed
 //! bill is also registered with Firefly III (update-or-create on the
 //! Firefly side, so re-runs idempotently refresh the record).
+//!
+//! Extractors may also emit companion blobs (`<slug>.bill.pdf` etc.).
+//! Those go through [`file_bill_blob`], which requires a same-slug
+//! `.bill.json` sibling in the same run and files the pair under a
+//! common `<payee>-<invoice>` name. Blobs without a sibling are
+//! dropped with a warning by the pipeline: the extractor should have
+//! emitted the structured record too.
 
 use std::fs;
 use std::path::Path;
@@ -21,7 +28,7 @@ use tracing::info;
 use super::FileOutcome;
 use super::firefly::{self, BillForFirefly, FireflySink};
 use super::json_target::{derive_year, first_non_empty};
-use super::sink::{slugify, write_atomic};
+use super::sink::{sanitize_ext, slugify, write_atomic};
 
 /// Shape we read out of a `.bill.json` artifact. Loosely schema.org
 /// `Invoice`-shaped; unknown fields are ignored so extractors can emit
@@ -161,6 +168,57 @@ fn register_with_firefly(sink: Option<&FireflySink>, payee: &str, bill: &Bill) {
     );
 }
 
+/// File a companion blob (typically a PDF) alongside a bill.
+///
+/// `pair` is the sanitised `(payee_slug, invoice_slug, year)` pulled
+/// from a same-slug `.bill.json` sibling in the same extractor run;
+/// the blob is filed under `<year>/<payee>-<invoice>.<ext>` so it sits
+/// beside the JSON.
+pub fn file_bill_blob(
+    src: &Path,
+    ext: &str,
+    pair: (&str, &str, i32),
+    dir: &Path,
+) -> Result<FileOutcome> {
+    let ext = sanitize_ext(ext)?;
+    let (payee, invoice, year) = pair;
+    let name_stem = format!("{payee}-{invoice}");
+
+    let target = dir
+        .join(format!("{year:04}"))
+        .join(format!("{name_stem}.{ext}"));
+
+    let body = fs::read(src).with_context(|| format!("reading bill blob {}", src.display()))?;
+    let existed = target.exists();
+    write_atomic(&target, &body)?;
+
+    let label = target.display().to_string();
+    if existed {
+        info!(target = %label, "bill blob updated");
+        Ok(FileOutcome::Updated(label))
+    } else {
+        info!(target = %label, "bill blob created");
+        Ok(FileOutcome::Created(label))
+    }
+}
+
+/// Parse `body` as a bill JSON and return the paired
+/// `(payee_slug, invoice_slug, year)` that a companion blob should be
+/// filed under, or `None` if a required field is missing.
+///
+/// Used by the pipeline to resolve a sibling `.bill.json` to the name
+/// a same-slug `.bill.<ext>` blob should be filed under.
+pub fn paired_name_from_json(body: &str) -> Option<(String, String, i32)> {
+    let bill: Bill = serde_json::from_str(body).ok()?;
+    let payee_slug = slugify(bill.payee()?, false);
+    let invoice_slug = slugify(bill.invoice()?, false);
+    if payee_slug.is_empty() || invoice_slug.is_empty() {
+        return None;
+    }
+    let year = derive_year(bill.date_candidates());
+    Some((payee_slug, invoice_slug, year))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +246,32 @@ mod tests {
         let body = std::fs::read_to_string(dir.join("2024/acme-inv1.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["receivedAt"], "2024-11-01T00:00:00Z");
+    }
+
+    #[test]
+    fn paired_name_from_json_derives_slugs_and_year() {
+        let body = r#"{"payee":"Acme Corp","invoiceNumber":"INV-42","dueDate":"2024-12-05"}"#;
+        let (payee, invoice, year) = paired_name_from_json(body).unwrap();
+        assert_eq!(payee, "acme-corp");
+        assert_eq!(invoice, "inv-42");
+        assert_eq!(year, 2024);
+    }
+
+    #[test]
+    fn blob_paired_lands_beside_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("blob.pdf");
+        std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
+        let dir = tmp.path().join("out");
+
+        let outcome = file_bill_blob(&src, "pdf", ("acme-corp", "inv-42", 2024), &dir).unwrap();
+        let path = match outcome {
+            FileOutcome::Created(p) => p,
+            FileOutcome::Updated(_) => panic!("expected Created"),
+        };
+        assert_eq!(
+            std::path::PathBuf::from(&path),
+            dir.join("2024/acme-corp-inv-42.pdf")
+        );
     }
 }

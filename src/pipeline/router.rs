@@ -245,6 +245,53 @@ pub(super) fn file_bill_artifact(
     }
 }
 
+/// File a bill companion blob (`<slug>.bill.pdf`, etc.) alongside its
+/// same-slug `.bill.json` sibling in the same run. An orphan blob (no
+/// sibling, or a sibling that fails to yield a paired name) is dropped
+/// with a warning: the extractor should have emitted the structured
+/// record too.
+pub(super) fn file_bill_blob_artifact(
+    extractor: &str,
+    artifact: &Artifact,
+    all_artifacts: &[Artifact],
+    bills_dir: &Path,
+    summary: &mut Summary,
+) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_BILL);
+        return;
+    }
+    let Some(pair) = sibling_json_body(all_artifacts, Kind::Bill, &artifact.slug)
+        .and_then(|body| bills::paired_name_from_json(&body))
+    else {
+        warn!(
+            extractor,
+            path = %artifact.path.display(),
+            slug = %artifact.slug,
+            "bill blob has no same-slug .bill.json sibling; dropping"
+        );
+        return;
+    };
+    match bills::file_bill_blob(
+        &artifact.path,
+        &artifact.ext,
+        (pair.0.as_str(), pair.1.as_str(), pair.2),
+        bills_dir,
+    ) {
+        Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
+            summary.bump(extractor, KIND_BILL);
+        }
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %artifact.path.display(),
+                error = format!("{e:#}"),
+                "failed to file bill blob"
+            );
+        }
+    }
+}
+
 pub(super) fn file_parcel_artifact(
     extractor: &str,
     artifact: &Artifact,
@@ -371,6 +418,67 @@ pub(super) fn file_receipt_artifact(
 /// extractor runs. The angle-brackets keep the name from ever
 /// colliding with a real extractor slug.
 pub(super) const RECEIPTS_FORWARD_SINK_NAME: &str = "<sink:receipts-forward>";
+
+/// File a receipt companion blob (`<slug>.receipt.pdf`, etc.) alongside
+/// its same-slug `.receipt.json` sibling in the same run. An orphan
+/// blob (no sibling, or a sibling that fails to yield a paired name)
+/// is dropped with a warning: the extractor should have emitted the
+/// structured record too. The [`receipts::ReceiptSink::Forward`]
+/// variant is a no-op here: the original RFC822 was already forwarded
+/// on the JSON receipt.
+pub(super) fn file_receipt_blob_artifact(
+    extractor: &str,
+    artifact: &Artifact,
+    all_artifacts: &[Artifact],
+    sink: &receipts::ReceiptSink,
+    summary: &mut Summary,
+) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_RECEIPT);
+        return;
+    }
+    let Some(pair) = sibling_json_body(all_artifacts, Kind::Receipt, &artifact.slug)
+        .and_then(|body| receipts::paired_name_from_json(&body))
+    else {
+        warn!(
+            extractor,
+            path = %artifact.path.display(),
+            slug = %artifact.slug,
+            "receipt blob has no same-slug .receipt.json sibling; dropping"
+        );
+        return;
+    };
+    match sink.file_receipt_blob(
+        &artifact.path,
+        &artifact.ext,
+        (pair.0.as_str(), pair.1.as_str(), pair.2),
+    ) {
+        Ok(Some(FileOutcome::Created(_) | FileOutcome::Updated(_))) => {
+            summary.bump(extractor, KIND_RECEIPT);
+        }
+        Ok(None) => {
+            // Forward-sink no-op: nothing to record.
+        }
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %artifact.path.display(),
+                error = format!("{e:#}"),
+                "failed to file receipt blob"
+            );
+        }
+    }
+}
+
+/// Find a same-slug JSON sibling of `kind` in the extractor run and
+/// return its body. Used to look up the merchant/order (or
+/// payee/invoice) that a companion blob should be paired under.
+fn sibling_json_body(all_artifacts: &[Artifact], kind: Kind, slug: &str) -> Option<String> {
+    let sibling = all_artifacts
+        .iter()
+        .find(|a| a.kind == kind && a.ext == "json" && a.slug == slug)?;
+    fs::read_to_string(&sibling.path).ok()
+}
 
 pub(super) fn file_subscription_artifact(
     extractor: &str,

@@ -382,17 +382,31 @@ pub fn run(
         let mut events: Vec<&Artifact> = Vec::new();
         let mut reservations: Vec<&Artifact> = Vec::new();
         let mut bill_arts: Vec<&Artifact> = Vec::new();
+        let mut bill_blob_arts: Vec<&Artifact> = Vec::new();
         let mut parcel_arts: Vec<&Artifact> = Vec::new();
         let mut receipt_arts: Vec<&Artifact> = Vec::new();
+        let mut receipt_blob_arts: Vec<&Artifact> = Vec::new();
         let mut ticket_arts: Vec<&Artifact> = Vec::new();
         let mut subscription_arts: Vec<&Artifact> = Vec::new();
         for artifact in &run.result.artifacts {
             match artifact.kind {
                 Kind::Event => events.push(artifact),
                 Kind::Reservation => reservations.push(artifact),
-                Kind::Bill => bill_arts.push(artifact),
+                Kind::Bill => {
+                    if artifact.ext == "json" {
+                        bill_arts.push(artifact);
+                    } else {
+                        bill_blob_arts.push(artifact);
+                    }
+                }
                 Kind::Parcel => parcel_arts.push(artifact),
-                Kind::Receipt => receipt_arts.push(artifact),
+                Kind::Receipt => {
+                    if artifact.ext == "json" {
+                        receipt_arts.push(artifact);
+                    } else {
+                        receipt_blob_arts.push(artifact);
+                    }
+                }
                 Kind::Ticket => ticket_arts.push(artifact),
                 Kind::Subscription => subscription_arts.push(artifact),
             }
@@ -401,8 +415,10 @@ pub fn run(
         let total_artifacts = events.len()
             + reservations.len()
             + bill_arts.len()
+            + bill_blob_arts.len()
             + parcel_arts.len()
             + receipt_arts.len()
+            + receipt_blob_arts.len()
             + ticket_arts.len()
             + subscription_arts.len();
         if let Some(buf) = explain.as_deref_mut() {
@@ -411,9 +427,9 @@ pub fn run(
                 outcome: ExplainOutcome::Produced {
                     events: events.len() as u32,
                     reservations: reservations.len() as u32,
-                    bills: bill_arts.len() as u32,
+                    bills: (bill_arts.len() + bill_blob_arts.len()) as u32,
                     parcels: parcel_arts.len() as u32,
-                    receipts: receipt_arts.len() as u32,
+                    receipts: (receipt_arts.len() + receipt_blob_arts.len()) as u32,
                     tickets: ticket_arts.len() as u32,
                     subscriptions: subscription_arts.len() as u32,
                 },
@@ -478,6 +494,26 @@ pub fn run(
             },
         );
 
+        // Companion blobs (e.g. `<slug>.bill.pdf`) get filed next to
+        // their same-slug `.bill.json` sibling under a common
+        // `<payee>-<invoice>` name. Orphan blobs (no sibling) are
+        // dropped by the router with a warning.
+        file_or_drop(
+            "bill-blob",
+            &run.extractor,
+            bill_blob_arts,
+            bills_dir,
+            |artifact, dir| {
+                router::file_bill_blob_artifact(
+                    &run.extractor,
+                    artifact,
+                    &run.result.artifacts,
+                    dir,
+                    &mut summary,
+                );
+            },
+        );
+
         file_or_drop(
             "parcel",
             &run.extractor,
@@ -526,6 +562,26 @@ pub fn run(
                     &mut summary,
                     recorder,
                     now_ts,
+                );
+            },
+        );
+
+        // Companion blobs (e.g. `<slug>.receipt.pdf`) get filed next to
+        // their same-slug `.receipt.json` sibling under a common
+        // `<merchant>-<order>` name. Orphan blobs (no sibling) are
+        // dropped by the router with a warning.
+        file_or_drop(
+            "receipt-blob",
+            &run.extractor,
+            receipt_blob_arts,
+            receipts,
+            |artifact, sink| {
+                router::file_receipt_blob_artifact(
+                    &run.extractor,
+                    artifact,
+                    &run.result.artifacts,
+                    sink,
+                    &mut summary,
                 );
             },
         );
