@@ -355,9 +355,10 @@ fn read_status(path: &Path, err: io::Error) -> AppError {
 
 const CSS: &str = r#"
 body { font-family: system-ui, sans-serif; margin: 0; color: #222; background: #fafafa; }
-header { background: #2a3f5f; color: #fff; padding: 0.75rem 1.25rem; }
-header a { color: #fff; text-decoration: none; margin-right: 1rem; font-weight: 500; }
+header { background: #2a3f5f; color: #fff; padding: 0.75rem 1.25rem; display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; align-items: baseline; }
+header a { color: #fff; text-decoration: none; font-weight: 500; }
 header a:hover { text-decoration: underline; }
+@media (max-width: 640px) { header { padding: 0.5rem 0.75rem; gap: 0.15rem 0.75rem; font-size: 0.95rem; } }
 main { max-width: 960px; margin: 1.5rem auto; padding: 0 1.25rem; }
 h1 { margin-top: 0; }
 table { border-collapse: collapse; width: 100%; background: #fff; }
@@ -391,6 +392,8 @@ dl.detail { display: grid; grid-template-columns: max-content 1fr; column-gap: 1
 dl.detail dt { color: #555; font-weight: 500; }
 dl.detail dd { margin: 0; }
 p.links { margin: 0.5rem 0; }
+ul.items { background: #fff; padding: 1rem 1rem 1rem 2rem; border-radius: 6px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); margin: 0 0 1rem; }
+ul.items li { margin: 0.2rem 0; }
 .empty { padding: 2rem; text-align: center; color: #777; background: #fff; border: 1px dashed #ddd; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; }
 .card { background: #fff; padding: 1rem; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
@@ -643,11 +646,13 @@ async fn list_all(
     let body = if feed.is_empty() {
         "<div class=\"empty\">no artifacts yet</div>".to_string()
     } else {
-        // Upcoming stays fully rendered (typically small); Recent
-        // dominates the row count once you have any history, so that's
-        // the section we paginate.
+        // Upcoming renders in full on page 1 only; Recent dominates
+        // the row count once you have any history, so that's what we
+        // paginate. Repeating Upcoming on every page would waste a
+        // section header when the user has clearly scrolled past it.
         let mut out = String::new();
-        if !upcoming.is_empty() {
+        let on_first_page = page_q.page.unwrap_or(1) <= 1;
+        if on_first_page && !upcoming.is_empty() {
             out.push_str(&render_feed_section(
                 &state,
                 "Upcoming",
@@ -740,6 +745,37 @@ fn short_date(raw: &str) -> String {
     parse_any_date(raw)
         .map(|d| d.to_string())
         .unwrap_or_else(|| raw.to_string())
+}
+
+/// `YYYY-MM-DD HH:MM` when `raw` parses as a datetime, `YYYY-MM-DD`
+/// when it's a date-only value, or the input unchanged. Used on
+/// reservation view pages where the time of departure / arrival
+/// matters (flights, trains); [`short_date`] drops the time.
+fn short_datetime(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    // Split off timezone / fractional-seconds before parsing, matching
+    // parse_any_date's trimming so this stays symmetric.
+    let head = s.split('.').next().unwrap_or(s);
+    let head = match head.strip_suffix('Z') {
+        Some(without_z) => without_z,
+        None => match head.find('T') {
+            Some(t) => match head[t..].find(['+', '-']) {
+                Some(off) => &head[..t + off],
+                None => head,
+            },
+            None => head,
+        },
+    };
+    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y%m%dT%H%M%S"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(head, fmt) {
+            return dt.format("%Y-%m-%d %H:%M").to_string();
+        }
+    }
+    // Date-only or unparseable: fall through to short_date behaviour.
+    short_date(raw)
 }
 
 /// Query parameters shared by every list page: pagination, a
@@ -963,6 +999,24 @@ fn matches_search(query: &ListQuery, haystack: &str) -> bool {
     haystack
         .to_ascii_lowercase()
         .contains(&q.to_ascii_lowercase())
+}
+
+/// Empty-state message for a list page. When the user has narrowed
+/// with `q=` or `year=`, name those filters so it's obvious that the
+/// data isn't gone, just filtered.
+fn empty_message(kind: &str, query: &ListQuery) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(q) = &query.q {
+        parts.push(format!("matching \"{}\"", esc(q)));
+    }
+    if let Some(y) = &query.year {
+        parts.push(format!("in {}", esc(y)));
+    }
+    if parts.is_empty() {
+        format!("<div class=\"empty\">no {kind}</div>")
+    } else {
+        format!("<div class=\"empty\">no {kind} {}</div>", parts.join(" "))
+    }
 }
 
 /// Gather every artifact into a single date-sorted feed. Missing dates
@@ -1453,7 +1507,7 @@ async fn list_bills(
         return Ok(Html(page(
             &state,
             "Bills",
-            &format!("{bar}<div class=\"empty\">no bills</div>"),
+            &format!("{bar}{}", empty_message("bills", &query)),
         )));
     }
     let total = rows.len();
@@ -1552,10 +1606,7 @@ async fn list_parcels(
         // parcels), fall back to the newest history entry's `seen_at`
         // - roughly the pipeline's last touch, close enough for a
         // list row.
-        let terminal = matches!(
-            status.as_str(),
-            "OrderDelivered" | "Delivered" | "OrderReturned" | "Returned" | "ReturnedToSender"
-        );
+        let terminal = is_terminal_parcel_status(&status);
         let mut due_keys: Vec<&str> = vec![
             "actualDeliveryTime",
             "expectedArrivalUntil",
@@ -1609,7 +1660,7 @@ async fn list_parcels(
         return Ok(Html(page(
             &state,
             "Parcels",
-            &format!("{bar}<div class=\"empty\">no parcels</div>"),
+            &format!("{bar}{}", empty_message("parcels", &query)),
         )));
     }
     let total = rows.len();
@@ -1664,6 +1715,16 @@ async fn view_parcel(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    // For delivered/returned parcels missing both actualDeliveryTime
+    // and receivedAt (older backfilled records), the last history
+    // entry's `seen_at` is our best remaining timestamp. Matches the
+    // list-page fallback so both views tell the same story.
+    let terminal = pick_str(&value, &["deliveryStatus"])
+        .as_deref()
+        .is_some_and(is_terminal_parcel_status);
+    let received_display = pick_str(&value, &["receivedAt"])
+        .or_else(|| terminal.then(|| last_history_seen_at(&value)).flatten())
+        .map(|s| short_date(&s));
     let fields = [
         ("Tracking number", Some(tracking.clone())),
         ("Carrier", (!carrier.is_empty()).then_some(carrier)),
@@ -1677,10 +1738,7 @@ async fn view_parcel(
             "Delivered",
             pick_str(&value, &["actualDeliveryTime"]).map(|s| short_date(&s)),
         ),
-        (
-            "Received",
-            pick_str(&value, &["receivedAt"]).map(|s| short_date(&s)),
-        ),
+        ("Received", received_display),
     ];
     Ok(Html(page(
         &state,
@@ -1751,7 +1809,7 @@ async fn list_receipts(
         return Ok(Html(page(
             &state,
             "Receipts",
-            &format!("{bar}<div class=\"empty\">no receipts</div>"),
+            &format!("{bar}{}", empty_message("receipts", &query)),
         )));
     }
     let total = rows.len();
@@ -1811,17 +1869,50 @@ async fn view_receipt(
         .into_iter()
         .map(|(label, name)| (label, state.url(&format!("/receipts/{year}/{name}"))))
         .collect();
-    Ok(Html(page(
-        &state,
-        &title,
-        &detail_view(
-            &order,
-            &fields,
-            &state.url(&format!("/receipts/{year}/{slug}.json")),
-            &blobs,
-            vendor_url(&value).as_deref(),
-        ),
-    )))
+    let mut body = detail_view(
+        &order,
+        &fields,
+        &state.url(&format!("/receipts/{year}/{slug}.json")),
+        &blobs,
+        vendor_url(&value).as_deref(),
+    );
+    body.push_str(&render_ordered_items(&value));
+    Ok(Html(page(&state, &title, &body)))
+}
+
+/// Render a receipt's `orderedItem` as a list, or the empty string
+/// when the record has none. Each `OrderItem` shows its `orderedItem`
+/// name with the quantity in a muted tag; unknown shapes are silently
+/// dropped so a broken row can't wreck the whole page.
+fn render_ordered_items(value: &Value) -> String {
+    let Some(items) = value.get("orderedItem").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let rendered: Vec<String> = items
+        .iter()
+        .filter_map(|item| {
+            let name = item
+                .get("orderedItem")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .or_else(|| item.get("name").and_then(|n| n.as_str()))?;
+            let qty = item
+                .get("orderQuantity")
+                .and_then(|q| q.as_u64())
+                .filter(|q| *q > 1);
+            let qty_html = qty
+                .map(|q| format!(" <span class=\"muted\">x{q}</span>"))
+                .unwrap_or_default();
+            Some(format!("<li>{}{qty_html}</li>", esc(name)))
+        })
+        .collect();
+    if rendered.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<h2>Items</h2><ul class=\"items\">{}</ul>",
+        rendered.join("")
+    )
 }
 
 async fn list_subscriptions(
@@ -1878,7 +1969,7 @@ async fn list_subscriptions(
         return Ok(Html(page(
             &state,
             "Subscriptions",
-            &format!("{bar}<div class=\"empty\">no subscriptions</div>"),
+            &format!("{bar}{}", empty_message("subscriptions", &query)),
         )));
     }
     let body = format!(
@@ -1957,6 +2048,16 @@ fn parse_iso_duration_days(iso: &str) -> Option<u32> {
 /// Format a subscription/bill/receipt `price` field as `"1.59 GBP"`.
 /// Renders `"free"` when the price parses as exactly zero, and an empty
 /// string when the payload has no numeric price at all.
+/// Whether a `deliveryStatus` string represents a terminal outcome
+/// (delivered or returned). Matches the schema.org spellings the
+/// parcels sink treats as final in [`crate::targets::parcels`].
+fn is_terminal_parcel_status(status: &str) -> bool {
+    matches!(
+        status,
+        "OrderDelivered" | "Delivered" | "OrderReturned" | "Returned" | "ReturnedToSender"
+    )
+}
+
 /// The `seen_at` timestamp of the last history entry on a parcel
 /// record, if any. Records filed before `receivedAt` stamping was
 /// added carry only this pipeline timestamp; the parcel list uses it
@@ -2117,6 +2218,19 @@ async fn list_reservations(
         let date_raw = reservation_date(&value).unwrap_or_default();
         let sort_date = parse_any_date(&date_raw);
         let route = reservation_route(&value).unwrap_or_default();
+        // Flights, trains and coaches have a meaningful time-of-day
+        // component (departure at 17:10); hotel check-ins and event
+        // start dates don't need one.
+        let for_kind = value
+            .get("reservationFor")
+            .and_then(|f| f.get("@type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        let date_display = if matches!(for_kind, "Flight" | "TrainTrip" | "BusTrip") {
+            short_datetime(&date_raw)
+        } else {
+            short_date(&date_raw)
+        };
         let haystack = format!("{provider} {number} {route} {under} {date_raw}");
         if !matches_search(&query, &haystack) {
             continue;
@@ -2129,7 +2243,7 @@ async fn list_reservations(
             esc(&number),
             esc(&route),
             esc(&under),
-            esc(&short_date(&date_raw)),
+            esc(&date_display),
             links_cell(
                 &state.url(&format!("/reservations/{year}/{slug}.json")),
                 &[],
@@ -2146,7 +2260,7 @@ async fn list_reservations(
         return Ok(Html(page(
             &state,
             "Reservations",
-            &format!("{bar}<div class=\"empty\">no reservations</div>"),
+            &format!("{bar}{}", empty_message("reservations", &query)),
         )));
     }
     let total = rows.len();
@@ -2213,12 +2327,42 @@ async fn view_reservation(
     let provider = reservation_provider(&value).unwrap_or_else(|| slug.clone());
     let number = reservation_number(&value).unwrap_or_default();
     let route = reservation_route(&value);
+    let top_kind = value.get("@type").and_then(|t| t.as_str()).unwrap_or("");
+    let for_kind = value
+        .get("reservationFor")
+        .and_then(|f| f.get("@type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    // Kind-specific date labelling: hotel stays get Check-in +
+    // Check-out; flights/trains show Departure + Arrival with the
+    // time preserved (F28). Anything else falls back to a single
+    // "Date" row from reservation_date.
+    let is_lodging = top_kind == "LodgingReservation" || for_kind == "LodgingBusiness";
+    let is_journey = matches!(for_kind, "Flight" | "TrainTrip" | "BusTrip");
+    let for_val = value.get("reservationFor");
+    let checkin = pick_str(&value, &["checkinTime"]).map(|s| short_date(&s));
+    let checkout = pick_str(&value, &["checkoutTime"]).map(|s| short_date(&s));
+    let departure = for_val
+        .and_then(|f| pick_str(f, &["departureTime"]))
+        .map(|s| short_datetime(&s));
+    let arrival = for_val
+        .and_then(|f| pick_str(f, &["arrivalTime"]))
+        .map(|s| short_datetime(&s));
+    let generic_date = if is_lodging || is_journey {
+        None
+    } else {
+        reservation_date(&value).map(|s| short_date(&s))
+    };
     let fields = [
         ("Provider", Some(provider.clone())),
         ("Reference", (!number.is_empty()).then_some(number.clone())),
         ("Route", route),
         ("Passenger", value.get("underName").and_then(named)),
-        ("Date", reservation_date(&value).map(|s| short_date(&s))),
+        ("Check-in", is_lodging.then_some(checkin).flatten()),
+        ("Check-out", is_lodging.then_some(checkout).flatten()),
+        ("Departure", is_journey.then_some(departure).flatten()),
+        ("Arrival", is_journey.then_some(arrival).flatten()),
+        ("Date", generic_date),
         (
             "Received",
             pick_str(&value, &["receivedAt"]).map(|s| short_date(&s)),
@@ -2314,7 +2458,7 @@ async fn list_tickets(
         return Ok(Html(page(
             &state,
             "Tickets",
-            &format!("{bar}<div class=\"empty\">no tickets</div>"),
+            &format!("{bar}{}", empty_message("tickets", &query)),
         )));
     }
     let body = format!(
@@ -3869,6 +4013,220 @@ mod tests {
         let app = router(state_with(config, ""));
         let (_, body) = get(&app, "/all").await;
         assert!(body.contains("page 1 of 2"), "pager missing: {body}");
+    }
+
+    #[tokio::test]
+    async fn all_page_two_omits_upcoming() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("bills/2026")).unwrap();
+        // Enough recent bills to force two pages, plus one upcoming
+        // reservation so the Upcoming section would render on p1.
+        for i in 0..(PAGE_SIZE + 5) {
+            fs::write(
+                tmp.path().join(format!("bills/2026/bill-{i:03}.json")),
+                format!(
+                    r#"{{"payee":"P","invoiceNumber":"I{i:03}","dueDate":"2025-01-{:02}"}}"#,
+                    (i % 28) + 1
+                ),
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(tmp.path().join("reservations/2099")).unwrap();
+        fs::write(
+            tmp.path().join("reservations/2099/future-air-FOO.json"),
+            br#"{"@type":"FlightReservation","reservationNumber":"FOO",
+                 "reservationFor":{"@type":"Flight","airline":{"iataCode":"XX","name":"FutureAir"},
+                                    "departureTime":"2099-01-01T08:00:00Z"}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            bills_dir: Some(tmp.path().join("bills")),
+            reservations_dir: Some(tmp.path().join("reservations")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body_p1) = get(&app, "/all").await;
+        assert!(body_p1.contains("Upcoming"), "p1 should show Upcoming");
+        let (_, body_p2) = get(&app, "/all?page=2").await;
+        assert!(
+            !body_p2.contains("Upcoming"),
+            "p2 should not repeat Upcoming: {body_p2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_message_names_the_year_filter() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/bills?year=1970").await;
+        assert!(
+            body.contains("no bills in 1970"),
+            "empty message should name the year filter: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_message_names_the_search() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/bills?q=nothing-matches-this").await;
+        assert!(
+            body.contains("matching \"nothing-matches-this\""),
+            "empty message should name the search term: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hotel_view_shows_check_in_and_check_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("reservations/2026")).unwrap();
+        fs::write(
+            tmp.path().join("reservations/2026/hotel.json"),
+            br#"{"@type":"LodgingReservation","reservationNumber":"ABC123",
+                 "checkinTime":"2026-11-05T15:00:00","checkoutTime":"2026-11-08T12:00:00",
+                 "reservationFor":{"@type":"LodgingBusiness","name":"ibis Test"}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            reservations_dir: Some(tmp.path().join("reservations")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/reservations/2026/hotel/view").await;
+        assert!(
+            body.contains("<dt>Check-in</dt><dd>2026-11-05</dd>"),
+            "check-in row missing: {body}"
+        );
+        assert!(
+            body.contains("<dt>Check-out</dt><dd>2026-11-08</dd>"),
+            "check-out row missing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_view_shows_departure_and_arrival_times() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("reservations/2026")).unwrap();
+        fs::write(
+            tmp.path().join("reservations/2026/klm.json"),
+            br#"{"@type":"FlightReservation","reservationNumber":"Y9ZO6Z",
+                 "reservationFor":{"@type":"Flight",
+                     "airline":{"iataCode":"KL","name":"KLM"},
+                     "departureAirport":{"iataCode":"LHR"},
+                     "arrivalAirport":{"iataCode":"AMS"},
+                     "departureTime":"2026-09-21T17:10:00",
+                     "arrivalTime":"2026-09-21T19:30:00"}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            reservations_dir: Some(tmp.path().join("reservations")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/reservations/2026/klm/view").await;
+        assert!(
+            body.contains("<dt>Departure</dt><dd>2026-09-21 17:10</dd>"),
+            "departure with time missing: {body}"
+        );
+        assert!(
+            body.contains("<dt>Arrival</dt><dd>2026-09-21 19:30</dd>"),
+            "arrival with time missing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reservation_list_shows_time_for_flights_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("reservations/2026")).unwrap();
+        fs::write(
+            tmp.path().join("reservations/2026/klm.json"),
+            br#"{"@type":"FlightReservation","reservationNumber":"KL",
+                 "reservationFor":{"@type":"Flight","airline":{"name":"KLM"},
+                     "departureTime":"2026-09-21T17:10:00"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("reservations/2026/hotel.json"),
+            br#"{"@type":"LodgingReservation","reservationNumber":"HT",
+                 "checkinTime":"2026-11-05T15:00:00",
+                 "reservationFor":{"@type":"LodgingBusiness","name":"ibis"}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            reservations_dir: Some(tmp.path().join("reservations")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/reservations").await;
+        assert!(
+            body.contains(">2026-09-21 17:10<"),
+            "flight row should carry time: {body}"
+        );
+        assert!(
+            body.contains(">2026-11-05<") && !body.contains(">2026-11-05 15:00<"),
+            "hotel row should not carry time: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_view_lists_ordered_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("receipts/2026")).unwrap();
+        fs::write(
+            tmp.path().join("receipts/2026/amazon.json"),
+            br#"{"merchant":"Amazon","orderNumber":"O1","orderDate":"2026-01-01",
+                 "orderedItem":[
+                     {"@type":"OrderItem","orderQuantity":1,
+                      "orderedItem":{"@type":"Product","name":"Widget"}},
+                     {"@type":"OrderItem","orderQuantity":3,
+                      "orderedItem":{"@type":"Product","name":"Gizmo"}}]}"#,
+        )
+        .unwrap();
+        let config = Config {
+            receipts_dir: Some(tmp.path().join("receipts")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/receipts/2026/amazon/view").await;
+        assert!(body.contains("<h2>Items</h2>"), "items heading missing");
+        assert!(body.contains("<li>Widget"), "widget missing: {body}");
+        assert!(body.contains("<li>Gizmo"), "gizmo missing: {body}");
+        assert!(body.contains("x3"), "quantity annotation missing: {body}");
+    }
+
+    #[tokio::test]
+    async fn parcel_view_falls_back_to_history_seen_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("parcels")).unwrap();
+        fs::write(
+            tmp.path().join("parcels/X.json"),
+            br#"{"trackingNumber":"X","deliveryStatus":"OrderDelivered",
+                 "history":[{"seen_at":"2024-11-15T10:00:00Z",
+                             "deliveryStatus":"OrderDelivered"}]}"#,
+        )
+        .unwrap();
+        let config = Config {
+            parcels_dir: Some(tmp.path().join("parcels")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/parcels/X/view").await;
+        assert!(
+            body.contains("<dt>Received</dt><dd>2024-11-15</dd>"),
+            "view page should fall back to history seen_at: {body}"
+        );
+    }
+
+    #[test]
+    fn short_datetime_preserves_time_and_short_date_drops_it() {
+        assert_eq!(short_datetime("2026-09-21T17:10:00"), "2026-09-21 17:10");
+        assert_eq!(short_datetime("2026-09-21T17:10:00Z"), "2026-09-21 17:10");
+        assert_eq!(
+            short_datetime("2026-09-21T17:10:00+02:00"),
+            "2026-09-21 17:10"
+        );
+        assert_eq!(short_datetime("2026-09-21"), "2026-09-21");
+        assert_eq!(short_date("2026-09-21T17:10:00"), "2026-09-21");
     }
 
     #[tokio::test]
