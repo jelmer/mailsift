@@ -526,7 +526,15 @@ fn render_feed_section(state: &AppState, title: &str, items: &[&FeedItem], limit
             kind = esc(item.kind),
             title = esc(&item.title),
             subtitle = esc(&item.subtitle),
-            links = links_cell(&state.url(&item.href), item.vendor_url.as_deref()),
+            links = links_cell(
+                &state.url(&item.href),
+                &item
+                    .blobs
+                    .iter()
+                    .map(|(label, path)| (label.clone(), state.url(path)))
+                    .collect::<Vec<_>>(),
+                item.vendor_url.as_deref(),
+            ),
         ));
     }
     format!(
@@ -567,6 +575,10 @@ struct FeedItem {
     /// Root-relative URL to the detail page; run through `state.url`
     /// before rendering.
     href: String,
+    /// Companion downloadable blobs (e.g. `("pdf",
+    /// "/bills/2026/acme.pdf")`) grouped with this entry. Rendered as
+    /// extra links after the primary JSON link.
+    blobs: Vec<(String, String)>,
 }
 
 /// Try a series of ISO-ish date formats. Accepts YYYY-MM-DD,
@@ -643,6 +655,7 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 subtitle: stem,
                 vendor_url: None,
                 href: format!("/events/{name}"),
+                blobs: Vec::new(),
             });
         }
     }
@@ -663,6 +676,10 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
             )
             .and_then(|d| parse_any_date(&d))
             .unwrap_or_else(|| mtime_date(&dir.join(&year).join(format!("{slug}.json"))));
+            let blobs = sibling_blobs(dir, &year, &slug)
+                .into_iter()
+                .map(|(label, name)| (label, format!("/bills/{year}/{name}")))
+                .collect();
             items.push(FeedItem {
                 date,
                 kind: "bill",
@@ -670,6 +687,7 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 subtitle: invoice,
                 vendor_url: vendor_url(&value),
                 href: format!("/bills/{year}/{slug}.json"),
+                blobs,
             });
         }
     }
@@ -696,6 +714,7 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 subtitle: status,
                 vendor_url: vendor_url(&value),
                 href: format!("/parcels/{name}"),
+                blobs: Vec::new(),
             });
         }
     }
@@ -707,6 +726,10 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
             let date = pick_str(&value, &["receivedAt", "orderDate", "date"])
                 .and_then(|d| parse_any_date(&d))
                 .unwrap_or_else(|| mtime_date(&dir.join(&year).join(format!("{slug}.json"))));
+            let blobs = sibling_blobs(dir, &year, &slug)
+                .into_iter()
+                .map(|(label, name)| (label, format!("/receipts/{year}/{name}")))
+                .collect();
             items.push(FeedItem {
                 date,
                 kind: "receipt",
@@ -714,6 +737,7 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 subtitle: order,
                 vendor_url: vendor_url(&value),
                 href: format!("/receipts/{year}/{slug}.json"),
+                blobs,
             });
         }
     }
@@ -734,6 +758,7 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 subtitle: renewal.unwrap_or_default(),
                 vendor_url: vendor_url(&value),
                 href: format!("/subscriptions/{name}"),
+                blobs: Vec::new(),
             });
         }
     }
@@ -750,37 +775,30 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 subtitle: reservation_number(&value).unwrap_or_default(),
                 vendor_url: vendor_url(&value),
                 href: format!("/reservations/{year}/{slug}.json"),
+                blobs: Vec::new(),
             });
         }
     }
 
     if let Some(dir) = state.tickets_dir() {
-        for entry in read_dir_or_empty(dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let year = entry.file_name().to_string_lossy().into_owned();
+        for (year, group) in group_ticket_files(dir)? {
             let year_num: i32 = year.parse().unwrap_or(0);
-            for inner in fs::read_dir(entry.path())? {
-                let inner = inner?;
-                if !inner.file_type()?.is_file() {
-                    continue;
-                }
-                let name = inner.file_name().to_string_lossy().into_owned();
-                // Tickets don't carry their own date; use file mtime,
-                // falling back to Jan 1 of the year dir if we can't
-                // stat.
-                let date = mtime_date_opt(&inner.path())
+            for (slug, files) in group {
+                let date = files
+                    .iter()
+                    .filter_map(|f| mtime_date_opt(&f.path))
+                    .max()
                     .or_else(|| NaiveDate::from_ymd_opt(year_num, 1, 1))
                     .unwrap_or_else(|| Utc::now().date_naive());
+                let (href, blobs) = ticket_links(&year, &files);
                 items.push(FeedItem {
                     date,
                     kind: "ticket",
-                    title: name.clone(),
+                    title: slug,
                     subtitle: year.clone(),
                     vendor_url: None,
-                    href: format!("/tickets/{year}/{name}"),
+                    href,
+                    blobs,
                 });
             }
         }
@@ -1018,6 +1036,10 @@ async fn list_bills(State(state): State<Arc<AppState>>) -> Result<Html<String>, 
             .unwrap_or_default();
         let href = state.url(&format!("/bills/{}/{}.json", year, slug));
         let vendor = vendor_url(&value);
+        let blobs: Vec<(String, String)> = sibling_blobs(dir, &year, &slug)
+            .into_iter()
+            .map(|(label, name)| (label, state.url(&format!("/bills/{year}/{name}"))))
+            .collect();
         // Records with no date in the payload fall back to the shard
         // year, which is then the only date they carry.
         let due = due.unwrap_or_else(|| year.clone());
@@ -1027,7 +1049,7 @@ async fn list_bills(State(state): State<Arc<AppState>>) -> Result<Html<String>, 
             esc(&invoice.unwrap_or_default()),
             esc(&due),
             esc(&amount),
-            links_cell(&href, vendor.as_deref()),
+            links_cell(&href, &blobs, vendor.as_deref()),
         );
         rows.push((year, slug, cells));
     }
@@ -1055,7 +1077,7 @@ async fn get_bill(
     UrlPath((year, name)): UrlPath<(String, String)>,
 ) -> Result<Response, AppError> {
     let dir = require_dir(state.bills_dir(), "bills")?;
-    serve_json_file(dir, &year, &name)
+    serve_shard_file(dir, &year, &name)
 }
 
 async fn list_parcels(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
@@ -1079,7 +1101,11 @@ async fn list_parcels(State(state): State<Arc<AppState>>) -> Result<Html<String>
             esc(&carrier),
             esc(&status),
             esc(&eta),
-            links_cell(&state.url(&format!("/parcels/{name}")), vendor.as_deref()),
+            links_cell(
+                &state.url(&format!("/parcels/{name}")),
+                &[],
+                vendor.as_deref()
+            ),
         );
         rows.push((name, cells));
     }
@@ -1128,6 +1154,10 @@ async fn list_receipts(State(state): State<Arc<AppState>>) -> Result<Html<String
         let order = pick_str(&value, &["orderNumber", "identifier"]).unwrap_or_default();
         let date = pick_str(&value, &["orderDate", "date"]).unwrap_or_else(|| year.clone());
         let vendor = vendor_url(&value);
+        let blobs: Vec<(String, String)> = sibling_blobs(dir, &year, &slug)
+            .into_iter()
+            .map(|(label, name)| (label, state.url(&format!("/receipts/{year}/{name}"))))
+            .collect();
         let cells = format!(
             "<td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
             esc(&merchant),
@@ -1135,6 +1165,7 @@ async fn list_receipts(State(state): State<Arc<AppState>>) -> Result<Html<String
             esc(&date),
             links_cell(
                 &state.url(&format!("/receipts/{year}/{slug}.json")),
+                &blobs,
                 vendor.as_deref(),
             ),
         );
@@ -1164,7 +1195,7 @@ async fn get_receipt(
     UrlPath((year, name)): UrlPath<(String, String)>,
 ) -> Result<Response, AppError> {
     let dir = require_dir(state.receipts_dir(), "receipts")?;
-    serve_json_file(dir, &year, &name)
+    serve_shard_file(dir, &year, &name)
 }
 
 async fn list_subscriptions(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
@@ -1185,6 +1216,7 @@ async fn list_subscriptions(State(state): State<Arc<AppState>>) -> Result<Html<S
             esc(&price),
             links_cell(
                 &state.url(&format!("/subscriptions/{name}")),
+                &[],
                 vendor.as_deref(),
             ),
         );
@@ -1280,6 +1312,7 @@ async fn list_reservations(State(state): State<Arc<AppState>>) -> Result<Html<St
             esc(&date),
             links_cell(
                 &state.url(&format!("/reservations/{year}/{slug}.json")),
+                &[],
                 vendor_url(&value).as_deref(),
             ),
         );
@@ -1309,40 +1342,41 @@ async fn get_reservation(
     UrlPath((year, name)): UrlPath<(String, String)>,
 ) -> Result<Response, AppError> {
     let dir = require_dir(state.reservations_dir(), "reservations")?;
-    serve_json_file(dir, &year, &name)
+    serve_shard_file(dir, &year, &name)
 }
 
 async fn list_tickets(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.tickets_dir(), "tickets")?;
     let mut rows: Vec<(String, String, String)> = Vec::new();
-    for entry in read_dir_or_empty(dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let year = entry.file_name().to_string_lossy().into_owned();
-        for inner in fs::read_dir(entry.path())? {
-            let inner = inner?;
-            if !inner.file_type()?.is_file() {
-                continue;
-            }
-            let name = inner.file_name().to_string_lossy().into_owned();
-            let size = inner.metadata().map(|m| m.len()).unwrap_or(0);
-            let ext = inner
-                .path()
-                .extension()
-                .map(|e| e.to_string_lossy().into_owned())
-                .unwrap_or_default();
+    for (year, group) in group_ticket_files(dir)? {
+        for (slug, files) in group {
+            let size: u64 = files.iter().map(|f| f.size).sum();
+            let types = files
+                .iter()
+                .map(|f| f.label().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let downloads = files
+                .iter()
+                .map(|f| {
+                    format!(
+                        "<a href=\"{}\">{}</a>",
+                        esc(&state.url(&format!("/tickets/{year}/{}", f.name))),
+                        esc(f.label()),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" &middot; ");
             let cells = format!(
                 "<td>{}</td><td><span class=\"badge\">{}</span></td><td>{}</td><td>{}</td>\
-                 <td><a href=\"{}\">download</a></td>",
+                 <td>{}</td>",
                 esc(&year),
-                esc(&ext),
-                esc(&name),
+                esc(&types),
+                esc(&slug),
                 human_size(size),
-                esc(&state.url(&format!("/tickets/{year}/{name}"))),
+                downloads,
             );
-            rows.push((year.clone(), name, cells));
+            rows.push((year.clone(), slug, cells));
         }
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -1364,6 +1398,112 @@ async fn list_tickets(State(state): State<Arc<AppState>>) -> Result<Html<String>
     Ok(Html(page(&state, "Tickets", &body)))
 }
 
+/// One file that belongs to a ticket group under a `<year>/` shard.
+struct TicketFile {
+    /// Filename as stored on disk.
+    name: String,
+    /// Full path, kept so callers can read mtime without going back to
+    /// the directory.
+    path: PathBuf,
+    /// File size in bytes.
+    size: u64,
+    /// True when the filename is `<slug>.meta.json`, the metadata
+    /// sidecar written beside each ticket blob.
+    is_meta: bool,
+}
+
+impl TicketFile {
+    /// Short label used in the type column ("json" for the sidecar,
+    /// otherwise the file extension lowercased, e.g. "pdf", "pkpass").
+    fn label(&self) -> &str {
+        if self.is_meta {
+            "json"
+        } else {
+            Path::new(&self.name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+        }
+    }
+}
+
+/// Ticket slug for a filename in a year shard: `<slug>.meta.json` maps
+/// to `<slug>`, other extensions map to `<file_stem>`. Returns `None`
+/// for files without a usable extension.
+fn ticket_slug(name: &str) -> Option<(String, bool)> {
+    if let Some(stem) = name.strip_suffix(".meta.json") {
+        return Some((stem.to_string(), true));
+    }
+    let (stem, _ext) = name.rsplit_once('.')?;
+    Some((stem.to_string(), false))
+}
+
+/// `(slug, files_for_that_slug)`: one entry per ticket group within a
+/// year shard.
+type TicketSlugGroup = (String, Vec<TicketFile>);
+
+/// `(year, groups_in_that_year)`: one entry per `<year>/` shard.
+type TicketYearGroup = (String, Vec<TicketSlugGroup>);
+
+/// Walk `<tickets_dir>/<year>/*`, grouping files by slug. Returns a
+/// deterministic order: years descending, slugs ascending, and within
+/// each slug the metadata sidecar (if any) first followed by blobs
+/// sorted by extension.
+fn group_ticket_files(dir: &Path) -> Result<Vec<TicketYearGroup>> {
+    let mut years: Vec<TicketYearGroup> = Vec::new();
+    for entry in read_dir_or_empty(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let year = entry.file_name().to_string_lossy().into_owned();
+        let mut by_slug: std::collections::BTreeMap<String, Vec<TicketFile>> =
+            std::collections::BTreeMap::new();
+        for inner in fs::read_dir(entry.path())? {
+            let inner = inner?;
+            if !inner.file_type()?.is_file() {
+                continue;
+            }
+            let name = inner.file_name().to_string_lossy().into_owned();
+            let Some((slug, is_meta)) = ticket_slug(&name) else {
+                continue;
+            };
+            let size = inner.metadata().map(|m| m.len()).unwrap_or(0);
+            by_slug.entry(slug).or_default().push(TicketFile {
+                name,
+                path: inner.path(),
+                size,
+                is_meta,
+            });
+        }
+        let mut group: Vec<TicketSlugGroup> = by_slug.into_iter().collect();
+        for (_, files) in &mut group {
+            files.sort_by(|a, b| b.is_meta.cmp(&a.is_meta).then(a.name.cmp(&b.name)));
+        }
+        years.push((year, group));
+    }
+    years.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(years)
+}
+
+/// Compute `(primary_href, blob_links)` for a ticket group. The
+/// primary link is the metadata sidecar when present, else the first
+/// blob; remaining files become extra links.
+fn ticket_links(year: &str, files: &[TicketFile]) -> (String, Vec<(String, String)>) {
+    let primary = files
+        .iter()
+        .find(|f| f.is_meta)
+        .or_else(|| files.first())
+        .expect("group_ticket_files never emits empty groups");
+    let primary_href = format!("/tickets/{year}/{}", primary.name);
+    let blobs = files
+        .iter()
+        .filter(|f| f.name != primary.name)
+        .map(|f| (f.label().to_string(), format!("/tickets/{year}/{}", f.name)))
+        .collect();
+    (primary_href, blobs)
+}
+
 async fn get_ticket(
     State(state): State<Arc<AppState>>,
     UrlPath((year, name)): UrlPath<(String, String)>,
@@ -1383,6 +1523,7 @@ fn content_type_for(name: &str) -> &'static str {
         .and_then(|e| e.to_str())
         .unwrap_or("");
     match ext.to_ascii_lowercase().as_str() {
+        "json" => "application/json",
         "pdf" => "application/pdf",
         "pkpass" => "application/vnd.apple.pkpass",
         "png" => "image/png",
@@ -1652,19 +1793,17 @@ fn read_json(path: &Path) -> Result<Value> {
     serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))
 }
 
-fn serve_json_file(dir: &Path, year: &str, name: &str) -> Result<Response, AppError> {
+/// Serve `<dir>/<year>/<name>`, picking the response content-type from
+/// the filename extension. JSON records and their companion blobs
+/// (e.g. `<slug>.pdf` beside `<slug>.json`) live in the same shard and
+/// share this handler.
+fn serve_shard_file(dir: &Path, year: &str, name: &str) -> Result<Response, AppError> {
     let year = safe_segment(year)?;
     let name = safe_segment(name)?;
     let path = dir.join(year).join(name);
     let body = fs::read(&path).map_err(|e| read_status(&path, e))?;
-    Ok((
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        )],
-        body,
-    )
-        .into_response())
+    let ct = content_type_for(name);
+    Ok(([(header::CONTENT_TYPE, HeaderValue::from_static(ct))], body).into_response())
 }
 
 /// Try a series of keys and return the first non-empty string value.
@@ -1720,17 +1859,48 @@ fn is_safe_http_url(s: &str) -> bool {
 }
 
 /// Render a "links" cell for a list row: always a link to the raw
-/// JSON, plus an optional "open" link to the artifact's vendor URL.
-/// `open` links carry `rel=\"noopener noreferrer\"` since they leave
-/// our origin.
-fn links_cell(json_href: &str, vendor: Option<&str>) -> String {
+/// JSON, then optional companion-blob links (e.g. a sibling `.pdf`),
+/// then an optional "open" link to the artifact's vendor URL. `open`
+/// links carry `rel=\"noopener noreferrer\"` since they leave our
+/// origin.
+fn links_cell(json_href: &str, blobs: &[(String, String)], vendor: Option<&str>) -> String {
     let mut out = format!("<a href=\"{}\">json</a>", esc(json_href));
+    for (label, href) in blobs {
+        out.push_str(&format!(
+            " &middot; <a href=\"{}\">{}</a>",
+            esc(href),
+            esc(label),
+        ));
+    }
     if let Some(url) = vendor {
         out.push_str(&format!(
             " &middot; <a href=\"{}\" rel=\"noopener noreferrer\">open</a>",
             esc(url),
         ));
     }
+    out
+}
+
+/// Companion blobs that live beside a `<year>/<slug>.json` artifact.
+/// Returns `(label, filename)` pairs sorted for stable rendering. The
+/// label is the lowercased extension (`"pdf"`, `"pkpass"`, ...).
+fn sibling_blobs(dir: &Path, year: &str, slug: &str) -> Vec<(String, String)> {
+    let year_dir = dir.join(year);
+    let mut out: Vec<(String, String)> = Vec::new();
+    let Ok(entries) = fs::read_dir(&year_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some((stem, ext)) = name.rsplit_once('.') else {
+            continue;
+        };
+        if stem != slug || ext.eq_ignore_ascii_case("json") {
+            continue;
+        }
+        out.push((ext.to_ascii_lowercase(), name));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
 
@@ -1992,6 +2162,125 @@ mod tests {
         assert!(
             body.contains("rel=\"noopener noreferrer\""),
             "external link rel missing"
+        );
+    }
+
+    #[test]
+    fn ticket_slug_strips_meta_json_suffix() {
+        assert_eq!(
+            ticket_slug("boarding-pass.meta.json"),
+            Some(("boarding-pass".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn ticket_slug_strips_single_extension_for_blobs() {
+        assert_eq!(
+            ticket_slug("boarding-pass.pdf"),
+            Some(("boarding-pass".to_string(), false))
+        );
+        assert_eq!(
+            ticket_slug("pass.pkpass"),
+            Some(("pass".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn ticket_slug_declines_extensionless_names() {
+        assert_eq!(ticket_slug("no-extension"), None);
+    }
+
+    #[tokio::test]
+    async fn ticket_row_groups_meta_json_and_blob() {
+        // A ticket blob (`.pdf`) and its `.meta.json` sidecar share a
+        // slug and should render as one row with both download links.
+        let tmp = tempfile::tempdir().unwrap();
+        let year = tmp.path().join("tickets/2026");
+        fs::create_dir_all(&year).unwrap();
+        fs::write(year.join("easyjet-ezy2521.pdf"), b"%PDF-1.4\n").unwrap();
+        fs::write(
+            year.join("easyjet-ezy2521.meta.json"),
+            br#"{"slug":"easyjet-ezy2521","file":"easyjet-ezy2521.pdf"}"#,
+        )
+        .unwrap();
+        let config = Config {
+            tickets_dir: Some(tmp.path().join("tickets")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/tickets").await;
+        assert_eq!(status, StatusCode::OK);
+        let tbody = body
+            .split("<tbody>")
+            .nth(1)
+            .and_then(|s| s.split("</tbody>").next())
+            .expect("no tbody in response");
+        // Exactly one row per ticket group.
+        assert_eq!(
+            tbody.matches("<tr>").count(),
+            1,
+            "expected 1 body row: {tbody}"
+        );
+        // Both links present on that row.
+        assert!(
+            body.contains("/tickets/2026/easyjet-ezy2521.meta.json"),
+            "meta.json link missing: {body}"
+        );
+        assert!(
+            body.contains("/tickets/2026/easyjet-ezy2521.pdf"),
+            "pdf link missing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bill_row_shows_sibling_pdf_link() {
+        let (tmp, mut config) = fixture();
+        // Fixture already wrote `bills/2026/acme-INV1.json`; add a
+        // sibling PDF blob and check the row surfaces it.
+        fs::write(tmp.path().join("bills/2026/acme-INV1.pdf"), b"%PDF-1.4\n").unwrap();
+        config.bills_dir = Some(tmp.path().join("bills"));
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/bills").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("/bills/2026/acme-INV1.json"),
+            "json link missing: {body}"
+        );
+        assert!(
+            body.contains("/bills/2026/acme-INV1.pdf"),
+            "pdf link missing: {body}"
+        );
+        // The row should still be one row.
+        let tbody = body
+            .split("<tbody>")
+            .nth(1)
+            .and_then(|s| s.split("</tbody>").next())
+            .unwrap_or("");
+        assert_eq!(tbody.matches("<tr>").count(), 1, "expected 1 row: {tbody}");
+    }
+
+    #[tokio::test]
+    async fn bill_pdf_served_as_pdf_content_type() {
+        let (tmp, mut config) = fixture();
+        fs::write(tmp.path().join("bills/2026/acme-INV1.pdf"), b"%PDF-1.4\n").unwrap();
+        config.bills_dir = Some(tmp.path().join("bills"));
+        let app = router(state_with(config, ""));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/bills/2026/acme-INV1.pdf")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/pdf")
         );
     }
 
