@@ -40,6 +40,7 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "t
 libc = "0.2"
 libgssapi = { version = "0.11", optional = true }
 mailparse = "0.16.1"
+notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 percent-encoding = "2"
 quick-xml = "0.36"
 regex = "1"
