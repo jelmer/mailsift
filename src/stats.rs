@@ -283,9 +283,13 @@ pub struct ExtractorStats {
     pub skipped_dkim: u64,
     /// Mean wall-clock runtime in milliseconds across runs that
     /// actually forked the extractor (`produced + empty + failed`).
-    /// `None` when there were no such runs.
+    /// `None` when there were no such runs; skipped in JSON so
+    /// consumers don't need to special-case `null` alongside a
+    /// numeric value.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mean_duration_ms: Option<f64>,
     /// Last (most recent) `ts` we saw for this extractor.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_ts: Option<i64>,
     /// Up to N most recent distinct `From:` domains for this
     /// extractor, oldest-first. Bounded to keep the table compact.

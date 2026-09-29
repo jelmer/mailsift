@@ -609,14 +609,29 @@ fn render_feed_sections(
 fn render_feed_section(state: &AppState, title: &str, items: &[&FeedItem], limit: usize) -> String {
     let mut rows = String::new();
     for item in items.iter().take(limit) {
+        // Kinds with a `/view` HTML page get a clickable title so the
+        // feed row acts like a list-page row; events (no view page)
+        // fall back to plain text.
+        let title_html = if let Some(v) = &item.view_href {
+            format!(
+                "<a href=\"{}\">{}</a>",
+                esc(&state.url(v)),
+                esc(&item.title)
+            )
+        } else {
+            esc(&item.title)
+        };
+        let date_cell = item
+            .date_display
+            .clone()
+            .unwrap_or_else(|| item.date.to_string());
         rows.push_str(&format!(
             "<tr><td>{date}</td><td><span class=\"badge {kind_class}\">{kind}</span></td>\
-             <td>{title}</td><td class=\"muted\">{subtitle}</td>\
+             <td>{title_html}</td><td class=\"muted\">{subtitle}</td>\
              <td>{links}</td></tr>",
-            date = esc(&item.date.to_string()),
+            date = esc(&date_cell),
             kind_class = esc(item.kind),
             kind = esc(item.kind),
-            title = esc(&item.title),
             subtitle = esc(&item.subtitle),
             links = links_cell(
                 &state.url(&item.href),
@@ -639,19 +654,33 @@ fn render_feed_section(state: &AppState, title: &str, items: &[&FeedItem], limit
 
 async fn list_all(
     State(state): State<Arc<AppState>>,
-    Query(page_q): Query<PageQuery>,
+    Query(query): Query<ListQuery>,
 ) -> Result<Html<String>, AppError> {
     let feed = build_feed(&state)?;
-    let (upcoming, recent) = split_feed(&feed);
-    let body = if feed.is_empty() {
-        "<div class=\"empty\">no artifacts yet</div>".to_string()
+    // Apply the search filter across every feed row's kind + title +
+    // subtitle. Year isn't shown as a chip here since the feed spans
+    // every kind and shard scheme.
+    let filtered: Vec<FeedItem> = feed
+        .into_iter()
+        .filter(|item| {
+            matches_search(
+                &query,
+                &format!("{} {} {}", item.kind, item.title, item.subtitle),
+            )
+        })
+        .collect();
+    let (upcoming, recent) = split_feed(&filtered);
+    let base_url = state.url("/all");
+    let bar = filter_bar(&base_url, &query, &[]);
+    let body = if filtered.is_empty() {
+        format!("{bar}{}", empty_message("artifacts", &query))
     } else {
         // Upcoming renders in full on page 1 only; Recent dominates
         // the row count once you have any history, so that's what we
         // paginate. Repeating Upcoming on every page would waste a
         // section header when the user has clearly scrolled past it.
-        let mut out = String::new();
-        let on_first_page = page_q.page.unwrap_or(1) <= 1;
+        let mut out = bar;
+        let on_first_page = query.page.unwrap_or(1) <= 1;
         if on_first_page && !upcoming.is_empty() {
             out.push_str(&render_feed_section(
                 &state,
@@ -661,7 +690,7 @@ async fn list_all(
             ));
         }
         if !recent.is_empty() {
-            let (page_slice, pager) = paginate(&recent, &page_q, &state.url("/all"));
+            let (page_slice, pager) = paginate(&recent, &query, &base_url);
             out.push_str(&render_feed_section(
                 &state,
                 "Recent",
@@ -683,6 +712,10 @@ struct FeedItem {
     /// Sort key. Extracted from a per-kind field (dueDate, orderDate,
     /// DTSTART, ...) when available; falls back to file mtime.
     date: NaiveDate,
+    /// Optional display override for the date cell. Set when a kind
+    /// carries a time-of-day that matters (flights, trains); rendered
+    /// verbatim instead of `date.to_string()`.
+    date_display: Option<String>,
     /// Kind label rendered as a badge in the list.
     kind: &'static str,
     /// Free-form title (payee, merchant, event summary, ...).
@@ -691,9 +724,13 @@ struct FeedItem {
     subtitle: String,
     /// Vendor / detail URL from the artifact JSON, if present.
     vendor_url: Option<String>,
-    /// Root-relative URL to the detail page; run through `state.url`
-    /// before rendering.
+    /// Root-relative URL to the raw JSON (or the ics for events); run
+    /// through `state.url` before rendering.
     href: String,
+    /// Root-relative URL to the rendered HTML view for this record.
+    /// `None` for kinds that don't have a view page (currently just
+    /// events).
+    view_href: Option<String>,
     /// Companion downloadable blobs (e.g. `("pdf",
     /// "/bills/2026/acme.pdf")`) grouped with this entry. Rendered as
     /// extra links after the primary JSON link.
@@ -805,10 +842,6 @@ impl<'de> Deserialize<'de> for ListQuery {
         })
     }
 }
-
-/// Backwards-compatible alias so older call sites and tests keep
-/// working; the new name reflects the broader remit.
-type PageQuery = ListQuery;
 
 impl ListQuery {
     /// Serialise the non-empty fields to a URL query string prefixed
@@ -948,7 +981,15 @@ fn filter_bar(base_url: &str, query: &ListQuery, years: &[String]) -> String {
         esc(base_url),
         esc(q_value),
     ));
-    if !years.is_empty() {
+    // Always include the currently-filtered year in the chip set,
+    // even when it matches nothing on disk. Without this a
+    // `?year=1970` URL would render the bar with no active chip and
+    // the user couldn't tell what filter had eliminated every row.
+    let mut chip_years: std::collections::BTreeSet<String> = years.iter().cloned().collect();
+    if let Some(y) = &query.year {
+        chip_years.insert(y.clone());
+    }
+    if !chip_years.is_empty() {
         out.push_str("<div class=\"year-chips\">");
         // "all" chip clears the year filter but keeps any active search.
         let all_href = {
@@ -965,7 +1006,8 @@ fn filter_bar(base_url: &str, query: &ListQuery, years: &[String]) -> String {
             esc(&all_href),
             if all_active { "chip active" } else { "chip" },
         ));
-        for year in years {
+        // Descending: newest year first for readability.
+        for year in chip_years.iter().rev() {
             let href = {
                 let q = ListQuery {
                     page: None,
@@ -1052,10 +1094,12 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
             items.push(FeedItem {
                 date,
                 kind: "event",
+                date_display: None,
                 title: summary,
                 subtitle: stem,
                 vendor_url: None,
                 href: format!("/events/{name}"),
+                view_href: None,
                 blobs: Vec::new(),
             });
         }
@@ -1084,10 +1128,12 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
             items.push(FeedItem {
                 date,
                 kind: "bill",
+                date_display: None,
                 title: payee,
                 subtitle: invoice,
                 vendor_url: vendor_url(&value),
                 href: format!("/bills/{year}/{slug}.json"),
+                view_href: Some(format!("/bills/{year}/{slug}/view")),
                 blobs,
             });
         }
@@ -1111,13 +1157,16 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
             )
             .and_then(|d| parse_any_date(&d))
             .unwrap_or_else(|| mtime_date(&dir.join(&name)));
+            let slug = name.strip_suffix(".json").unwrap_or(&name).to_string();
             items.push(FeedItem {
                 date,
                 kind: "parcel",
+                date_display: None,
                 title: tracking,
                 subtitle: status,
                 vendor_url: vendor_url(&value),
                 href: format!("/parcels/{name}"),
+                view_href: Some(format!("/parcels/{slug}/view")),
                 blobs: Vec::new(),
             });
         }
@@ -1137,10 +1186,12 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
             items.push(FeedItem {
                 date,
                 kind: "receipt",
+                date_display: None,
                 title: merchant,
                 subtitle: order,
                 vendor_url: vendor_url(&value),
                 href: format!("/receipts/{year}/{slug}.json"),
+                view_href: Some(format!("/receipts/{year}/{slug}/view")),
                 blobs,
             });
         }
@@ -1155,13 +1206,16 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 .and_then(parse_any_date)
                 .or_else(|| renewal.as_deref().and_then(parse_any_date))
                 .unwrap_or_else(|| mtime_date(&dir.join(&name)));
+            let slug = name.strip_suffix(".json").unwrap_or(&name).to_string();
             items.push(FeedItem {
                 date,
                 kind: "subscription",
+                date_display: None,
                 title: display,
                 subtitle: renewal.unwrap_or_default(),
                 vendor_url: vendor_url(&value),
                 href: format!("/subscriptions/{name}"),
+                view_href: Some(format!("/subscriptions/{slug}/view")),
                 blobs: Vec::new(),
             });
         }
@@ -1169,16 +1223,33 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
 
     if let Some(dir) = state.reservations_dir() {
         for (year, slug, value) in walk_year_json(dir)? {
-            let date = reservation_date(&value)
-                .and_then(|d| parse_any_date(&d))
+            let raw_date = reservation_date(&value);
+            let date = raw_date
+                .as_deref()
+                .and_then(parse_any_date)
                 .unwrap_or_else(|| mtime_date(&dir.join(&year).join(format!("{slug}.json"))));
+            // Flights / trains / coaches carry a departure time we
+            // don't want to strip in the feed; hotels and everything
+            // else stick with the default date-only cell.
+            let for_kind = value
+                .get("reservationFor")
+                .and_then(|f| f.get("@type"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let date_display = if matches!(for_kind, "Flight" | "TrainTrip" | "BusTrip") {
+                raw_date.map(|s| short_datetime(&s))
+            } else {
+                None
+            };
             items.push(FeedItem {
                 date,
+                date_display,
                 kind: "reservation",
                 title: reservation_provider(&value).unwrap_or_default(),
                 subtitle: reservation_number(&value).unwrap_or_default(),
                 vendor_url: vendor_url(&value),
                 href: format!("/reservations/{year}/{slug}.json"),
+                view_href: Some(format!("/reservations/{year}/{slug}/view")),
                 blobs: Vec::new(),
             });
         }
@@ -1211,10 +1282,12 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 items.push(FeedItem {
                     date,
                     kind: "ticket",
+                    date_display: None,
                     title,
                     subtitle,
                     vendor_url: None,
                     href,
+                    view_href: Some(format!("/tickets/{year}/{slug}/view")),
                     blobs,
                 });
             }
@@ -1740,17 +1813,15 @@ async fn view_parcel(
         ),
         ("Received", received_display),
     ];
-    Ok(Html(page(
-        &state,
-        &tracking,
-        &detail_view(
-            "",
-            &fields,
-            &state.url(&format!("/parcels/{file}")),
-            &[],
-            vendor_url(&value).as_deref(),
-        ),
-    )))
+    let mut body = detail_view(
+        "",
+        &fields,
+        &state.url(&format!("/parcels/{file}")),
+        &[],
+        vendor_url(&value).as_deref(),
+    );
+    body.push_str(&render_parcel_history(&value));
+    Ok(Html(page(&state, &tracking, &body)))
 }
 
 async fn list_receipts(
@@ -1884,6 +1955,61 @@ async fn view_receipt(
 /// when the record has none. Each `OrderItem` shows its `orderedItem`
 /// name with the quantity in a muted tag; unknown shapes are silently
 /// dropped so a broken row can't wreck the whole page.
+/// Render a parcel's `history` array as a compact timeline, oldest
+/// first. Each entry shows the event date and the delivery status,
+/// plus any timing fields (`actualDeliveryTime`, `expectedArrivalUntil`)
+/// carried on that history row. Empty when there's no history.
+fn render_parcel_history(value: &Value) -> String {
+    let Some(history) = value.get("history").and_then(Value::as_array) else {
+        return String::new();
+    };
+    if history.is_empty() {
+        return String::new();
+    }
+    let mut rendered: Vec<(String, String)> = Vec::new();
+    for entry in history {
+        let obj = match entry.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        // Prefer receivedAt (the mail's own date) over seen_at
+        // (pipeline-run time) when both are present. Fall back to the
+        // status-carrying timestamps too so we can render a date even
+        // for older records that only carry `seen_at`.
+        let ts = obj
+            .get("receivedAt")
+            .or_else(|| obj.get("actualDeliveryTime"))
+            .or_else(|| obj.get("seen_at"))
+            .and_then(|v| v.as_str())
+            .map(short_date)
+            .unwrap_or_default();
+        let status = obj
+            .get("deliveryStatus")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if ts.is_empty() && status.is_empty() {
+            continue;
+        }
+        rendered.push((ts, status));
+    }
+    if rendered.is_empty() {
+        return String::new();
+    }
+    let items = rendered
+        .into_iter()
+        .map(|(ts, status)| {
+            format!(
+                "<li><span class=\"muted\">{}</span> {}</li>",
+                esc(&ts),
+                esc(&status)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!("<h2>Timeline</h2><ul class=\"items\">{items}</ul>")
+}
+
 fn render_ordered_items(value: &Value) -> String {
     let Some(items) = value.get("orderedItem").and_then(Value::as_array) else {
         return String::new();
@@ -2333,42 +2459,120 @@ async fn view_reservation(
         .and_then(|f| f.get("@type"))
         .and_then(|t| t.as_str())
         .unwrap_or("");
-    // Kind-specific date labelling: hotel stays get Check-in +
-    // Check-out; flights/trains show Departure + Arrival with the
-    // time preserved (F28). Anything else falls back to a single
-    // "Date" row from reservation_date.
+    // Kind-specific field ordering: hotels get Check-in / Check-out,
+    // journeys get Departure / Arrival with HH:MM, rental cars get
+    // Pickup / Dropoff, events get venue + End, food establishments
+    // get Party size. Anything else falls back to a generic Date.
     let is_lodging = top_kind == "LodgingReservation" || for_kind == "LodgingBusiness";
     let is_journey = matches!(for_kind, "Flight" | "TrainTrip" | "BusTrip");
+    let is_rental = top_kind == "RentalCarReservation";
+    let is_event = top_kind == "EventReservation" || for_kind == "Event";
+    let is_food = top_kind == "FoodEstablishmentReservation";
     let for_val = value.get("reservationFor");
-    let checkin = pick_str(&value, &["checkinTime"]).map(|s| short_date(&s));
-    let checkout = pick_str(&value, &["checkoutTime"]).map(|s| short_date(&s));
-    let departure = for_val
-        .and_then(|f| pick_str(f, &["departureTime"]))
-        .map(|s| short_datetime(&s));
-    let arrival = for_val
-        .and_then(|f| pick_str(f, &["arrivalTime"]))
-        .map(|s| short_datetime(&s));
-    let generic_date = if is_lodging || is_journey {
-        None
-    } else {
-        reservation_date(&value).map(|s| short_date(&s))
-    };
-    let fields = [
+    let mut fields: Vec<(&str, Option<String>)> = vec![
         ("Provider", Some(provider.clone())),
         ("Reference", (!number.is_empty()).then_some(number.clone())),
         ("Route", route),
         ("Passenger", value.get("underName").and_then(named)),
-        ("Check-in", is_lodging.then_some(checkin).flatten()),
-        ("Check-out", is_lodging.then_some(checkout).flatten()),
-        ("Departure", is_journey.then_some(departure).flatten()),
-        ("Arrival", is_journey.then_some(arrival).flatten()),
-        ("Date", generic_date),
-        (
-            "Received",
-            pick_str(&value, &["receivedAt"]).map(|s| short_date(&s)),
-        ),
-        ("Ticket number", pick_str(&value, &["ticketNumber"])),
     ];
+    if is_lodging {
+        fields.push((
+            "Check-in",
+            pick_str(&value, &["checkinTime"]).map(|s| short_date(&s)),
+        ));
+        fields.push((
+            "Check-out",
+            pick_str(&value, &["checkoutTime"]).map(|s| short_date(&s)),
+        ));
+    }
+    if is_journey {
+        fields.push((
+            "Departure",
+            for_val
+                .and_then(|f| pick_str(f, &["departureTime"]))
+                .map(|s| short_datetime(&s)),
+        ));
+        fields.push((
+            "Arrival",
+            for_val
+                .and_then(|f| pick_str(f, &["arrivalTime"]))
+                .map(|s| short_datetime(&s)),
+        ));
+    }
+    if is_rental {
+        fields.push((
+            "Pickup",
+            pick_str(&value, &["pickupTime"]).map(|s| short_datetime(&s)),
+        ));
+        fields.push((
+            "Pickup location",
+            value.get("pickupLocation").and_then(named),
+        ));
+        fields.push((
+            "Dropoff",
+            pick_str(&value, &["dropoffTime"]).map(|s| short_datetime(&s)),
+        ));
+        fields.push((
+            "Dropoff location",
+            value.get("dropoffLocation").and_then(named),
+        ));
+        fields.push(("Vehicle", for_val.and_then(named)));
+    }
+    if is_event {
+        fields.push((
+            "Starts",
+            for_val
+                .and_then(|f| pick_str(f, &["startDate"]))
+                .map(|s| short_datetime(&s)),
+        ));
+        fields.push((
+            "Ends",
+            for_val
+                .and_then(|f| pick_str(f, &["endDate"]))
+                .map(|s| short_datetime(&s)),
+        ));
+        fields.push((
+            "Venue",
+            for_val.and_then(|f| f.get("location")).and_then(named),
+        ));
+        fields.push((
+            "Address",
+            for_val
+                .and_then(|f| f.get("location"))
+                .and_then(|l| l.get("address"))
+                .and_then(format_address),
+        ));
+    }
+    if is_food {
+        fields.push((
+            "Starts",
+            for_val
+                .and_then(|_| pick_str(&value, &["startTime"]))
+                .map(|s| short_datetime(&s)),
+        ));
+        fields.push(("Venue", for_val.and_then(named)));
+        fields.push((
+            "Address",
+            for_val
+                .and_then(|f| f.get("address"))
+                .and_then(format_address),
+        ));
+        fields.push((
+            "Party size",
+            value
+                .get("partySize")
+                .and_then(|v| v.as_u64())
+                .map(|n| n.to_string()),
+        ));
+    }
+    if !(is_lodging || is_journey || is_rental || is_event || is_food) {
+        fields.push(("Date", reservation_date(&value).map(|s| short_date(&s))));
+    }
+    fields.push((
+        "Received",
+        pick_str(&value, &["receivedAt"]).map(|s| short_date(&s)),
+    ));
+    fields.push(("Ticket number", pick_str(&value, &["ticketNumber"])));
     Ok(Html(page(
         &state,
         &provider,
@@ -2380,6 +2584,31 @@ async fn view_reservation(
             vendor_url(&value).as_deref(),
         ),
     )))
+}
+
+/// Render a schema.org `PostalAddress` (or a bare address string) as
+/// a comma-joined one-liner. Empty result comes back as `None` so
+/// `detail_view` can skip the row.
+fn format_address(value: &Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        let s = s.trim();
+        return (!s.is_empty()).then(|| s.to_string());
+    }
+    let obj = value.as_object()?;
+    let parts: Vec<String> = [
+        "streetAddress",
+        "addressLocality",
+        "addressRegion",
+        "postalCode",
+        "addressCountry",
+    ]
+    .iter()
+    .filter_map(|k| obj.get(*k).and_then(|v| v.as_str()))
+    .map(|s| s.trim())
+    .filter(|s| !s.is_empty())
+    .map(str::to_owned)
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 async fn list_tickets(
@@ -2675,10 +2904,15 @@ fn content_type_for(name: &str) -> &'static str {
     }
 }
 
-async fn api_bills(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
+async fn api_bills(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Value>, AppError> {
     let dir = require_dir(state.bills_dir(), "bills")?;
     let items: Vec<Value> = walk_year_json(dir)?
         .into_iter()
+        .filter(|(year, _, _)| query.year.as_deref().is_none_or(|y| year == y))
+        .filter(|(_, _, v)| matches_search(&query, &json_haystack(v)))
         .map(|(year, slug, mut v)| {
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("_year".into(), Value::String(year));
@@ -2690,16 +2924,28 @@ async fn api_bills(State(state): State<Arc<AppState>>) -> Result<Json<Value>, Ap
     Ok(Json(Value::Array(items)))
 }
 
-async fn api_parcels(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
+async fn api_parcels(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Value>, AppError> {
     let dir = require_dir(state.parcels_dir(), "parcels")?;
-    let items: Vec<Value> = walk_flat_json(dir)?.into_iter().map(|(_, v)| v).collect();
+    let items: Vec<Value> = walk_flat_json(dir)?
+        .into_iter()
+        .filter(|(_, v)| matches_search(&query, &json_haystack(v)))
+        .map(|(_, v)| v)
+        .collect();
     Ok(Json(Value::Array(items)))
 }
 
-async fn api_receipts(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
+async fn api_receipts(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Value>, AppError> {
     let dir = require_dir(state.receipts_dir(), "receipts")?;
     let items: Vec<Value> = walk_year_json(dir)?
         .into_iter()
+        .filter(|(year, _, _)| query.year.as_deref().is_none_or(|y| year == y))
+        .filter(|(_, _, v)| matches_search(&query, &json_haystack(v)))
         .map(|(year, slug, mut v)| {
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("_year".into(), Value::String(year));
@@ -2711,16 +2957,28 @@ async fn api_receipts(State(state): State<Arc<AppState>>) -> Result<Json<Value>,
     Ok(Json(Value::Array(items)))
 }
 
-async fn api_subscriptions(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
+async fn api_subscriptions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Value>, AppError> {
     let dir = require_dir(state.subscriptions_dir(), "subscriptions")?;
-    let items: Vec<Value> = walk_flat_json(dir)?.into_iter().map(|(_, v)| v).collect();
+    let items: Vec<Value> = walk_flat_json(dir)?
+        .into_iter()
+        .filter(|(_, v)| matches_search(&query, &json_haystack(v)))
+        .map(|(_, v)| v)
+        .collect();
     Ok(Json(Value::Array(items)))
 }
 
-async fn api_reservations(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
+async fn api_reservations(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Value>, AppError> {
     let dir = require_dir(state.reservations_dir(), "reservations")?;
     let items: Vec<Value> = walk_year_json(dir)?
         .into_iter()
+        .filter(|(year, _, _)| query.year.as_deref().is_none_or(|y| year == y))
+        .filter(|(_, _, v)| matches_search(&query, &json_haystack(v)))
         .map(|(year, slug, mut v)| {
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("_year".into(), Value::String(year));
@@ -2730,6 +2988,28 @@ async fn api_reservations(State(state): State<Arc<AppState>>) -> Result<Json<Val
         })
         .collect();
     Ok(Json(Value::Array(items)))
+}
+
+/// Flatten every string leaf of `value` into a single space-separated
+/// haystack. Used by the API filters so `?q=foo` matches anywhere in
+/// the record without needing per-kind field lists.
+fn json_haystack(value: &Value) -> String {
+    fn walk(v: &Value, out: &mut String) {
+        match v {
+            Value::String(s) => {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(s);
+            }
+            Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
+            Value::Object(o) => o.values().for_each(|v| walk(v, out)),
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    walk(value, &mut out);
+    out
 }
 
 /// Per-extractor stats table, aggregated on request from
@@ -4227,6 +4507,274 @@ mod tests {
         );
         assert_eq!(short_datetime("2026-09-21"), "2026-09-21");
         assert_eq!(short_date("2026-09-21T17:10:00"), "2026-09-21");
+    }
+
+    #[tokio::test]
+    async fn feed_title_links_to_view_page() {
+        // The fixture bill should render in the /all feed with its
+        // title wrapped in an <a href=".../view">.
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/all").await;
+        assert!(
+            body.contains("/bills/2026/acme-INV1/view"),
+            "feed row should link to view page: {body}"
+        );
+        assert!(
+            body.contains("<a href=\"/bills/2026/acme-INV1/view\">Acme</a>"),
+            "title should be the anchor text: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn feed_flight_row_shows_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("reservations/2099")).unwrap();
+        fs::write(
+            tmp.path().join("reservations/2099/klm.json"),
+            br#"{"@type":"FlightReservation","reservationNumber":"KL",
+                 "reservationFor":{"@type":"Flight","airline":{"name":"KLM"},
+                     "departureTime":"2099-09-21T17:10:00"}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            reservations_dir: Some(tmp.path().join("reservations")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/all").await;
+        assert!(
+            body.contains(">2099-09-21 17:10<"),
+            "feed flight row should render time: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_year_chip_still_renders_active() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/bills?year=1970").await;
+        // The 1970 chip should be present and marked active.
+        assert!(
+            body.contains("class=\"chip active\">1970</a>"),
+            "1970 chip should render as active: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_bills_respects_year_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("bills/2025")).unwrap();
+        fs::create_dir_all(tmp.path().join("bills/2026")).unwrap();
+        fs::write(
+            tmp.path().join("bills/2025/old.json"),
+            br#"{"payee":"OldCo","invoiceNumber":"O1","dueDate":"2025-01-15"}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("bills/2026/new.json"),
+            br#"{"payee":"NewCo","invoiceNumber":"N1","dueDate":"2026-03-15"}"#,
+        )
+        .unwrap();
+        let config = Config {
+            bills_dir: Some(tmp.path().join("bills")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/api/bills.json?year=2025").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "expected 1 result: {parsed}");
+        assert_eq!(arr[0]["payee"], "OldCo");
+    }
+
+    #[tokio::test]
+    async fn api_reservations_respects_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("reservations/2026")).unwrap();
+        fs::write(
+            tmp.path().join("reservations/2026/a.json"),
+            br#"{"@type":"FlightReservation","reservationNumber":"AAA",
+                 "reservationFor":{"airline":{"name":"KLM"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("reservations/2026/b.json"),
+            br#"{"@type":"FlightReservation","reservationNumber":"BBB",
+                 "reservationFor":{"airline":{"name":"EasyJet"}}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            reservations_dir: Some(tmp.path().join("reservations")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/api/reservations.json?q=klm").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "expected 1 result: {parsed}");
+        assert_eq!(arr[0]["reservationNumber"], "AAA");
+    }
+
+    #[tokio::test]
+    async fn parcel_view_shows_history_timeline() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("parcels")).unwrap();
+        fs::write(
+            tmp.path().join("parcels/X.json"),
+            br#"{"trackingNumber":"X","deliveryStatus":"OrderDelivered",
+                 "history":[
+                     {"seen_at":"2024-11-10T10:00:00Z","deliveryStatus":"OnItsWay"},
+                     {"seen_at":"2024-11-14T09:00:00Z","deliveryStatus":"OutForDelivery"},
+                     {"seen_at":"2024-11-14T15:00:00Z","deliveryStatus":"OrderDelivered"}
+                 ]}"#,
+        )
+        .unwrap();
+        let config = Config {
+            parcels_dir: Some(tmp.path().join("parcels")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/parcels/X/view").await;
+        assert!(body.contains("<h2>Timeline</h2>"), "timeline missing");
+        assert!(body.contains("OnItsWay"), "in-transit missing");
+        assert!(body.contains("OutForDelivery"), "OFD missing");
+        assert!(body.contains("OrderDelivered"), "delivered missing");
+    }
+
+    #[tokio::test]
+    async fn rental_car_view_shows_pickup_and_dropoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("reservations/2026")).unwrap();
+        fs::write(
+            tmp.path().join("reservations/2026/car.json"),
+            br#"{"@type":"RentalCarReservation","reservationNumber":"H1",
+                 "pickupTime":"2026-05-01T10:00:00","dropoffTime":"2026-05-04T17:00:00",
+                 "pickupLocation":{"name":"Oslo Airport"},
+                 "provider":{"name":"Hertz"},
+                 "reservationFor":{"@type":"Car","name":"Compact"}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            reservations_dir: Some(tmp.path().join("reservations")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/reservations/2026/car/view").await;
+        assert!(
+            body.contains("<dt>Pickup</dt><dd>2026-05-01 10:00</dd>"),
+            "pickup missing: {body}"
+        );
+        assert!(
+            body.contains("<dt>Pickup location</dt><dd>Oslo Airport</dd>"),
+            "pickup loc missing: {body}"
+        );
+        assert!(
+            body.contains("<dt>Dropoff</dt><dd>2026-05-04 17:00</dd>"),
+            "dropoff missing: {body}"
+        );
+        assert!(
+            body.contains("<dt>Vehicle</dt><dd>Compact</dd>"),
+            "vehicle missing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_view_shows_venue_and_end_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("reservations/2023")).unwrap();
+        fs::write(
+            tmp.path().join("reservations/2023/meetup.json"),
+            br#"{"@type":"EventReservation","reservationNumber":"E1",
+                 "reservationFor":{"@type":"Event","name":"Data Meetup",
+                     "startDate":"2023-12-06T18:00:00",
+                     "endDate":"2023-12-06T21:00:00",
+                     "location":{"name":"4th Floor Studios",
+                         "address":{"streetAddress":"1 Test St","addressLocality":"London",
+                                    "postalCode":"E1 2BT"}}}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            reservations_dir: Some(tmp.path().join("reservations")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/reservations/2023/meetup/view").await;
+        assert!(
+            body.contains("<dt>Venue</dt><dd>4th Floor Studios</dd>"),
+            "venue missing: {body}"
+        );
+        assert!(
+            body.contains("<dt>Starts</dt><dd>2023-12-06 18:00</dd>"),
+            "start missing: {body}"
+        );
+        assert!(
+            body.contains("<dt>Ends</dt><dd>2023-12-06 21:00</dd>"),
+            "end missing: {body}"
+        );
+        assert!(
+            body.contains("1 Test St, London, E1 2BT"),
+            "address missing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restaurant_view_shows_party_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("reservations/2026")).unwrap();
+        fs::write(
+            tmp.path().join("reservations/2026/dinner.json"),
+            br#"{"@type":"FoodEstablishmentReservation","reservationNumber":"D1",
+                 "startTime":"2026-05-01T19:30:00","partySize":4,
+                 "reservationFor":{"@type":"FoodEstablishment",
+                     "name":"Botanist","address":"1 Sloane Sq"}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            reservations_dir: Some(tmp.path().join("reservations")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/reservations/2026/dinner/view").await;
+        assert!(
+            body.contains("<dt>Party size</dt><dd>4</dd>"),
+            "party size missing: {body}"
+        );
+        assert!(
+            body.contains("<dt>Venue</dt><dd>Botanist</dd>"),
+            "venue missing: {body}"
+        );
+        assert!(
+            body.contains("<dt>Starts</dt><dd>2026-05-01 19:30</dd>"),
+            "start missing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_page_supports_search() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/all?q=acme").await;
+        assert!(body.contains("Acme"), "matching row missing: {body}");
+        assert!(
+            !body.contains("Fixture Air"),
+            "non-matching row should be filtered: {body}"
+        );
+    }
+
+    #[test]
+    fn stats_api_skips_null_mean_duration() {
+        // Serialise a fresh ExtractorStats (no runs) and confirm the
+        // JSON has no `mean_duration_ms` key.
+        let stats = crate::stats::ExtractorStats {
+            name: "x".into(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&stats).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("mean_duration_ms"),
+            "null mean_duration_ms should be omitted from JSON: {v}"
+        );
     }
 
     #[tokio::test]
