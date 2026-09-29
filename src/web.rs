@@ -220,14 +220,19 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/events", get(list_events))
         .route("/events/:name", get(get_event))
         .route("/bills", get(list_bills))
+        .route("/bills/:year/:slug/view", get(view_bill))
         .route("/bills/:year/:name", get(get_bill))
         .route("/parcels", get(list_parcels))
+        .route("/parcels/:name/view", get(view_parcel))
         .route("/parcels/:name", get(get_parcel))
         .route("/receipts", get(list_receipts))
+        .route("/receipts/:year/:slug/view", get(view_receipt))
         .route("/receipts/:year/:name", get(get_receipt))
         .route("/subscriptions", get(list_subscriptions))
+        .route("/subscriptions/:name/view", get(view_subscription))
         .route("/subscriptions/:name", get(get_subscription))
         .route("/reservations", get(list_reservations))
+        .route("/reservations/:year/:slug/view", get(view_reservation))
         .route("/reservations/:year/:name", get(get_reservation))
         .route("/tickets", get(list_tickets))
         .route("/tickets/:year/:name", get(get_ticket))
@@ -239,7 +244,56 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/reservations.json", get(api_reservations))
         .route("/api/stats.json", get(api_stats))
         .route("/api/recent-failures.json", get(api_recent_failures))
+        .fallback(not_found)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            rerender_error_pages,
+        ))
         .with_state(state)
+}
+
+/// Fallback for unrouted paths. Uses the request's state so the 404
+/// page keeps the full navbar (`AppError::into_response` can't since
+/// axum's `IntoResponse` isn't given state).
+async fn not_found(State(state): State<Arc<AppState>>) -> Response {
+    error_page(&state, StatusCode::NOT_FOUND)
+}
+
+/// Middleware that rewrites HTML error responses to include the full
+/// navbar. `AppError::into_response` renders with an empty
+/// `AppState::default()`; here we swap that body for one rendered with
+/// the real state. Non-HTML responses (JSON APIs, PDF blobs) pass
+/// through untouched.
+async fn rerender_error_pages(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let resp = next.run(req).await;
+    if !resp.status().is_client_error() && !resp.status().is_server_error() {
+        return resp;
+    }
+    let is_html = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/html"));
+    if !is_html {
+        return resp;
+    }
+    error_page(&state, resp.status())
+}
+
+/// Render an error page with the request's [`AppState`] so the navbar
+/// is populated. Used by the router `fallback` and the
+/// `rerender_error_pages` middleware.
+fn error_page(state: &AppState, status: StatusCode) -> Response {
+    let reason = status.canonical_reason().unwrap_or("Error");
+    (
+        status,
+        Html(page(state, reason, &format!("<p>{}</p>", esc(reason)))),
+    )
+        .into_response()
 }
 
 /// Wraps `anyhow::Error` with an HTTP status. Bad requests and
@@ -319,9 +373,14 @@ pre { background: #f5f5f7; padding: 1rem; overflow: auto; }
 .badge.reservation { background: #d3e8f7; color: #14416b; }
 .badge.ticket { background: #f5efc9; color: #6b5510; }
 .badge.event { background: #d8e6e2; color: #234942; }
+.badge.muted-badge { background: #ececec; color: #666; }
 .muted { color: #777; }
 .pager { margin: 1rem 0; }
 .pager a, .pager span { margin-right: 0.5rem; }
+dl.detail { display: grid; grid-template-columns: max-content 1fr; column-gap: 1rem; row-gap: 0.35rem; background: #fff; padding: 1rem; border-radius: 6px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); margin: 0 0 1rem; }
+dl.detail dt { color: #555; font-weight: 500; }
+dl.detail dd { margin: 0; }
+p.links { margin: 0.5rem 0; }
 .empty { padding: 2rem; text-align: center; color: #777; background: #fff; border: 1px dashed #ddd; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; }
 .card { background: #fff; padding: 1rem; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
@@ -636,11 +695,25 @@ fn short_date(raw: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
-/// `?page=N` query parameter, 1-indexed. Defaults to page 1.
-#[derive(Deserialize, Default)]
+/// `?page=N` query parameter, 1-indexed. Defaults to page 1. Values
+/// that don't parse as a positive integer are treated the same as no
+/// `page` at all so a shared URL with a garbage tail doesn't 400.
+#[derive(Default)]
 struct PageQuery {
-    #[serde(default)]
     page: Option<usize>,
+}
+
+impl<'de> Deserialize<'de> for PageQuery {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            page: Option<String>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(PageQuery {
+            page: raw.page.and_then(|s| s.parse().ok()),
+        })
+    }
 }
 
 /// Rows-per-page for the list views. Big enough to fit the "few
@@ -1150,6 +1223,7 @@ async fn list_bills(
             })
             .unwrap_or_default();
         let href = state.url(&format!("/bills/{}/{}.json", year, slug));
+        let view_href = state.url(&format!("/bills/{year}/{slug}/view"));
         let vendor = vendor_url(&value);
         let blobs: Vec<(String, String)> = sibling_blobs(dir, &year, &slug)
             .into_iter()
@@ -1160,7 +1234,8 @@ async fn list_bills(
         // year, which is then the only date they carry.
         let due_display = due.unwrap_or_else(|| year.clone());
         let cells = format!(
-            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
+            "<td><a href=\"{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
+            esc(&view_href),
             esc(&payee.unwrap_or_default()),
             esc(&invoice.unwrap_or_default()),
             esc(&short_date(&due_display)),
@@ -1204,6 +1279,57 @@ async fn get_bill(
     serve_shard_file(dir, &year, &name)
 }
 
+async fn view_bill(
+    State(state): State<Arc<AppState>>,
+    UrlPath((year, slug)): UrlPath<(String, String)>,
+) -> Result<Html<String>, AppError> {
+    let dir = require_dir(state.bills_dir(), "bills")?;
+    let value = read_shard_json(dir, &year, &slug)?;
+    let title = pick_str(&value, &["payee", "accountName"]).unwrap_or_else(|| slug.clone());
+    let subtitle = pick_str(&value, &["invoiceNumber", "identifier"]).unwrap_or_default();
+    let fields = [
+        ("Payee", pick_str(&value, &["payee", "accountName"])),
+        (
+            "Invoice number",
+            pick_str(&value, &["invoiceNumber", "identifier"]),
+        ),
+        (
+            "Due",
+            pick_str(&value, &["dueDate", "paymentDueDate", "date"]).map(|s| short_date(&s)),
+        ),
+        (
+            "Issued",
+            pick_str(&value, &["issueDate", "date"]).map(|s| short_date(&s)),
+        ),
+        (
+            "Amount",
+            value
+                .get("totalPaymentDue")
+                .map(format_price)
+                .filter(|s| !s.is_empty()),
+        ),
+        (
+            "Received",
+            pick_str(&value, &["receivedAt"]).map(|s| short_date(&s)),
+        ),
+    ];
+    let blobs: Vec<(String, String)> = sibling_blobs(dir, &year, &slug)
+        .into_iter()
+        .map(|(label, name)| (label, state.url(&format!("/bills/{year}/{name}"))))
+        .collect();
+    Ok(Html(page(
+        &state,
+        &title,
+        &detail_view(
+            &subtitle,
+            &fields,
+            &state.url(&format!("/bills/{year}/{slug}.json")),
+            &blobs,
+            vendor_url(&value).as_deref(),
+        ),
+    )))
+}
+
 async fn list_parcels(
     State(state): State<Arc<AppState>>,
     Query(page_q): Query<PageQuery>,
@@ -1240,8 +1366,12 @@ async fn list_parcels(
         .as_deref()
         .and_then(parse_any_date);
         let vendor = vendor_url(&value);
+        let slug = name.strip_suffix(".json").unwrap_or(&name);
+        let view_href = state.url(&format!("/parcels/{slug}/view"));
         let cells = format!(
-            "<td>{}</td><td><span class=\"badge\">{}</span></td><td>{}</td><td>{}</td><td>{}</td>",
+            "<td><a href=\"{}\">{}</a></td><td><span class=\"badge\">{}</span></td>\
+             <td>{}</td><td>{}</td><td>{}</td>",
+            esc(&view_href),
             esc(&tracking),
             esc(&carrier),
             esc(&status),
@@ -1297,6 +1427,56 @@ async fn get_parcel(
         .into_response())
 }
 
+async fn view_parcel(
+    State(state): State<Arc<AppState>>,
+    UrlPath(name): UrlPath<String>,
+) -> Result<Html<String>, AppError> {
+    let dir = require_dir(state.parcels_dir(), "parcels")?;
+    let file = if name.ends_with(".json") {
+        name.clone()
+    } else {
+        format!("{name}.json")
+    };
+    let value = read_flat_json(dir, &file)?;
+    let tracking =
+        pick_str(&value, &["trackingNumber", "identifier"]).unwrap_or_else(|| name.clone());
+    let carrier = value
+        .get("provider")
+        .and_then(|p| p.get("name").or_else(|| p.get("@id")))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let fields = [
+        ("Tracking number", Some(tracking.clone())),
+        ("Carrier", (!carrier.is_empty()).then_some(carrier)),
+        ("Status", pick_str(&value, &["deliveryStatus"])),
+        (
+            "Expected",
+            pick_str(&value, &["expectedArrivalUntil", "expectedArrivalFrom"])
+                .map(|s| short_date(&s)),
+        ),
+        (
+            "Delivered",
+            pick_str(&value, &["actualDeliveryTime"]).map(|s| short_date(&s)),
+        ),
+        (
+            "Received",
+            pick_str(&value, &["receivedAt"]).map(|s| short_date(&s)),
+        ),
+    ];
+    Ok(Html(page(
+        &state,
+        &tracking,
+        &detail_view(
+            "",
+            &fields,
+            &state.url(&format!("/parcels/{file}")),
+            &[],
+            vendor_url(&value).as_deref(),
+        ),
+    )))
+}
+
 async fn list_receipts(
     State(state): State<Arc<AppState>>,
     Query(page_q): Query<PageQuery>,
@@ -1314,12 +1494,14 @@ async fn list_receipts(
             .map(format_price)
             .unwrap_or_default();
         let vendor = vendor_url(&value);
+        let view_href = state.url(&format!("/receipts/{year}/{slug}/view"));
         let blobs: Vec<(String, String)> = sibling_blobs(dir, &year, &slug)
             .into_iter()
             .map(|(label, name)| (label, state.url(&format!("/receipts/{year}/{name}"))))
             .collect();
         let cells = format!(
-            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
+            "<td><a href=\"{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
+            esc(&view_href),
             esc(&merchant),
             esc(&order),
             esc(&short_date(&date_display)),
@@ -1363,19 +1545,82 @@ async fn get_receipt(
     serve_shard_file(dir, &year, &name)
 }
 
+async fn view_receipt(
+    State(state): State<Arc<AppState>>,
+    UrlPath((year, slug)): UrlPath<(String, String)>,
+) -> Result<Html<String>, AppError> {
+    let dir = require_dir(state.receipts_dir(), "receipts")?;
+    let value = read_shard_json(dir, &year, &slug)?;
+    let title = pick_str(&value, &["merchant", "seller"]).unwrap_or_else(|| slug.clone());
+    let order = pick_str(&value, &["orderNumber", "identifier"]).unwrap_or_default();
+    let fields = [
+        ("Merchant", pick_str(&value, &["merchant", "seller"])),
+        (
+            "Order number",
+            pick_str(&value, &["orderNumber", "identifier"]),
+        ),
+        (
+            "Ordered",
+            pick_str(&value, &["orderDate", "date"]).map(|s| short_date(&s)),
+        ),
+        (
+            "Total",
+            value
+                .get("priceSpecification")
+                .map(format_price)
+                .filter(|s| !s.is_empty()),
+        ),
+        (
+            "Received",
+            pick_str(&value, &["receivedAt"]).map(|s| short_date(&s)),
+        ),
+    ];
+    let blobs: Vec<(String, String)> = sibling_blobs(dir, &year, &slug)
+        .into_iter()
+        .map(|(label, name)| (label, state.url(&format!("/receipts/{year}/{name}"))))
+        .collect();
+    Ok(Html(page(
+        &state,
+        &title,
+        &detail_view(
+            &order,
+            &fields,
+            &state.url(&format!("/receipts/{year}/{slug}.json")),
+            &blobs,
+            vendor_url(&value).as_deref(),
+        ),
+    )))
+}
+
 async fn list_subscriptions(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.subscriptions_dir(), "subscriptions")?;
-    let mut rows: Vec<(Option<NaiveDate>, String, String)> = Vec::new();
+    let today = Utc::now().date_naive();
+    // (sort_date, active, name, cells): sort active first, then newest.
+    let mut rows: Vec<(bool, Option<NaiveDate>, String, String)> = Vec::new();
     for (name, value) in walk_flat_json(dir)? {
         let display = pick_str(&value, &["name", "provider"]).unwrap_or_default();
         let renewal = pick_str(&value, &["renewalDate", "nextPaymentDate"]).unwrap_or_default();
         let price = format_price(&value);
         let started = pick_str(&value, &["orderDate", "receivedAt"]).unwrap_or_default();
         let sort_date = parse_any_date(&started);
+        let received = pick_str(&value, &["receivedAt"])
+            .as_deref()
+            .and_then(parse_any_date);
+        let duration = pick_str(&value, &["subscriptionDuration"]);
+        let active = is_subscription_active(received, duration.as_deref(), today);
+        let status_html = if active {
+            "<span class=\"badge subscription\">active</span>".to_string()
+        } else {
+            "<span class=\"badge muted-badge\">inactive</span>".to_string()
+        };
         let vendor = vendor_url(&value);
+        let slug = name.strip_suffix(".json").unwrap_or(&name);
+        let view_href = state.url(&format!("/subscriptions/{slug}/view"));
         let cells = format!(
-            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
+            "<td><a href=\"{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
+            esc(&view_href),
             esc(&display),
+            status_html,
             esc(&short_date(&started)),
             esc(&short_date(&renewal)),
             esc(&price),
@@ -1385,11 +1630,11 @@ async fn list_subscriptions(State(state): State<Arc<AppState>>) -> Result<Html<S
                 vendor.as_deref(),
             ),
         );
-        rows.push((sort_date, name, cells));
+        rows.push((active, sort_date, name, cells));
     }
-    // Newest first; ties sort by filename so ordering stays stable
-    // across requests.
-    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    // Active subscriptions first, then newest within each group; ties
+    // by filename for determinism.
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
     if rows.is_empty() {
         return Ok(Html(page(
             &state,
@@ -1398,14 +1643,56 @@ async fn list_subscriptions(State(state): State<Arc<AppState>>) -> Result<Html<S
         )));
     }
     let body = format!(
-        "<table><thead><tr><th>name</th><th>started</th><th>renews</th><th>price</th><th></th></tr></thead>\
+        "<table><thead><tr><th>name</th><th>status</th><th>started</th><th>renews</th>\
+         <th>price</th><th></th></tr></thead>\
          <tbody>{}</tbody></table>",
         rows.into_iter()
-            .map(|(_, _, c)| format!("<tr>{c}</tr>"))
+            .map(|(_, _, _, c)| format!("<tr>{c}</tr>"))
             .collect::<Vec<_>>()
             .join("")
     );
     Ok(Html(page(&state, "Subscriptions", &body)))
+}
+
+/// Heuristic active/inactive flag for a subscription. Active while
+/// `received_at` is within twice the subscription's own cycle (so we'd
+/// expect at least one more renewal email by now if it were still
+/// running). Falls back to a 60-day window when the record has no
+/// parseable duration.
+fn is_subscription_active(
+    received: Option<NaiveDate>,
+    duration: Option<&str>,
+    today: NaiveDate,
+) -> bool {
+    let Some(received) = received else {
+        return true; // no signal to declare it inactive on
+    };
+    let stale_after_days = duration
+        .and_then(parse_iso_duration_days)
+        .map(|d| d.saturating_mul(2))
+        .unwrap_or(60);
+    let age = today.signed_duration_since(received).num_days();
+    age <= i64::from(stale_after_days)
+}
+
+/// Approximate an ISO 8601 duration (`P1M`, `P1Y`, `P7D`, ...) as a
+/// day count. Only supports the single-designator forms schema.org
+/// subscription payloads actually use; anything more elaborate returns
+/// `None` and callers fall back to a default window.
+fn parse_iso_duration_days(iso: &str) -> Option<u32> {
+    let rest = iso.strip_prefix('P')?;
+    if rest.is_empty() {
+        return None;
+    }
+    let (num_str, unit) = rest.split_at(rest.len() - 1);
+    let n: u32 = num_str.parse().ok()?;
+    match unit {
+        "D" => Some(n),
+        "W" => Some(n.saturating_mul(7)),
+        "M" => Some(n.saturating_mul(30)),
+        "Y" => Some(n.saturating_mul(365)),
+        _ => None,
+    }
 }
 
 /// Format a subscription/bill/receipt `price` field as `"1.59 GBP"`.
@@ -1454,6 +1741,48 @@ async fn get_subscription(
         body,
     )
         .into_response())
+}
+
+async fn view_subscription(
+    State(state): State<Arc<AppState>>,
+    UrlPath(name): UrlPath<String>,
+) -> Result<Html<String>, AppError> {
+    let dir = require_dir(state.subscriptions_dir(), "subscriptions")?;
+    let file = if name.ends_with(".json") {
+        name.clone()
+    } else {
+        format!("{name}.json")
+    };
+    let value = read_flat_json(dir, &file)?;
+    let title = pick_str(&value, &["name", "provider"]).unwrap_or_else(|| name.clone());
+    let fields = [
+        ("Name", pick_str(&value, &["name"])),
+        ("Provider", pick_str(&value, &["provider"])),
+        (
+            "Started",
+            pick_str(&value, &["orderDate", "receivedAt"]).map(|s| short_date(&s)),
+        ),
+        (
+            "Renews",
+            pick_str(&value, &["renewalDate", "nextPaymentDate"]).map(|s| short_date(&s)),
+        ),
+        ("Cycle", pick_str(&value, &["subscriptionDuration"])),
+        (
+            "Price",
+            Some(format_price(&value)).filter(|s| !s.is_empty()),
+        ),
+    ];
+    Ok(Html(page(
+        &state,
+        &title,
+        &detail_view(
+            "",
+            &fields,
+            &state.url(&format!("/subscriptions/{file}")),
+            &[],
+            vendor_url(&value).as_deref(),
+        ),
+    )))
 }
 
 /// Name of a schema.org node that may be a bare string or an object
@@ -1506,10 +1835,14 @@ async fn list_reservations(
         let under = value.get("underName").and_then(named).unwrap_or_default();
         let date_raw = reservation_date(&value).unwrap_or_default();
         let sort_date = parse_any_date(&date_raw);
+        let route = reservation_route(&value).unwrap_or_default();
+        let view_href = state.url(&format!("/reservations/{year}/{slug}/view"));
         let cells = format!(
-            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
+            "<td><a href=\"{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
+            esc(&view_href),
             esc(&provider),
             esc(&number),
+            esc(&route),
             esc(&under),
             esc(&short_date(&date_raw)),
             links_cell(
@@ -1533,8 +1866,9 @@ async fn list_reservations(
     let total = rows.len();
     let (page_rows, pager) = paginate(&rows, &page_q, &state.url("/reservations"));
     let body = format!(
-        "<table><thead><tr><th>provider</th><th>reference</th><th>name</th>\
-         <th>date</th><th></th></tr></thead><tbody>{rows}</tbody></table>{pager}",
+        "<table><thead><tr><th>provider</th><th>reference</th><th>route</th>\
+         <th>name</th><th>date</th><th></th></tr></thead>\
+         <tbody>{rows}</tbody></table>{pager}",
         rows = page_rows
             .iter()
             .map(|(_, _, _, c)| format!("<tr>{c}</tr>"))
@@ -1545,12 +1879,77 @@ async fn list_reservations(
     Ok(Html(page(&state, "Reservations", &body)))
 }
 
+/// Compact route description for a reservation. Flights render as
+/// `LHR -> AMS`; train and coach legs use station / stop names since
+/// IATA-style codes aren't standardised for rail. Anything else
+/// returns `None`.
+fn reservation_route(value: &Value) -> Option<String> {
+    let for_ = value.get("reservationFor")?;
+    let kind = for_.get("@type").and_then(|t| t.as_str()).unwrap_or("");
+    let (depart, arrive) = match kind {
+        "Flight" => (
+            for_.get("departureAirport")
+                .and_then(|a| pick_str(a, &["iataCode", "name"])),
+            for_.get("arrivalAirport")
+                .and_then(|a| pick_str(a, &["iataCode", "name"])),
+        ),
+        "TrainTrip" | "BusTrip" => (
+            for_.get("departureStation")
+                .or_else(|| for_.get("departureBusStop"))
+                .and_then(|s| pick_str(s, &["name"])),
+            for_.get("arrivalStation")
+                .or_else(|| for_.get("arrivalBusStop"))
+                .and_then(|s| pick_str(s, &["name"])),
+        ),
+        _ => return None,
+    };
+    match (depart, arrive) {
+        (Some(a), Some(b)) => Some(format!("{a} -> {b}")),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }
+}
+
 async fn get_reservation(
     State(state): State<Arc<AppState>>,
     UrlPath((year, name)): UrlPath<(String, String)>,
 ) -> Result<Response, AppError> {
     let dir = require_dir(state.reservations_dir(), "reservations")?;
     serve_shard_file(dir, &year, &name)
+}
+
+async fn view_reservation(
+    State(state): State<Arc<AppState>>,
+    UrlPath((year, slug)): UrlPath<(String, String)>,
+) -> Result<Html<String>, AppError> {
+    let dir = require_dir(state.reservations_dir(), "reservations")?;
+    let value = read_shard_json(dir, &year, &slug)?;
+    let provider = reservation_provider(&value).unwrap_or_else(|| slug.clone());
+    let number = reservation_number(&value).unwrap_or_default();
+    let route = reservation_route(&value);
+    let fields = [
+        ("Provider", Some(provider.clone())),
+        ("Reference", (!number.is_empty()).then_some(number.clone())),
+        ("Route", route),
+        ("Passenger", value.get("underName").and_then(named)),
+        ("Date", reservation_date(&value).map(|s| short_date(&s))),
+        (
+            "Received",
+            pick_str(&value, &["receivedAt"]).map(|s| short_date(&s)),
+        ),
+        ("Ticket number", pick_str(&value, &["ticketNumber"])),
+    ];
+    Ok(Html(page(
+        &state,
+        &provider,
+        &detail_view(
+            &number,
+            &fields,
+            &state.url(&format!("/reservations/{year}/{slug}.json")),
+            &[],
+            vendor_url(&value).as_deref(),
+        ),
+    )))
 }
 
 async fn list_tickets(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
@@ -2038,6 +2437,62 @@ fn serve_shard_file(dir: &Path, year: &str, name: &str) -> Result<Response, AppE
     let body = fs::read(&path).map_err(|e| read_status(&path, e))?;
     let ct = content_type_for(name);
     Ok(([(header::CONTENT_TYPE, HeaderValue::from_static(ct))], body).into_response())
+}
+
+/// Read `<dir>/<year>/<slug>.json` as parsed JSON, mapping filesystem
+/// errors to appropriate HTTP statuses. Used by the detail-view
+/// handlers.
+fn read_shard_json(dir: &Path, year: &str, slug: &str) -> Result<Value, AppError> {
+    let year = safe_segment(year)?;
+    let slug = safe_segment(slug)?;
+    let path = dir.join(year).join(format!("{slug}.json"));
+    let body = fs::read_to_string(&path).map_err(|e| read_status(&path, e))?;
+    serde_json::from_str(&body).map_err(|e| AppError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        err: anyhow::Error::from(e).context(format!("parsing {}", path.display())),
+    })
+}
+
+/// Read `<dir>/<name>` (flat, no year shard) as parsed JSON.
+fn read_flat_json(dir: &Path, name: &str) -> Result<Value, AppError> {
+    let name = safe_segment(name)?;
+    let path = dir.join(name);
+    let body = fs::read_to_string(&path).map_err(|e| read_status(&path, e))?;
+    serde_json::from_str(&body).map_err(|e| AppError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        err: anyhow::Error::from(e).context(format!("parsing {}", path.display())),
+    })
+}
+
+/// Render a detail-view page body: an optional subtitle, a definition
+/// list of non-empty fields, and a footer with `raw json` / blob /
+/// vendor links. Fields with an empty or `None` value are silently
+/// skipped so callers can pass through the union of keys a kind might
+/// have.
+fn detail_view(
+    subtitle: &str,
+    fields: &[(&str, Option<String>)],
+    json_href: &str,
+    blobs: &[(String, String)],
+    vendor: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    if !subtitle.is_empty() {
+        out.push_str(&format!("<p class=\"muted\">{}</p>", esc(subtitle)));
+    }
+    out.push_str("<dl class=\"detail\">");
+    for (label, value) in fields {
+        let Some(v) = value else { continue };
+        if v.trim().is_empty() {
+            continue;
+        }
+        out.push_str(&format!("<dt>{}</dt><dd>{}</dd>", esc(label), esc(v)));
+    }
+    out.push_str("</dl>");
+    out.push_str("<p class=\"links\">");
+    out.push_str(&links_cell(json_href, blobs, vendor));
+    out.push_str("</p>");
+    out
 }
 
 /// Try a series of keys and return the first non-empty string value.
@@ -2699,6 +3154,115 @@ mod tests {
     fn format_price_missing() {
         let v: Value = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(format_price(&v), "");
+    }
+
+    #[tokio::test]
+    async fn reservation_route_flight() {
+        let v: Value = serde_json::from_str(
+            r#"{"reservationFor":{"@type":"Flight",
+                "departureAirport":{"iataCode":"LHR"},
+                "arrivalAirport":{"iataCode":"AMS"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(reservation_route(&v).as_deref(), Some("LHR -> AMS"));
+    }
+
+    #[tokio::test]
+    async fn reservation_route_train_uses_station_names() {
+        let v: Value = serde_json::from_str(
+            r#"{"reservationFor":{"@type":"TrainTrip",
+                "departureStation":{"name":"London St Pancras"},
+                "arrivalStation":{"name":"Amsterdam Centraal"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            reservation_route(&v).as_deref(),
+            Some("London St Pancras -> Amsterdam Centraal")
+        );
+    }
+
+    #[tokio::test]
+    async fn reservation_route_hotel_none() {
+        let v: Value =
+            serde_json::from_str(r#"{"reservationFor":{"@type":"LodgingBusiness","name":"ibis"}}"#)
+                .unwrap();
+        assert!(reservation_route(&v).is_none());
+    }
+
+    #[tokio::test]
+    async fn not_found_navbar_has_configured_kinds() {
+        // AppError paths used to render 404 with a default (empty)
+        // AppState, dropping every kind link. The rerender middleware
+        // now swaps in the request's state so the nav stays intact.
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/bills/2026/does-not-exist.json").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body.contains(">bills</a>"),
+            "bills link missing from 404 nav: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_query_falls_back_on_garbage() {
+        // A shared URL with `?page=abc` should not 400; treat it as
+        // page 1 instead.
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, _) = get(&app, "/bills?page=abc").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn subscription_active_recent_receivedat() {
+        let today = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        let received = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        assert!(is_subscription_active(Some(received), Some("P1M"), today));
+    }
+
+    #[tokio::test]
+    async fn subscription_inactive_when_stale() {
+        // 2*P1M = 60 days; a 6-month-old record is definitely stale.
+        let today = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+        let received = NaiveDate::from_ymd_opt(2025, 12, 1).unwrap();
+        assert!(!is_subscription_active(Some(received), Some("P1M"), today));
+    }
+
+    #[test]
+    fn parse_iso_duration_common_forms() {
+        assert_eq!(parse_iso_duration_days("P1M"), Some(30));
+        assert_eq!(parse_iso_duration_days("P1Y"), Some(365));
+        assert_eq!(parse_iso_duration_days("P7D"), Some(7));
+        assert_eq!(parse_iso_duration_days("PT1H"), None); // time part unsupported
+    }
+
+    #[tokio::test]
+    async fn bill_view_page_renders_field_list() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/bills/2026/acme-INV1/view").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("<dt>Payee</dt><dd>Acme</dd>"), "body: {body}");
+        assert!(
+            body.contains("<dt>Invoice number</dt><dd>INV1</dd>"),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("/bills/2026/acme-INV1.json"),
+            "raw json link missing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bill_list_title_links_to_view() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/bills").await;
+        assert!(
+            body.contains("/bills/2026/acme-INV1/view"),
+            "list should link to view page: {body}"
+        );
     }
 
     #[tokio::test]
