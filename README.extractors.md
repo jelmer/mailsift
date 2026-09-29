@@ -158,7 +158,9 @@ chronologically.
 | `<slug>.reservation.json`  | `reservation`  | A schema.org-style reservation object (`FlightReservation`, `TrainReservation`, `BusReservation`, `LodgingReservation`, `EventReservation`, `FoodEstablishmentReservation`). mailsift converts it into a calendar event. |
 | `<slug>.parcel.json`       | `parcel`       | Loose schema.org `ParcelDelivery` JSON. Must include `trackingNumber` (the dedup key). Merged with any prior record for the same tracking number as the parcel progresses. |
 | `<slug>.receipt.json`      | `receipt`      | Loose schema.org `Order` / `Invoice` JSON. Must include `orderNumber` (or `identifier`) and a merchant/seller name. |
+| `<slug>.receipt.<ext>`     | `receipt`      | Companion blob (typically `.pdf`) for a receipt. Must ship with a same-slug `.receipt.json`; filed beside it under `<merchant>-<order>.<ext>`. Orphan blobs are dropped. |
 | `<slug>.bill.json`         | `bill`         | JSON with `payee`, `amount`, `dueDate`, `invoiceNumber`. |
+| `<slug>.bill.<ext>`        | `bill`         | Companion blob (typically `.pdf`) for a bill. Must ship with a same-slug `.bill.json`; filed beside it under `<payee>-<invoice>.<ext>`. Orphan blobs are dropped. |
 | `<slug>.subscription.json` | `subscription` | schema.org-ish JSON carrying at least `subscriptionDuration`. Downstream tooling synthesises renewal reminders from it. |
 | `<slug>.ticket.<ext>`      | `ticket`       | Any binary blob (PDF, pkpass, image, ...). Dedup is by content hash; `<ext>` is taken literally as the on-disk extension. The slug is the filed name, so make it specific: `ryanair-fr1234-2026-04-10.ticket.pdf`. |
 
@@ -172,6 +174,15 @@ the blob's filename and content type, plus the booking reference and
 passenger from a `.reservation.json` emitted in the same run. Emitting
 both from one message is what makes a ticket traceable back to its
 trip.
+
+Receipts and bills accept the same `<slug>.<kind>.<ext>` form for
+companion attachments (typically the vendor's PDF). Pair by using the
+same slug for the JSON and the blob (`digitalocean-2026-08.receipt.json`
+next to `digitalocean-2026-08.receipt.pdf`); the pipeline files the
+blob under the same `<merchant>-<order>` (or `<payee>-<invoice>`) name
+as the JSON, so a re-run overwrites in place. A blob with no
+same-slug JSON sibling is dropped with a warning: always emit the
+structured record too.
 
 Bills, parcels and subscriptions are **not** auto-synthesised into
 calendar events. If you want a bill's due date to show on the calendar,

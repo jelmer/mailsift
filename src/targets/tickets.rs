@@ -82,7 +82,7 @@ struct Sidecar<'a> {
 /// Best-guess content-type from the extension. Servers typically
 /// don't care for opaque uploads, but a sensible value is nicer than
 /// application/octet-stream for the common cases.
-fn content_type_for(ext: &str) -> &'static str {
+pub(super) fn content_type_for(ext: &str) -> &'static str {
     match ext {
         "pdf" => "application/pdf",
         "pkpass" => "application/vnd.apple.pkpass",
