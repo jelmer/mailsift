@@ -29,12 +29,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use tracing::info;
 
 use super::FileOutcome;
 use super::json_target::{derive_year, first_non_empty};
 use super::mail_forward::{self, MailForwarder};
-use super::sink::{sanitize_ext, slugify, write_atomic};
+use super::sink::{log_file_outcome, sanitize_ext, slugify, write_atomic};
 use super::tickets::content_type_for;
 use super::webdav::{PutOutcome, WebdavSink};
 
@@ -199,13 +198,7 @@ fn file_to_dir(
     let existed = target.exists();
     write_atomic(&target, body)?;
 
-    if existed {
-        info!(target = %target.display(), "receipt updated");
-        Ok(FileOutcome::Updated(target.display().to_string()))
-    } else {
-        info!(target = %target.display(), "receipt created");
-        Ok(FileOutcome::Created(target.display().to_string()))
-    }
+    Ok(log_file_outcome(&target, existed, "receipt"))
 }
 
 fn file_to_webdav(
@@ -237,14 +230,7 @@ fn file_blob_to_dir(
     let existed = target.exists();
     write_atomic(&target, body)?;
 
-    let label = target.display().to_string();
-    if existed {
-        info!(target = %label, "receipt blob updated");
-        Ok(FileOutcome::Updated(label))
-    } else {
-        info!(target = %label, "receipt blob created");
-        Ok(FileOutcome::Created(label))
-    }
+    Ok(log_file_outcome(&target, existed, "receipt blob"))
 }
 
 fn file_blob_to_webdav(

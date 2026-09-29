@@ -19,11 +19,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::warn;
 
 use super::FileOutcome;
 use super::json_target::{derive_year, first_non_empty};
-use super::sink::{slugify, write_atomic};
+use super::sink::{log_file_outcome, slugify, write_atomic};
 
 /// Identifying fields we pull out of a `.reservation.json` artifact.
 ///
@@ -373,14 +373,7 @@ fn file_one(
     let body_out = super::json_target::body_with_received_at(body, received_at_epoch);
     write_atomic(&target, body_out.as_bytes())?;
 
-    let label = target.display().to_string();
-    if existed {
-        info!(target = %label, "reservation updated");
-        Ok(FileOutcome::Updated(label))
-    } else {
-        info!(target = %label, "reservation created");
-        Ok(FileOutcome::Created(label))
-    }
+    Ok(log_file_outcome(&target, existed, "reservation"))
 }
 
 #[cfg(test)]

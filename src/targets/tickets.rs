@@ -44,10 +44,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use tracing::info;
 
 use super::FileOutcome;
-use super::sink::{sanitize_ext, slugify, write_atomic};
+use super::sink::{log_file_outcome, sanitize_ext, slugify, write_atomic};
 use super::webdav::{PutOutcome, WebdavSink};
 
 /// Identifying fields copied from the sibling reservation artifact, if
@@ -169,13 +168,7 @@ fn file_to_dir(
     write_atomic(&target, &body)?;
     write_atomic(&year_dir.join(sidecar_name(slug)), sidecar.as_bytes())?;
 
-    if existed {
-        info!(target = %target.display(), "ticket updated");
-        Ok(FileOutcome::Updated(target.display().to_string()))
-    } else {
-        info!(target = %target.display(), "ticket created");
-        Ok(FileOutcome::Created(target.display().to_string()))
-    }
+    Ok(log_file_outcome(&target, existed, "ticket"))
 }
 
 fn file_to_webdav(

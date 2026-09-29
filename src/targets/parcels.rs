@@ -14,10 +14,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use tracing::info;
 
 use super::FileOutcome;
-use super::sink::{slugify, write_atomic};
+use super::sink::{log_file_outcome, slugify, write_atomic};
 
 /// Shape we read out of a `.parcel.json` artifact. Loosely schema.org
 /// `ParcelDelivery`-shaped; unknown fields pass through unchanged.
@@ -117,12 +116,8 @@ pub fn file_parcel(
     let serialised = serde_json::to_vec_pretty(&merged).context("serialising merged parcel")?;
     write_atomic(&target, &serialised)?;
 
-    let label = target.display().to_string();
-    if existed {
-        info!(target = %label, "parcel updated");
-        Ok(FileOutcome::Updated(label))
-    } else {
-        info!(target = %label, "parcel created");
+    let outcome = log_file_outcome(&target, existed, "parcel");
+    if !existed {
         // First time we've seen this tracking number; fan out to every
         // configured tracker registration sink so they can start
         // polling the carrier. Silently skip parcels with no
@@ -133,8 +128,8 @@ pub fn file_parcel(
         {
             trackers.register_best_effort(carrier, tracking);
         }
-        Ok(FileOutcome::Created(label))
     }
+    Ok(outcome)
 }
 
 /// Fields describing where a parcel is right now, as opposed to what

@@ -16,11 +16,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use tracing::info;
 
 use super::FileOutcome;
 use super::json_target::first_non_empty;
-use super::sink::{slugify, write_atomic};
+use super::sink::{log_file_outcome, slugify, write_atomic};
 
 /// Shape we read out of a `.subscription.json` artifact. Loosely
 /// schema.org-shaped (most fields mirror `Offer` / `Subscription`).
@@ -68,14 +67,7 @@ pub fn file_subscription(
     let body_out = super::json_target::body_with_received_at(&body, received_at_epoch);
     write_atomic(&target, body_out.as_bytes())?;
 
-    let label = target.display().to_string();
-    if existed {
-        info!(target = %label, "subscription updated");
-        Ok(FileOutcome::Updated(label))
-    } else {
-        info!(target = %label, "subscription created");
-        Ok(FileOutcome::Created(label))
-    }
+    Ok(log_file_outcome(&target, existed, "subscription"))
 }
 
 #[cfg(test)]

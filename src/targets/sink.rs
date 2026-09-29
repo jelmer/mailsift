@@ -17,6 +17,7 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
+use tracing::info;
 
 /// What a sink did with one artifact.
 ///
@@ -31,6 +32,21 @@ pub enum FileOutcome {
     Created(String),
     /// Existing record at this location was overwritten / re-sent.
     Updated(String),
+}
+
+/// Emit the `"<kind> created"` or `"<kind> updated"` log line and
+/// return the matching [`FileOutcome`] pointing at `target`. Every
+/// local sink lands here after `write_atomic` to keep the log wording
+/// consistent.
+pub fn log_file_outcome(target: &Path, existed: bool, kind: &str) -> FileOutcome {
+    let label = target.display().to_string();
+    if existed {
+        info!(target = %label, "{kind} updated");
+        FileOutcome::Updated(label)
+    } else {
+        info!(target = %label, "{kind} created");
+        FileOutcome::Created(label)
+    }
 }
 
 /// Write `body` to `target`, creating any missing parent directories
