@@ -1514,6 +1514,16 @@ fn run() -> Result<()> {
             } else {
                 mailsift::stats::Recorder::default_file()
             };
+            // With `--only`, the user has locked the extractor set;
+            // don't let the fs watcher broaden it on the fly.
+            // Otherwise pass through the discovery dirs so extractor
+            // edits picked up by the watcher retrigger against the
+            // scan window.
+            let watched_dirs: &[PathBuf] = if watch && only.is_empty() {
+                &extractors_dir
+            } else {
+                &[]
+            };
             imap_scan::run(imap_scan::ImapScanConfig {
                 host: &target_imap.host,
                 port: target_imap.port,
@@ -1523,6 +1533,7 @@ fn run() -> Result<()> {
                 before: before.as_deref(),
                 limit,
                 extractors: &extractors,
+                extractor_dirs: watched_dirs,
                 targets: pipeline::PipelineTargets {
                     event_sink: &sink,
                     bills_dir: dirs.bills.as_deref(),
