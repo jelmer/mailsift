@@ -59,6 +59,7 @@ fn default_order() -> i32 {
     100
 }
 
+#[derive(Clone)]
 pub struct Extractor {
     pub name: String,
     pub script: PathBuf,
@@ -73,12 +74,18 @@ pub struct Extractor {
     /// Compiled body-shape requirements from `requires:`. Empty means
     /// "no constraint on the message body".
     body_requirements: Vec<BodyRequirement>,
+    /// SHA-256 over the manifest bytes and script bytes at load time.
+    /// Used by `imap-scan --watch` to notice when an extractor's
+    /// definition changed on disk, so the affected messages can be
+    /// re-processed against the new version.
+    fingerprint: [u8; 32],
 }
 
 /// A single `requires:` entry, parsed from the manifest. Used by the
 /// IMAP prefilter to decide, from a `BODYSTRUCTURE` response alone
 /// (without fetching the body), whether the extractor could possibly
 /// match the message.
+#[derive(Clone)]
 pub enum BodyRequirement {
     /// `requires: html`: needs a `text/html` part anywhere in the tree.
     Html,
@@ -99,6 +106,7 @@ pub enum BodyRequirement {
 /// Deliberately minimal; only the wildcard forms actually used in
 /// extractor manifests are supported, so we don't drag in a
 /// general-purpose glob crate.
+#[derive(Clone)]
 pub enum FilenamePattern {
     /// Exact (case-insensitive) match.
     Exact(String),
@@ -169,6 +177,7 @@ fn parse_body_requirement(raw: &str) -> Result<BodyRequirement> {
 }
 
 /// Compiled form of a single `from_domains` entry.
+#[derive(Clone)]
 enum FromDomainPattern {
     /// Exact match against the (lowercased) sender domain.
     Exact(String),
@@ -258,6 +267,14 @@ impl Extractor {
             .collect()
     }
 
+    /// A stable identifier for the extractor's on-disk definition
+    /// (manifest bytes and script bytes at discovery time). Two loads
+    /// of the same extractor produce the same fingerprint iff neither
+    /// file changed on disk between them.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        self.fingerprint
+    }
+
     /// Return `true` when this extractor declares any `from_domains`
     /// or `subject_regex` hint, i.e. [`matches_headers`] can rule it
     /// out from headers alone. An extractor without hints matches
@@ -344,6 +361,18 @@ pub struct ExtractorRun {
 /// field, the first directory wins, letting a personal directory of
 /// overrides layer on top of an upstream-shipped set. Duplicates from
 /// later directories are skipped with a debug log.
+/// SHA-256 over the manifest bytes. Deliberately does not cover the
+/// script: an extractor's manifest is what the pipeline dispatches on
+/// (from_domains, subject_regex, requires, require_dkim), and only
+/// those changes need historical mail replayed. A script tweak alone
+/// re-runs against fresh mail through the normal IDLE path.
+fn fingerprint_bytes(manifest_bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(manifest_bytes);
+    h.finalize().into()
+}
+
 pub fn discover(dirs: &[PathBuf]) -> Result<Vec<Extractor>> {
     let mut out: Vec<Extractor> = Vec::new();
     for dir in dirs {
@@ -647,6 +676,8 @@ fn discover_into(dir: &Path, out: &mut Vec<Extractor>) -> Result<()> {
             continue;
         }
 
+        let fingerprint = fingerprint_bytes(body.as_bytes());
+
         out.push(Extractor {
             name: manifest.name,
             script: script_path,
@@ -655,6 +686,7 @@ fn discover_into(dir: &Path, out: &mut Vec<Extractor>) -> Result<()> {
             from_domains,
             subject_regex,
             body_requirements,
+            fingerprint,
         });
     }
     Ok(())
@@ -808,6 +840,7 @@ mod tests {
             from_domains: from_domains.into_iter().map(parse_from_domain).collect(),
             subject_regex: subject_regex.map(|s| regex::Regex::new(s).unwrap()),
             body_requirements,
+            fingerprint: [0u8; 32],
         }
     }
 
@@ -1043,6 +1076,7 @@ mod tests {
             from_domains: Vec::new(),
             subject_regex: None,
             body_requirements: Vec::new(),
+            fingerprint: [0u8; 32],
         }
     }
 
@@ -1119,6 +1153,43 @@ mod tests {
         assert_eq!(got.len(), 2);
         let names: Vec<&str> = got.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_stable_across_reloads() {
+        let dir = fixture("f", "name: f\norder: 42\n", true);
+        let a = discover(&[dir.path().to_path_buf()]).unwrap();
+        let b = discover(&[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert_eq!(a[0].fingerprint(), b[0].fingerprint());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_changes_when_manifest_changes() {
+        let dir = fixture("f", "name: f\norder: 42\n", true);
+        let before = discover(&[dir.path().to_path_buf()]).unwrap();
+        fs::write(dir.path().join("f.yaml"), "name: f\norder: 43\n").unwrap();
+        let after = discover(&[dir.path().to_path_buf()]).unwrap();
+        assert_ne!(before[0].fingerprint(), after[0].fingerprint());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_ignores_script_changes() {
+        // A pure script edit doesn't broaden dispatch, so the
+        // watcher deliberately doesn't retrigger historical mail on
+        // one; only manifest changes do.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fixture("f", "name: f\n", true);
+        let before = discover(&[dir.path().to_path_buf()]).unwrap();
+        let script = dir.path().join("f.py");
+        fs::write(&script, "#!/bin/sh\necho hello\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let after = discover(&[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(before[0].fingerprint(), after[0].fingerprint());
     }
 
     #[cfg(unix)]
