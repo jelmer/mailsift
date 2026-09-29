@@ -191,11 +191,36 @@ fn merge(mut existing: Value, incoming: Value) -> Value {
     let history = existing_obj
         .entry("history")
         .or_insert_with(|| Value::Array(Vec::new()));
-    if let Value::Array(arr) = history {
+    if let Value::Array(arr) = history
+        && !is_duplicate_history_entry(arr.last(), &history_entry)
+    {
         arr.push(history_entry);
     }
 
     Value::Object(existing_obj)
+}
+
+/// Whether `entry` records the same tracker snapshot as `last`,
+/// ignoring their own `seen_at`. Repeated poll cycles that see the
+/// same status with the same event timestamps produce identical
+/// entries; keeping only the first stops the history from growing
+/// unboundedly.
+fn is_duplicate_history_entry(last: Option<&Value>, entry: &Value) -> bool {
+    let Some(last) = last.and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(entry) = entry.as_object() else {
+        return false;
+    };
+    [
+        "receivedAt",
+        "deliveryStatus",
+        "expectedArrivalUntil",
+        "expectedArrivalFrom",
+        "actualDeliveryTime",
+    ]
+    .iter()
+    .all(|k| last.get(*k) == entry.get(*k))
 }
 
 /// Whether a record's `deliveryStatus` is a terminal one. Matches the
@@ -570,6 +595,36 @@ mod tests {
         let history = obj.get("history").unwrap().as_array().unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[1].get("deliveryStatus").unwrap(), "OutForDelivery");
+    }
+
+    #[test]
+    fn merge_skips_duplicate_history_entry() {
+        // A polling tracker that re-emits the same status shouldn't
+        // bloat the history: only the first observation is kept.
+        let existing = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "OrderDelivered",
+            "receivedAt": "2024-11-01T00:00:00Z",
+            "history": [
+                {
+                    "seen_at": "2024-11-01T10:00:00Z",
+                    "receivedAt": "2024-11-01T00:00:00Z",
+                    "deliveryStatus": "OrderDelivered"
+                }
+            ]
+        });
+        let incoming = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "OrderDelivered",
+            "receivedAt": "2024-11-01T00:00:00Z"
+        });
+        let merged = merge(existing, incoming);
+        let history = merged.get("history").unwrap().as_array().unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "duplicate history entry should not be appended"
+        );
     }
 
     #[test]
