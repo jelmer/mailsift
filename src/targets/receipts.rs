@@ -31,7 +31,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 use super::FileOutcome;
-use super::json_target::{derive_year, first_non_empty};
+use super::json_target::{derive_year, first_non_empty, read_and_parse};
 use super::mail_forward::{self, MailForwarder};
 use super::sink::{log_file_outcome, sanitize_ext, slugify, write_atomic};
 use super::tickets::content_type_for;
@@ -86,10 +86,7 @@ impl ReceiptSink {
         raw_message: &[u8],
         received_at_epoch: Option<i64>,
     ) -> Result<FileOutcome> {
-        let body = fs::read_to_string(src)
-            .with_context(|| format!("reading receipt source {}", src.display()))?;
-        let receipt: Receipt = serde_json::from_str(&body)
-            .with_context(|| format!("parsing receipt JSON {}", src.display()))?;
+        let (body, receipt) = read_and_parse::<Receipt>(src, "receipt")?;
 
         let merchant = receipt
             .merchant()

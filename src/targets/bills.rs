@@ -26,7 +26,7 @@ use serde::Deserialize;
 
 use super::FileOutcome;
 use super::firefly::{self, BillForFirefly, FireflySink};
-use super::json_target::{derive_year, first_non_empty};
+use super::json_target::{derive_year, first_non_empty, read_and_parse};
 use super::sink::{log_file_outcome, sanitize_ext, slugify, write_atomic};
 
 /// Shape we read out of a `.bill.json` artifact. Loosely schema.org
@@ -86,10 +86,7 @@ pub fn file_bill(
     firefly: Option<&FireflySink>,
     received_at_epoch: Option<i64>,
 ) -> Result<FileOutcome> {
-    let body = fs::read_to_string(src)
-        .with_context(|| format!("reading bill source {}", src.display()))?;
-    let bill: Bill = serde_json::from_str(&body)
-        .with_context(|| format!("parsing bill JSON {}", src.display()))?;
+    let (body, bill) = read_and_parse::<Bill>(src, "bill")?;
 
     let payee = bill
         .payee()

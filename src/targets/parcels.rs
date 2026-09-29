@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::FileOutcome;
+use super::json_target::read_and_parse;
 use super::sink::{log_file_outcome, slugify, write_atomic};
 
 /// Shape we read out of a `.parcel.json` artifact. Loosely schema.org
@@ -62,11 +63,7 @@ pub fn file_parcel(
     trackers: Option<&super::trackers::Trackers>,
     received_at_epoch: Option<i64>,
 ) -> Result<FileOutcome> {
-    let body = fs::read_to_string(src)
-        .with_context(|| format!("reading parcel source {}", src.display()))?;
-
-    let parcel: Parcel = serde_json::from_str(&body)
-        .with_context(|| format!("parsing parcel JSON {}", src.display()))?;
+    let (body, parcel) = read_and_parse::<Parcel>(src, "parcel")?;
     let tracking = parcel
         .tracking()
         .ok_or_else(|| anyhow!("{}: missing 'trackingNumber'", src.display()))?;

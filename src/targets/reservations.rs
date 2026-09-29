@@ -17,12 +17,12 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 use tracing::warn;
 
 use super::FileOutcome;
-use super::json_target::{derive_year, first_non_empty};
+use super::json_target::{derive_year, first_non_empty, read_and_parse};
 use super::sink::{log_file_outcome, slugify, write_atomic};
 
 /// Identifying fields we pull out of a `.reservation.json` artifact.
@@ -282,10 +282,7 @@ pub fn file_reservation(
     dir: &Path,
     received_at_epoch: Option<i64>,
 ) -> Result<Vec<FileOutcome>> {
-    let body = fs::read_to_string(src)
-        .with_context(|| format!("reading reservation source {}", src.display()))?;
-    let doc: serde_json::Value = serde_json::from_str(&body)
-        .with_context(|| format!("parsing reservation JSON {}", src.display()))?;
+    let (_body, doc) = read_and_parse::<serde_json::Value>(src, "reservation")?;
     // Each leg is kept as generic JSON so it can be written back out
     // with its own fields intact; the typed view below is only for
     // picking a filename, and is deliberately lossy.
