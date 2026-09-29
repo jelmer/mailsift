@@ -446,7 +446,7 @@ fn page(state: &AppState, title: &str, body: &str) -> String {
          <main>\n<h1>{title}</h1>\n{body}\n</main>\n\
          <footer>\n\
          <a href=\"https://github.com/jelmer/mailsift\">mailsift</a> \
-         &copy; 2025-2026 Jelmer Vernoo&#307;j \
+         &copy; 2025-2026 <a href=\"https://www.jelmer.uk\">Jelmer Vernoo&#307;</a> \
          &lt;<a href=\"mailto:jelmer@jelmer.uk\">jelmer@jelmer.uk</a>&gt;\n\
          </footer>\n\
          </body>\n</html>",
