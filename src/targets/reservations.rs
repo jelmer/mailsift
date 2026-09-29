@@ -184,9 +184,8 @@ impl Reservation {
     /// trip: both legs share the airline and the booking reference,
     /// so the date is the only thing that tells them apart.
     fn day(&self) -> Option<String> {
-        let candidates = self.date_candidates();
-        let raw = candidates.first()?.trim();
-        let day = raw.get(..10)?;
+        let raw = self.date_candidates().next()?;
+        let day = raw.trim().get(..10)?;
         let mut parts = day.split('-');
         let ok = matches!(parts.next(), Some(y) if y.len() == 4 && y.bytes().all(|b| b.is_ascii_digit()))
             && parts.clone().count() == 2
@@ -196,7 +195,7 @@ impl Reservation {
 
     /// Date candidates, most specific first. Owned because a scalar
     /// may have been a JSON number that we rendered to a string.
-    fn date_candidates(&self) -> Vec<String> {
+    fn date_candidates(&self) -> impl Iterator<Item = String> + '_ {
         let for_ = &self.reservation_for;
         [
             for_.departure_time.as_ref(),
@@ -208,7 +207,13 @@ impl Reservation {
         .into_iter()
         .flatten()
         .filter_map(Scalar::as_str)
-        .collect()
+    }
+
+    /// The year to file this reservation under, from the first
+    /// parseable date candidate; falls back to the current year.
+    fn year(&self) -> i32 {
+        let dates: Vec<String> = self.date_candidates().collect();
+        derive_year(dates.iter().map(|s| Some(s.as_str())))
     }
 }
 
@@ -342,8 +347,7 @@ fn file_one(
     let number = reservation
         .number()
         .ok_or_else(|| anyhow!("{}: missing 'reservationNumber'", src.display()))?;
-    let dates = reservation.date_candidates();
-    let year = derive_year(dates.iter().map(|s| Some(s.as_str())));
+    let year = reservation.year();
 
     let number_slug = slugify(&number, false);
     if number_slug.is_empty() {
@@ -385,8 +389,7 @@ mod tests {
     }
 
     fn year_of(r: &Reservation) -> i32 {
-        let dates = r.date_candidates();
-        derive_year(dates.iter().map(|s| Some(s.as_str())))
+        r.year()
     }
 
     #[test]
