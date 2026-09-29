@@ -2166,7 +2166,7 @@ async fn list_reservations(
 }
 
 /// Compact route description for a reservation. Flights render as
-/// `LHR -> AMS`; train and coach legs use station / stop names since
+/// `LHR → AMS`; train and coach legs use station / stop names since
 /// IATA-style codes aren't standardised for rail. Anything else
 /// returns `None`.
 fn reservation_route(value: &Value) -> Option<String> {
@@ -2190,7 +2190,7 @@ fn reservation_route(value: &Value) -> Option<String> {
         _ => return None,
     };
     match (depart, arrive) {
-        (Some(a), Some(b)) => Some(format!("{a} -> {b}")),
+        (Some(a), Some(b)) => Some(format!("{a} \u{2192} {b}")),
         (Some(a), None) | (None, Some(a)) => Some(a),
         (None, None) => None,
     }
@@ -3547,7 +3547,7 @@ mod tests {
                 "arrivalAirport":{"iataCode":"AMS"}}}"#,
         )
         .unwrap();
-        assert_eq!(reservation_route(&v).as_deref(), Some("LHR -> AMS"));
+        assert_eq!(reservation_route(&v).as_deref(), Some("LHR \u{2192} AMS"));
     }
 
     #[tokio::test]
@@ -3560,7 +3560,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             reservation_route(&v).as_deref(),
-            Some("London St Pancras -> Amsterdam Centraal")
+            Some("London St Pancras \u{2192} Amsterdam Centraal")
         );
     }
 
