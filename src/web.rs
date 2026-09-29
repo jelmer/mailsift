@@ -19,12 +19,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{NaiveDate, NaiveDateTime, Utc};
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::info;
 
@@ -311,7 +312,16 @@ th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
 tr:hover td { background: #fbfcff; }
 pre { background: #f5f5f7; padding: 1rem; overflow: auto; }
 .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.8rem; background: #e8eef7; color: #2a3f5f; }
+.badge.bill { background: #fbe6d4; color: #7a3d00; }
+.badge.parcel { background: #d9ebd2; color: #274d1f; }
+.badge.receipt { background: #e2d8f4; color: #422d76; }
+.badge.subscription { background: #f7dee6; color: #7d1f3d; }
+.badge.reservation { background: #d3e8f7; color: #14416b; }
+.badge.ticket { background: #f5efc9; color: #6b5510; }
+.badge.event { background: #d8e6e2; color: #234942; }
 .muted { color: #777; }
+.pager { margin: 1rem 0; }
+.pager a, .pager span { margin-right: 0.5rem; }
 .empty { padding: 2rem; text-align: center; color: #777; background: #fff; border: 1px dashed #ddd; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; }
 .card { background: #fff; padding: 1rem; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
@@ -447,10 +457,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppEr
         (
             "tickets",
             "/tickets",
-            state
-                .tickets_dir()
-                .map(|d| count_year(d, None))
-                .transpose()?,
+            state.tickets_dir().map(count_ticket_groups).transpose()?,
         ),
     ] {
         if let Some(count) = count {
@@ -519,10 +526,11 @@ fn render_feed_section(state: &AppState, title: &str, items: &[&FeedItem], limit
     let mut rows = String::new();
     for item in items.iter().take(limit) {
         rows.push_str(&format!(
-            "<tr><td>{date}</td><td><span class=\"badge\">{kind}</span></td>\
+            "<tr><td>{date}</td><td><span class=\"badge {kind_class}\">{kind}</span></td>\
              <td>{title}</td><td class=\"muted\">{subtitle}</td>\
              <td>{links}</td></tr>",
             date = esc(&item.date.to_string()),
+            kind_class = esc(item.kind),
             kind = esc(item.kind),
             title = esc(&item.title),
             subtitle = esc(&item.subtitle),
@@ -618,6 +626,92 @@ fn parse_any_date(raw: &str) -> Option<NaiveDate> {
     None
 }
 
+/// Render a date-like string as `YYYY-MM-DD` when it parses as one of
+/// the ISO variants [`parse_any_date`] accepts. Anything unrecognised
+/// passes through unchanged so we never silently blank out a value we
+/// don't understand.
+fn short_date(raw: &str) -> String {
+    parse_any_date(raw)
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| raw.to_string())
+}
+
+/// `?page=N` query parameter, 1-indexed. Defaults to page 1.
+#[derive(Deserialize, Default)]
+struct PageQuery {
+    #[serde(default)]
+    page: Option<usize>,
+}
+
+/// Rows-per-page for the list views. Big enough to fit the "few
+/// hundred" typical size without a scroll of doom, small enough that
+/// the HTML for a page stays under ~80 KB even with long URLs in
+/// vendor links.
+const PAGE_SIZE: usize = 100;
+
+/// Paginate `rows` for `page_q`, returning the slice for the current
+/// page plus a pre-built [`Pager`] describing prev/next links relative
+/// to `base_url`.
+fn paginate<'a, T>(rows: &'a [T], page_q: &PageQuery, base_url: &str) -> (&'a [T], Pager) {
+    let total = rows.len();
+    let pages = total.div_ceil(PAGE_SIZE).max(1);
+    let page = page_q.page.unwrap_or(1).clamp(1, pages);
+    let start = (page - 1) * PAGE_SIZE;
+    let end = (start + PAGE_SIZE).min(total);
+    (
+        &rows[start..end],
+        Pager {
+            page,
+            pages,
+            base_url: base_url.to_string(),
+        },
+    )
+}
+
+/// Pagination metadata computed by [`paginate`]. Kept separate from the
+/// row slice so callers can render it in whatever spot they want.
+struct Pager {
+    page: usize,
+    pages: usize,
+    base_url: String,
+}
+
+impl Pager {
+    /// Render the prev / page-x-of-y / next line, or an empty string
+    /// when there's only one page. `total` is the full row count and
+    /// gets shown alongside the page counter.
+    fn render(&self, total: usize) -> String {
+        if self.pages <= 1 {
+            return String::new();
+        }
+        let mut out = String::from("<nav class=\"pager\">");
+        if self.page > 1 {
+            out.push_str(&format!(
+                "<a href=\"{}?page={}\">&laquo; prev</a>",
+                esc(&self.base_url),
+                self.page - 1
+            ));
+        } else {
+            out.push_str("<span class=\"muted\">&laquo; prev</span>");
+        }
+        out.push_str(&format!(
+            " <span class=\"muted\">page {} of {} ({} items)</span> ",
+            self.page, self.pages, total
+        ));
+        if self.page < self.pages {
+            out.push_str(&format!(
+                "<a href=\"{}?page={}\">next &raquo;</a>",
+                esc(&self.base_url),
+                self.page + 1
+            ));
+        } else {
+            out.push_str("<span class=\"muted\">next &raquo;</span>");
+        }
+        out.push_str("</nav>");
+        out
+    }
+}
+
 /// Gather every artifact into a single date-sorted feed. Missing dates
 /// fall back to the file mtime, so nothing is silently dropped.
 fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
@@ -696,13 +790,16 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
         for (name, value) in walk_flat_json(dir)? {
             let tracking = pick_str(&value, &["trackingNumber", "identifier"]).unwrap_or_default();
             let status = pick_str(&value, &["deliveryStatus"]).unwrap_or_default();
+            // Prefer the ETA over receivedAt so an OutForDelivery
+            // parcel arriving next Tuesday shows in Upcoming rather
+            // than sinking into Recent under yesterday's status update.
             let date = pick_str(
                 &value,
                 &[
-                    "receivedAt",
                     "actualDeliveryTime",
                     "expectedArrivalUntil",
                     "expectedArrivalFrom",
+                    "receivedAt",
                 ],
             )
             .and_then(|d| parse_any_date(&d))
@@ -784,18 +881,31 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
         for (year, group) in group_ticket_files(dir)? {
             let year_num: i32 = year.parse().unwrap_or(0);
             for (slug, files) in group {
-                let date = files
+                let meta = files
                     .iter()
-                    .filter_map(|f| mtime_date_opt(&f.path))
-                    .max()
+                    .find(|f| f.is_meta)
+                    .and_then(|f| read_json(&f.path).ok());
+                let date = meta
+                    .as_ref()
+                    .and_then(|m| pick_str(m, &["receivedAt"]))
+                    .and_then(|s| parse_any_date(&s))
+                    .or_else(|| files.iter().filter_map(|f| mtime_date_opt(&f.path)).max())
                     .or_else(|| NaiveDate::from_ymd_opt(year_num, 1, 1))
                     .unwrap_or_else(|| Utc::now().date_naive());
+                let title = meta
+                    .as_ref()
+                    .and_then(|m| pick_str(m, &["provider"]))
+                    .unwrap_or_else(|| slug.clone());
+                let subtitle = meta
+                    .as_ref()
+                    .and_then(|m| pick_str(m, &["reservationNumber", "identifier"]))
+                    .unwrap_or_else(|| year.clone());
                 let (href, blobs) = ticket_links(&year, &files);
                 items.push(FeedItem {
                     date,
                     kind: "ticket",
-                    title: slug,
-                    subtitle: year.clone(),
+                    title,
+                    subtitle,
                     vendor_url: None,
                     href,
                     blobs,
@@ -1016,9 +1126,14 @@ fn ics_field(body: &str, key: &str) -> Option<String> {
     None
 }
 
-async fn list_bills(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
+async fn list_bills(
+    State(state): State<Arc<AppState>>,
+    Query(page_q): Query<PageQuery>,
+) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.bills_dir(), "bills")?;
-    let mut rows: Vec<(String, String, String)> = Vec::new(); // (year, slug, cells)
+    // (sort_date, year, slug, cells): sort_date is `None` for
+    // date-less payloads so they sink to the bottom.
+    let mut rows: Vec<(Option<NaiveDate>, String, String, String)> = Vec::new();
     for (year, slug, value) in walk_year_json(dir)? {
         let payee = pick_str(&value, &["payee", "accountName"]);
         let invoice = pick_str(&value, &["invoiceNumber", "identifier"]);
@@ -1040,20 +1155,25 @@ async fn list_bills(State(state): State<Arc<AppState>>) -> Result<Html<String>, 
             .into_iter()
             .map(|(label, name)| (label, state.url(&format!("/bills/{year}/{name}"))))
             .collect();
+        let sort_date = due.as_deref().and_then(parse_any_date);
         // Records with no date in the payload fall back to the shard
         // year, which is then the only date they carry.
-        let due = due.unwrap_or_else(|| year.clone());
+        let due_display = due.unwrap_or_else(|| year.clone());
         let cells = format!(
             "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
             esc(&payee.unwrap_or_default()),
             esc(&invoice.unwrap_or_default()),
-            esc(&due),
+            esc(&short_date(&due_display)),
             esc(&amount),
             links_cell(&href, &blobs, vendor.as_deref()),
         );
-        rows.push((year, slug, cells));
+        rows.push((sort_date, year, slug, cells));
     }
-    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    rows.sort_by(|a, b| {
+        b.0.cmp(&a.0) // newest first, None sinks
+            .then(b.1.cmp(&a.1))
+            .then(a.2.cmp(&b.2))
+    });
     if rows.is_empty() {
         return Ok(Html(page(
             &state,
@@ -1061,13 +1181,17 @@ async fn list_bills(State(state): State<Arc<AppState>>) -> Result<Html<String>, 
             "<div class=\"empty\">no bills</div>",
         )));
     }
+    let total = rows.len();
+    let (page_rows, pager) = paginate(&rows, &page_q, &state.url("/bills"));
     let body = format!(
         "<table><thead><tr><th>payee</th><th>invoice</th><th>due</th><th>amount</th><th></th></tr></thead>\
-         <tbody>{}</tbody></table>",
-        rows.into_iter()
-            .map(|(_, _, cells)| format!("<tr>{cells}</tr>"))
+         <tbody>{rows}</tbody></table>{pager}",
+        rows = page_rows
+            .iter()
+            .map(|(_, _, _, cells)| format!("<tr>{cells}</tr>"))
             .collect::<Vec<_>>()
-            .join("")
+            .join(""),
+        pager = pager.render(total),
     );
     Ok(Html(page(&state, "Bills", &body)))
 }
@@ -1080,36 +1204,59 @@ async fn get_bill(
     serve_shard_file(dir, &year, &name)
 }
 
-async fn list_parcels(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
+async fn list_parcels(
+    State(state): State<Arc<AppState>>,
+    Query(page_q): Query<PageQuery>,
+) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.parcels_dir(), "parcels")?;
-    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut rows: Vec<(Option<NaiveDate>, String, String)> = Vec::new();
     for (name, value) in walk_flat_json(dir)? {
         let tracking = pick_str(&value, &["trackingNumber", "identifier"]).unwrap_or_default();
         let status = pick_str(&value, &["deliveryStatus"]).unwrap_or_default();
         let carrier = value
             .get("provider")
-            .and_then(|p| p.get("@id").or_else(|| p.get("name")))
+            .and_then(|p| p.get("name").or_else(|| p.get("@id")))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let eta =
-            pick_str(&value, &["expectedArrivalUntil", "actualDeliveryTime"]).unwrap_or_default();
+        let due = pick_str(
+            &value,
+            &[
+                "actualDeliveryTime",
+                "expectedArrivalUntil",
+                "expectedArrivalFrom",
+            ],
+        )
+        .unwrap_or_default();
+        let sort_date = pick_str(
+            &value,
+            &[
+                "actualDeliveryTime",
+                "expectedArrivalUntil",
+                "receivedAt",
+                "expectedArrivalFrom",
+            ],
+        )
+        .as_deref()
+        .and_then(parse_any_date);
         let vendor = vendor_url(&value);
         let cells = format!(
             "<td>{}</td><td><span class=\"badge\">{}</span></td><td>{}</td><td>{}</td><td>{}</td>",
             esc(&tracking),
             esc(&carrier),
             esc(&status),
-            esc(&eta),
+            esc(&short_date(&due)),
             links_cell(
                 &state.url(&format!("/parcels/{name}")),
                 &[],
                 vendor.as_deref()
             ),
         );
-        rows.push((name, cells));
+        rows.push((sort_date, name, cells));
     }
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    // Newest first; entries with no parseable date sink to the bottom
+    // in alphabetical order so the page is still deterministic.
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     if rows.is_empty() {
         return Ok(Html(page(
             &state,
@@ -1117,13 +1264,17 @@ async fn list_parcels(State(state): State<Arc<AppState>>) -> Result<Html<String>
             "<div class=\"empty\">no parcels</div>",
         )));
     }
+    let total = rows.len();
+    let (page_rows, pager) = paginate(&rows, &page_q, &state.url("/parcels"));
     let body = format!(
-        "<table><thead><tr><th>tracking</th><th>carrier</th><th>status</th><th>eta</th><th></th></tr></thead>\
-         <tbody>{}</tbody></table>",
-        rows.into_iter()
-            .map(|(_, c)| format!("<tr>{c}</tr>"))
+        "<table><thead><tr><th>tracking</th><th>carrier</th><th>status</th><th>date</th><th></th></tr></thead>\
+         <tbody>{rows}</tbody></table>{pager}",
+        rows = page_rows
+            .iter()
+            .map(|(_, _, c)| format!("<tr>{c}</tr>"))
             .collect::<Vec<_>>()
-            .join("")
+            .join(""),
+        pager = pager.render(total),
     );
     Ok(Html(page(&state, "Parcels", &body)))
 }
@@ -1146,32 +1297,42 @@ async fn get_parcel(
         .into_response())
 }
 
-async fn list_receipts(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
+async fn list_receipts(
+    State(state): State<Arc<AppState>>,
+    Query(page_q): Query<PageQuery>,
+) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.receipts_dir(), "receipts")?;
-    let mut rows: Vec<(String, String, String)> = Vec::new();
+    let mut rows: Vec<(Option<NaiveDate>, String, String, String)> = Vec::new();
     for (year, slug, value) in walk_year_json(dir)? {
         let merchant = pick_str(&value, &["merchant", "seller"]).unwrap_or_default();
         let order = pick_str(&value, &["orderNumber", "identifier"]).unwrap_or_default();
-        let date = pick_str(&value, &["orderDate", "date"]).unwrap_or_else(|| year.clone());
+        let date_raw = pick_str(&value, &["orderDate", "date"]);
+        let sort_date = date_raw.as_deref().and_then(parse_any_date);
+        let date_display = date_raw.unwrap_or_else(|| year.clone());
+        let total = value
+            .get("priceSpecification")
+            .map(format_price)
+            .unwrap_or_default();
         let vendor = vendor_url(&value);
         let blobs: Vec<(String, String)> = sibling_blobs(dir, &year, &slug)
             .into_iter()
             .map(|(label, name)| (label, state.url(&format!("/receipts/{year}/{name}"))))
             .collect();
         let cells = format!(
-            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
+            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
             esc(&merchant),
             esc(&order),
-            esc(&date),
+            esc(&short_date(&date_display)),
+            esc(&total),
             links_cell(
                 &state.url(&format!("/receipts/{year}/{slug}.json")),
                 &blobs,
                 vendor.as_deref(),
             ),
         );
-        rows.push((year, slug, cells));
+        rows.push((sort_date, year, slug, cells));
     }
-    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
     if rows.is_empty() {
         return Ok(Html(page(
             &state,
@@ -1179,13 +1340,17 @@ async fn list_receipts(State(state): State<Arc<AppState>>) -> Result<Html<String
             "<div class=\"empty\">no receipts</div>",
         )));
     }
+    let total = rows.len();
+    let (page_rows, pager) = paginate(&rows, &page_q, &state.url("/receipts"));
     let body = format!(
-        "<table><thead><tr><th>merchant</th><th>order</th><th>date</th><th></th></tr></thead>\
-         <tbody>{}</tbody></table>",
-        rows.into_iter()
-            .map(|(_, _, c)| format!("<tr>{c}</tr>"))
+        "<table><thead><tr><th>merchant</th><th>order</th><th>date</th><th>total</th><th></th></tr></thead>\
+         <tbody>{rows}</tbody></table>{pager}",
+        rows = page_rows
+            .iter()
+            .map(|(_, _, _, c)| format!("<tr>{c}</tr>"))
             .collect::<Vec<_>>()
-            .join("")
+            .join(""),
+        pager = pager.render(total),
     );
     Ok(Html(page(&state, "Receipts", &body)))
 }
@@ -1200,19 +1365,19 @@ async fn get_receipt(
 
 async fn list_subscriptions(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.subscriptions_dir(), "subscriptions")?;
-    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut rows: Vec<(Option<NaiveDate>, String, String)> = Vec::new();
     for (name, value) in walk_flat_json(dir)? {
         let display = pick_str(&value, &["name", "provider"]).unwrap_or_default();
         let renewal = pick_str(&value, &["renewalDate", "nextPaymentDate"]).unwrap_or_default();
-        let price = value
-            .get("price")
-            .and_then(|v| v.as_str().map(String::from).or_else(|| Some(v.to_string())))
-            .unwrap_or_default();
+        let price = format_price(&value);
+        let started = pick_str(&value, &["orderDate", "receivedAt"]).unwrap_or_default();
+        let sort_date = parse_any_date(&started);
         let vendor = vendor_url(&value);
         let cells = format!(
-            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
+            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
             esc(&display),
-            esc(&renewal),
+            esc(&short_date(&started)),
+            esc(&short_date(&renewal)),
             esc(&price),
             links_cell(
                 &state.url(&format!("/subscriptions/{name}")),
@@ -1220,9 +1385,11 @@ async fn list_subscriptions(State(state): State<Arc<AppState>>) -> Result<Html<S
                 vendor.as_deref(),
             ),
         );
-        rows.push((name, cells));
+        rows.push((sort_date, name, cells));
     }
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    // Newest first; ties sort by filename so ordering stays stable
+    // across requests.
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     if rows.is_empty() {
         return Ok(Html(page(
             &state,
@@ -1231,14 +1398,44 @@ async fn list_subscriptions(State(state): State<Arc<AppState>>) -> Result<Html<S
         )));
     }
     let body = format!(
-        "<table><thead><tr><th>name</th><th>renews</th><th>price</th><th></th></tr></thead>\
+        "<table><thead><tr><th>name</th><th>started</th><th>renews</th><th>price</th><th></th></tr></thead>\
          <tbody>{}</tbody></table>",
         rows.into_iter()
-            .map(|(_, c)| format!("<tr>{c}</tr>"))
+            .map(|(_, _, c)| format!("<tr>{c}</tr>"))
             .collect::<Vec<_>>()
             .join("")
     );
     Ok(Html(page(&state, "Subscriptions", &body)))
+}
+
+/// Format a subscription/bill/receipt `price` field as `"1.59 GBP"`.
+/// Renders `"free"` when the price parses as exactly zero, and an empty
+/// string when the payload has no numeric price at all.
+fn format_price(value: &Value) -> String {
+    let Some(raw) = value.get("price") else {
+        return String::new();
+    };
+    let amount = raw
+        .as_f64()
+        .or_else(|| raw.as_str().and_then(|s| s.parse().ok()));
+    let Some(amount) = amount else {
+        return raw
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| raw.to_string());
+    };
+    if amount == 0.0 {
+        return "free".into();
+    }
+    let currency = value
+        .get("priceCurrency")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    if currency.is_empty() {
+        format!("{amount}")
+    } else {
+        format!("{amount} {currency}")
+    }
 }
 
 async fn get_subscription(
@@ -1270,13 +1467,15 @@ fn named(value: &Value) -> Option<String> {
 }
 
 /// Who a reservation is with. Same precedence as the filing target:
-/// the airline, then the generic provider, then the broker, then the
+/// the airline, then a provider (top-level or nested under
+/// `reservationFor` as train records emit), then the broker, then the
 /// name of the thing reserved (hotel, venue).
 fn reservation_provider(value: &Value) -> Option<String> {
     let for_ = value.get("reservationFor");
     for_.and_then(|f| f.get("airline"))
         .and_then(named)
         .or_else(|| value.get("provider").and_then(named))
+        .or_else(|| for_.and_then(|f| f.get("provider")).and_then(named))
         .or_else(|| value.get("broker").and_then(named))
         .or_else(|| for_.and_then(|f| f.get("name")).and_then(named))
 }
@@ -1295,30 +1494,35 @@ fn reservation_date(value: &Value) -> Option<String> {
         .or_else(|| pick_str(value, &["checkinTime", "startTime", "receivedAt"]))
 }
 
-async fn list_reservations(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
+async fn list_reservations(
+    State(state): State<Arc<AppState>>,
+    Query(page_q): Query<PageQuery>,
+) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.reservations_dir(), "reservations")?;
-    let mut rows: Vec<(String, String, String)> = Vec::new();
+    let mut rows: Vec<(Option<NaiveDate>, String, String, String)> = Vec::new();
     for (year, slug, value) in walk_year_json(dir)? {
         let provider = reservation_provider(&value).unwrap_or_default();
         let number = reservation_number(&value).unwrap_or_default();
         let under = value.get("underName").and_then(named).unwrap_or_default();
-        let date = reservation_date(&value).unwrap_or_default();
+        let date_raw = reservation_date(&value).unwrap_or_default();
+        let sort_date = parse_any_date(&date_raw);
         let cells = format!(
-            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
-            esc(&year),
+            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
             esc(&provider),
             esc(&number),
             esc(&under),
-            esc(&date),
+            esc(&short_date(&date_raw)),
             links_cell(
                 &state.url(&format!("/reservations/{year}/{slug}.json")),
                 &[],
                 vendor_url(&value).as_deref(),
             ),
         );
-        rows.push((year, slug, cells));
+        rows.push((sort_date, year, slug, cells));
     }
-    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    // Newest trip date first. Ties broken by shard year (desc) then
+    // slug (asc) for determinism.
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
     if rows.is_empty() {
         return Ok(Html(page(
             &state,
@@ -1326,13 +1530,17 @@ async fn list_reservations(State(state): State<Arc<AppState>>) -> Result<Html<St
             "<div class=\"empty\">no reservations</div>",
         )));
     }
+    let total = rows.len();
+    let (page_rows, pager) = paginate(&rows, &page_q, &state.url("/reservations"));
     let body = format!(
-        "<table><thead><tr><th>year</th><th>provider</th><th>reference</th><th>name</th>\
-         <th>date</th><th></th></tr></thead><tbody>{}</tbody></table>",
-        rows.into_iter()
-            .map(|(_, _, c)| format!("<tr>{c}</tr>"))
+        "<table><thead><tr><th>provider</th><th>reference</th><th>name</th>\
+         <th>date</th><th></th></tr></thead><tbody>{rows}</tbody></table>{pager}",
+        rows = page_rows
+            .iter()
+            .map(|(_, _, _, c)| format!("<tr>{c}</tr>"))
             .collect::<Vec<_>>()
-            .join("")
+            .join(""),
+        pager = pager.render(total),
     );
     Ok(Html(page(&state, "Reservations", &body)))
 }
@@ -1347,15 +1555,28 @@ async fn get_reservation(
 
 async fn list_tickets(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.tickets_dir(), "tickets")?;
-    let mut rows: Vec<(String, String, String)> = Vec::new();
+    let mut rows: Vec<(Option<NaiveDate>, String, String, String)> = Vec::new();
     for (year, group) in group_ticket_files(dir)? {
         for (slug, files) in group {
             let size: u64 = files.iter().map(|f| f.size).sum();
-            let types = files
+            let meta = files
                 .iter()
-                .map(|f| f.label().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
+                .find(|f| f.is_meta)
+                .and_then(|f| read_json(&f.path).ok());
+            let provider = meta
+                .as_ref()
+                .and_then(|m| pick_str(m, &["provider"]))
+                .unwrap_or_default();
+            let reference = meta
+                .as_ref()
+                .and_then(|m| pick_str(m, &["reservationNumber", "identifier"]))
+                .unwrap_or_default();
+            let received = meta
+                .as_ref()
+                .and_then(|m| pick_str(m, &["receivedAt"]))
+                .and_then(|s| parse_any_date(&s))
+                .or_else(|| files.iter().filter_map(|f| mtime_date_opt(&f.path)).max());
+            let received_display = received.map(|d| d.to_string()).unwrap_or_default();
             let downloads = files
                 .iter()
                 .map(|f| {
@@ -1368,18 +1589,19 @@ async fn list_tickets(State(state): State<Arc<AppState>>) -> Result<Html<String>
                 .collect::<Vec<_>>()
                 .join(" &middot; ");
             let cells = format!(
-                "<td>{}</td><td><span class=\"badge\">{}</span></td><td>{}</td><td>{}</td>\
-                 <td>{}</td>",
-                esc(&year),
-                esc(&types),
+                "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
+                esc(&received_display),
+                esc(&provider),
+                esc(&reference),
                 esc(&slug),
                 human_size(size),
                 downloads,
             );
-            rows.push((year.clone(), slug, cells));
+            rows.push((received, year.clone(), slug, cells));
         }
     }
-    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    // Newest first; None sinks to the bottom in alphabetical order.
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
     if rows.is_empty() {
         return Ok(Html(page(
             &state,
@@ -1388,10 +1610,11 @@ async fn list_tickets(State(state): State<Arc<AppState>>) -> Result<Html<String>
         )));
     }
     let body = format!(
-        "<table><thead><tr><th>year</th><th>type</th><th>name</th><th>size</th><th></th></tr></thead>\
+        "<table><thead><tr><th>received</th><th>provider</th><th>reference</th>\
+         <th>slug</th><th>size</th><th></th></tr></thead>\
          <tbody>{}</tbody></table>",
         rows.into_iter()
-            .map(|(_, _, c)| format!("<tr>{c}</tr>"))
+            .map(|(_, _, _, c)| format!("<tr>{c}</tr>"))
             .collect::<Vec<_>>()
             .join("")
     );
@@ -1449,6 +1672,17 @@ type TicketYearGroup = (String, Vec<TicketSlugGroup>);
 /// deterministic order: years descending, slugs ascending, and within
 /// each slug the metadata sidecar (if any) first followed by blobs
 /// sorted by extension.
+/// Count ticket *groups* (one per slug) under a tickets directory.
+/// Used for the overview card so a ticket with both a `.pdf` and its
+/// `.meta.json` sidecar counts as one, matching what the list page
+/// renders.
+fn count_ticket_groups(dir: &Path) -> Result<usize> {
+    Ok(group_ticket_files(dir)?
+        .into_iter()
+        .map(|(_, groups)| groups.len())
+        .sum())
+}
+
 fn group_ticket_files(dir: &Path) -> Result<Vec<TicketYearGroup>> {
     let mut years: Vec<TicketYearGroup> = Vec::new();
     for entry in read_dir_or_empty(dir)? {
@@ -2285,6 +2519,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bills_sorted_by_date_desc_across_years() {
+        // Two bills: one dated 2025-01, one 2026-03. Newer must render
+        // first regardless of the alphabetical order of slugs / shard
+        // year they live in.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("bills/2025")).unwrap();
+        fs::create_dir_all(tmp.path().join("bills/2026")).unwrap();
+        fs::write(
+            tmp.path().join("bills/2025/zzz.json"),
+            br#"{"payee":"Old","invoiceNumber":"OLD","dueDate":"2025-01-15"}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("bills/2026/aaa.json"),
+            br#"{"payee":"New","invoiceNumber":"NEW","dueDate":"2026-03-15"}"#,
+        )
+        .unwrap();
+        let config = Config {
+            bills_dir: Some(tmp.path().join("bills")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/bills").await;
+        let new_pos = body.find("NEW").expect("NEW missing");
+        let old_pos = body.find("OLD").expect("OLD missing");
+        assert!(
+            new_pos < old_pos,
+            "expected NEW (2026-03) before OLD (2025-01): {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parcels_sorted_by_date_desc_not_tracking_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("parcels")).unwrap();
+        // Alphabetically A < Z; date-wise Z is newer. Z must sort first.
+        fs::write(
+            tmp.path().join("parcels/A.json"),
+            br#"{"trackingNumber":"A","deliveryStatus":"OrderDelivered",
+                 "receivedAt":"2021-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("parcels/Z.json"),
+            br#"{"trackingNumber":"Z","deliveryStatus":"OutForDelivery",
+                 "receivedAt":"2026-08-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let config = Config {
+            parcels_dir: Some(tmp.path().join("parcels")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/parcels").await;
+        let tbody = body
+            .split("<tbody>")
+            .nth(1)
+            .and_then(|s| s.split("</tbody>").next())
+            .expect("no tbody");
+        let z_pos = tbody.find(">Z<").expect("Z missing");
+        let a_pos = tbody.find(">A<").expect("A missing");
+        assert!(z_pos < a_pos, "expected Z (newer) before A: {tbody}");
+    }
+
+    #[tokio::test]
+    async fn parcels_carrier_uses_name_not_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("parcels")).unwrap();
+        fs::write(
+            tmp.path().join("parcels/T.json"),
+            br#"{"trackingNumber":"T","deliveryStatus":"OrderDelivered",
+                 "provider":{"@id":"amazon-uk","name":"Amazon"}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            parcels_dir: Some(tmp.path().join("parcels")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/parcels").await;
+        assert!(body.contains(">Amazon<"), "carrier name missing: {body}");
+        assert!(!body.contains(">amazon-uk<"), "carrier id leaked: {body}");
+    }
+
+    #[tokio::test]
+    async fn reservation_date_column_is_short_date() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/reservations").await;
+        assert!(
+            body.contains(">2026-04-10<"),
+            "reservation date not shortened: {body}"
+        );
+        assert!(
+            !body.contains(">2026-04-10T08:00:00Z<"),
+            "full ISO datetime still rendered: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bill_list_pager_limits_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("bills/2026")).unwrap();
+        for i in 0..(PAGE_SIZE + 5) {
+            fs::write(
+                tmp.path().join(format!("bills/2026/bill-{i:03}.json")),
+                format!(
+                    r#"{{"payee":"P","invoiceNumber":"INV{i:03}","dueDate":"2026-01-{:02}"}}"#,
+                    (i % 28) + 1
+                ),
+            )
+            .unwrap();
+        }
+        let config = Config {
+            bills_dir: Some(tmp.path().join("bills")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/bills").await;
+        let tbody = body
+            .split("<tbody>")
+            .nth(1)
+            .and_then(|s| s.split("</tbody>").next())
+            .expect("no tbody");
+        assert_eq!(
+            tbody.matches("<tr>").count(),
+            PAGE_SIZE,
+            "first page should show PAGE_SIZE rows: {tbody}"
+        );
+        assert!(body.contains("page 1 of 2"), "pager missing: {body}");
+    }
+
+    #[tokio::test]
+    async fn subscriptions_price_shows_currency_and_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("subscriptions")).unwrap();
+        fs::write(
+            tmp.path().join("subscriptions/paid.json"),
+            br#"{"name":"Paid","price":1.59,"priceCurrency":"GBP",
+                 "orderDate":"2026-01-01"}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("subscriptions/free.json"),
+            br#"{"name":"Free","price":0.0,"priceCurrency":"USD",
+                 "orderDate":"2026-01-02"}"#,
+        )
+        .unwrap();
+        let config = Config {
+            subscriptions_dir: Some(tmp.path().join("subscriptions")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/subscriptions").await;
+        assert!(
+            body.contains("1.59 GBP"),
+            "paid row missing currency: {body}"
+        );
+        assert!(
+            body.contains(">free<"),
+            "free row not labelled 'free': {body}"
+        );
+    }
+
+    #[test]
+    fn format_price_free_zero() {
+        let v: Value = serde_json::from_str(r#"{"price":0.0,"priceCurrency":"GBP"}"#).unwrap();
+        assert_eq!(format_price(&v), "free");
+    }
+
+    #[test]
+    fn format_price_with_currency() {
+        let v: Value = serde_json::from_str(r#"{"price":9.99,"priceCurrency":"EUR"}"#).unwrap();
+        assert_eq!(format_price(&v), "9.99 EUR");
+    }
+
+    #[test]
+    fn format_price_missing() {
+        let v: Value = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(format_price(&v), "");
+    }
+
+    #[tokio::test]
     async fn overview_renders() {
         let (tmp, config) = fixture();
         let bills_dir = config.bills_dir.clone().expect("fixture has bills");
@@ -2589,7 +3006,7 @@ tickets_dir = "/var/mailsift/tickets"
         let (status, body) = get(&app, "/all").await;
         assert_eq!(status, StatusCode::OK);
         assert!(
-            body.contains("<span class=\"badge\">reservation</span>"),
+            body.contains("<span class=\"badge reservation\">reservation</span>"),
             "no reservation badge in feed: {body}"
         );
         assert!(body.contains("Fixture Air"), "feed row missing: {body}");
