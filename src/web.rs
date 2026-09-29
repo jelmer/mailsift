@@ -235,6 +235,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/reservations/:year/:slug/view", get(view_reservation))
         .route("/reservations/:year/:name", get(get_reservation))
         .route("/tickets", get(list_tickets))
+        .route("/tickets/:year/:slug/view", get(view_ticket))
         .route("/tickets/:year/:name", get(get_ticket))
         .route("/stats", get(show_stats))
         .route("/api/bills.json", get(api_bills))
@@ -377,6 +378,15 @@ pre { background: #f5f5f7; padding: 1rem; overflow: auto; }
 .muted { color: #777; }
 .pager { margin: 1rem 0; }
 .pager a, .pager span { margin-right: 0.5rem; }
+.filter-bar { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; margin: 0 0 1rem; }
+.filter-bar form.search { display: flex; gap: 0.4rem; }
+.filter-bar input[type=search] { padding: 0.35rem 0.6rem; border: 1px solid #ccc; border-radius: 4px; font: inherit; }
+.filter-bar button { padding: 0.35rem 0.75rem; border: 1px solid #2a3f5f; background: #2a3f5f; color: #fff; border-radius: 4px; cursor: pointer; font: inherit; }
+.filter-bar button:hover { background: #1e2e46; }
+.year-chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.year-chips a.chip { display: inline-block; padding: 0.15rem 0.55rem; border-radius: 999px; background: #eef1f6; color: #2a3f5f; font-size: 0.85rem; text-decoration: none; }
+.year-chips a.chip:hover { background: #dde3ed; }
+.year-chips a.chip.active { background: #2a3f5f; color: #fff; }
 dl.detail { display: grid; grid-template-columns: max-content 1fr; column-gap: 1rem; row-gap: 0.35rem; background: #fff; padding: 1rem; border-radius: 6px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); margin: 0 0 1rem; }
 dl.detail dt { color: #555; font-weight: 500; }
 dl.detail dd { margin: 0; }
@@ -464,7 +474,11 @@ async fn index(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppEr
     // that file elsewhere (CalDAV for events, WebDAV/forwarder for
     // receipts/tickets) have their own UIs.
     let mut cards = Vec::new();
-    for (label, href, count) in [
+    let subscription_totals = state
+        .subscriptions_dir()
+        .map(count_active_subscriptions)
+        .transpose()?;
+    for (label, href, count, subtitle) in [
         (
             "events",
             "/events",
@@ -472,6 +486,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppEr
                 .events_dir()
                 .map(|d| count_flat(d, "ics"))
                 .transpose()?,
+            None,
         ),
         (
             "bills",
@@ -480,6 +495,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppEr
                 .bills_dir()
                 .map(|d| count_year(d, Some("json")))
                 .transpose()?,
+            None,
         ),
         (
             "parcels",
@@ -488,6 +504,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppEr
                 .parcels_dir()
                 .map(|d| count_flat(d, "json"))
                 .transpose()?,
+            None,
         ),
         (
             "receipts",
@@ -496,14 +513,13 @@ async fn index(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppEr
                 .receipts_dir()
                 .map(|d| count_year(d, Some("json")))
                 .transpose()?,
+            None,
         ),
         (
             "subscriptions",
             "/subscriptions",
-            state
-                .subscriptions_dir()
-                .map(|d| count_flat(d, "json"))
-                .transpose()?,
+            subscription_totals.map(|(_, total)| total),
+            subscription_totals.map(|(active, _)| format!("{active} active")),
         ),
         (
             "reservations",
@@ -512,17 +528,23 @@ async fn index(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppEr
                 .reservations_dir()
                 .map(|d| count_year(d, Some("json")))
                 .transpose()?,
+            None,
         ),
         (
             "tickets",
             "/tickets",
             state.tickets_dir().map(count_ticket_groups).transpose()?,
+            None,
         ),
     ] {
         if let Some(count) = count {
+            let subtitle_html = subtitle
+                .as_deref()
+                .map(|s| format!("<div class=\"muted\">{}</div>", esc(s)))
+                .unwrap_or_default();
             cards.push(format!(
                 "<div class=\"card\"><h2><a href=\"{href}\">{label}</a></h2>\
-                 <div class=\"n\">{count}</div></div>",
+                 <div class=\"n\">{count}</div>{subtitle_html}</div>",
                 href = esc(&state.url(href)),
                 label = esc(label),
             ));
@@ -612,13 +634,38 @@ fn render_feed_section(state: &AppState, title: &str, items: &[&FeedItem], limit
     )
 }
 
-async fn list_all(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
+async fn list_all(
+    State(state): State<Arc<AppState>>,
+    Query(page_q): Query<PageQuery>,
+) -> Result<Html<String>, AppError> {
     let feed = build_feed(&state)?;
     let (upcoming, recent) = split_feed(&feed);
     let body = if feed.is_empty() {
         "<div class=\"empty\">no artifacts yet</div>".to_string()
     } else {
-        render_feed_sections(&state, &upcoming, &recent, usize::MAX)
+        // Upcoming stays fully rendered (typically small); Recent
+        // dominates the row count once you have any history, so that's
+        // the section we paginate.
+        let mut out = String::new();
+        if !upcoming.is_empty() {
+            out.push_str(&render_feed_section(
+                &state,
+                "Upcoming",
+                &upcoming,
+                usize::MAX,
+            ));
+        }
+        if !recent.is_empty() {
+            let (page_slice, pager) = paginate(&recent, &page_q, &state.url("/all"));
+            out.push_str(&render_feed_section(
+                &state,
+                "Recent",
+                page_slice,
+                usize::MAX,
+            ));
+            out.push_str(&pager.render(recent.len()));
+        }
+        out
     };
     Ok(Html(page(&state, "All artifacts", &body)))
 }
@@ -695,25 +742,78 @@ fn short_date(raw: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
-/// `?page=N` query parameter, 1-indexed. Defaults to page 1. Values
-/// that don't parse as a positive integer are treated the same as no
-/// `page` at all so a shared URL with a garbage tail doesn't 400.
+/// Query parameters shared by every list page: pagination, a
+/// substring search, and a shard-year filter. All fields are optional
+/// and lenient — values that don't parse fall back to `None` rather
+/// than 400ing a shared URL.
 #[derive(Default)]
-struct PageQuery {
+struct ListQuery {
     page: Option<usize>,
+    q: Option<String>,
+    year: Option<String>,
 }
 
-impl<'de> Deserialize<'de> for PageQuery {
+impl<'de> Deserialize<'de> for ListQuery {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Raw {
             page: Option<String>,
+            q: Option<String>,
+            year: Option<String>,
         }
         let raw = Raw::deserialize(deserializer)?;
-        Ok(PageQuery {
+        Ok(ListQuery {
             page: raw.page.and_then(|s| s.parse().ok()),
+            q: raw.q.filter(|s| !s.is_empty()),
+            year: raw.year.filter(|s| !s.is_empty()),
         })
     }
+}
+
+/// Backwards-compatible alias so older call sites and tests keep
+/// working; the new name reflects the broader remit.
+type PageQuery = ListQuery;
+
+impl ListQuery {
+    /// Serialise the non-empty fields to a URL query string prefixed
+    /// with `?`, or the empty string if nothing is set. Used to build
+    /// pager `href`s that preserve the current filters.
+    fn to_query_string(&self, override_page: Option<usize>) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(q) = &self.q {
+            parts.push(format!("q={}", url_encode(q)));
+        }
+        if let Some(y) = &self.year {
+            parts.push(format!("year={}", url_encode(y)));
+        }
+        if let Some(p) = override_page.or(self.page)
+            && p > 1
+        {
+            parts.push(format!("page={p}"));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", parts.join("&"))
+        }
+    }
+}
+
+/// Minimal percent-encoder for query values: spaces to `+`, everything
+/// non-alphanumeric to `%XX`. Good enough for the free-text `q=` and
+/// four-digit `year=` values we actually emit.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match *b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Rows-per-page for the list views. Big enough to fit the "few
@@ -722,13 +822,14 @@ impl<'de> Deserialize<'de> for PageQuery {
 /// vendor links.
 const PAGE_SIZE: usize = 100;
 
-/// Paginate `rows` for `page_q`, returning the slice for the current
+/// Paginate `rows` for `query`, returning the slice for the current
 /// page plus a pre-built [`Pager`] describing prev/next links relative
-/// to `base_url`.
-fn paginate<'a, T>(rows: &'a [T], page_q: &PageQuery, base_url: &str) -> (&'a [T], Pager) {
+/// to `base_url`. `base_url` should not carry its own query string;
+/// filter parameters from `query` are appended when the pager renders.
+fn paginate<'a, T>(rows: &'a [T], query: &ListQuery, base_url: &str) -> (&'a [T], Pager) {
     let total = rows.len();
     let pages = total.div_ceil(PAGE_SIZE).max(1);
-    let page = page_q.page.unwrap_or(1).clamp(1, pages);
+    let page = query.page.unwrap_or(1).clamp(1, pages);
     let start = (page - 1) * PAGE_SIZE;
     let end = (start + PAGE_SIZE).min(total);
     (
@@ -737,6 +838,8 @@ fn paginate<'a, T>(rows: &'a [T], page_q: &PageQuery, base_url: &str) -> (&'a [T
             page,
             pages,
             base_url: base_url.to_string(),
+            prev_query: query.to_query_string(Some(page.saturating_sub(1).max(1))),
+            next_query: query.to_query_string(Some(page + 1)),
         },
     )
 }
@@ -747,6 +850,10 @@ struct Pager {
     page: usize,
     pages: usize,
     base_url: String,
+    /// Pre-built query strings for prev/next links so filters (`q=`,
+    /// `year=`) survive pagination.
+    prev_query: String,
+    next_query: String,
 }
 
 impl Pager {
@@ -760,9 +867,9 @@ impl Pager {
         let mut out = String::from("<nav class=\"pager\">");
         if self.page > 1 {
             out.push_str(&format!(
-                "<a href=\"{}?page={}\">&laquo; prev</a>",
+                "<a href=\"{}{}\">&laquo; prev</a>",
                 esc(&self.base_url),
-                self.page - 1
+                self.prev_query,
             ));
         } else {
             out.push_str("<span class=\"muted\">&laquo; prev</span>");
@@ -773,9 +880,9 @@ impl Pager {
         ));
         if self.page < self.pages {
             out.push_str(&format!(
-                "<a href=\"{}?page={}\">next &raquo;</a>",
+                "<a href=\"{}{}\">next &raquo;</a>",
                 esc(&self.base_url),
-                self.page + 1
+                self.next_query,
             ));
         } else {
             out.push_str("<span class=\"muted\">next &raquo;</span>");
@@ -783,6 +890,79 @@ impl Pager {
         out.push_str("</nav>");
         out
     }
+}
+
+/// Render a compact filter bar for a list page: a search input plus
+/// year chips (skipped when `years` is empty). Submitting the search
+/// preserves the current `year=` filter but resets `page=` since page
+/// numbers rarely make sense after the row set changes.
+fn filter_bar(base_url: &str, query: &ListQuery, years: &[String]) -> String {
+    let mut out = String::from("<div class=\"filter-bar\">");
+    let hidden_year = query
+        .year
+        .as_deref()
+        .map(|y| format!("<input type=\"hidden\" name=\"year\" value=\"{}\">", esc(y),))
+        .unwrap_or_default();
+    let q_value = query.q.as_deref().unwrap_or("");
+    out.push_str(&format!(
+        "<form method=\"get\" action=\"{}\" class=\"search\">\
+         {hidden_year}<input type=\"search\" name=\"q\" value=\"{}\" \
+         placeholder=\"search\" autocomplete=\"off\">\
+         <button type=\"submit\">go</button></form>",
+        esc(base_url),
+        esc(q_value),
+    ));
+    if !years.is_empty() {
+        out.push_str("<div class=\"year-chips\">");
+        // "all" chip clears the year filter but keeps any active search.
+        let all_href = {
+            let q = ListQuery {
+                page: None,
+                q: query.q.clone(),
+                year: None,
+            };
+            format!("{}{}", base_url, q.to_query_string(None))
+        };
+        let all_active = query.year.is_none();
+        out.push_str(&format!(
+            "<a href=\"{}\" class=\"{}\">all</a>",
+            esc(&all_href),
+            if all_active { "chip active" } else { "chip" },
+        ));
+        for year in years {
+            let href = {
+                let q = ListQuery {
+                    page: None,
+                    q: query.q.clone(),
+                    year: Some(year.clone()),
+                };
+                format!("{}{}", base_url, q.to_query_string(None))
+            };
+            let active = query.year.as_deref() == Some(year.as_str());
+            out.push_str(&format!(
+                "<a href=\"{}\" class=\"{}\">{}</a>",
+                esc(&href),
+                if active { "chip active" } else { "chip" },
+                esc(year),
+            ));
+        }
+        out.push_str("</div>");
+    }
+    out.push_str("</div>");
+    out
+}
+
+/// True when `query` has no substring filter, or when `haystack`
+/// contains that substring (case-insensitive). `haystack` should
+/// concatenate every user-visible field on a row so the match feels
+/// like "find anywhere on this line".
+fn matches_search(query: &ListQuery, haystack: &str) -> bool {
+    let Some(q) = &query.q else {
+        return true;
+    };
+    haystack
+        .to_ascii_lowercase()
+        .contains(&q.to_ascii_lowercase())
 }
 
 /// Gather every artifact into a single date-sorted feed. Missing dates
@@ -1201,13 +1381,20 @@ fn ics_field(body: &str, key: &str) -> Option<String> {
 
 async fn list_bills(
     State(state): State<Arc<AppState>>,
-    Query(page_q): Query<PageQuery>,
+    Query(query): Query<ListQuery>,
 ) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.bills_dir(), "bills")?;
     // (sort_date, year, slug, cells): sort_date is `None` for
     // date-less payloads so they sink to the bottom.
     let mut rows: Vec<(Option<NaiveDate>, String, String, String)> = Vec::new();
+    let mut years_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (year, slug, value) in walk_year_json(dir)? {
+        years_seen.insert(year.clone());
+        if let Some(y) = &query.year
+            && &year != y
+        {
+            continue;
+        }
         let payee = pick_str(&value, &["payee", "accountName"]);
         let invoice = pick_str(&value, &["invoiceNumber", "identifier"]);
         let due = pick_str(&value, &["dueDate", "paymentDueDate", "date"]);
@@ -1222,6 +1409,18 @@ async fn list_bills(
                 Some(format!("{} {}", price, cur).trim().to_string())
             })
             .unwrap_or_default();
+        // Search haystack: every visible column so `?q=` matches
+        // anywhere on the line.
+        let haystack = format!(
+            "{} {} {} {}",
+            payee.as_deref().unwrap_or(""),
+            invoice.as_deref().unwrap_or(""),
+            due.as_deref().unwrap_or(""),
+            amount,
+        );
+        if !matches_search(&query, &haystack) {
+            continue;
+        }
         let href = state.url(&format!("/bills/{}/{}.json", year, slug));
         let view_href = state.url(&format!("/bills/{year}/{slug}/view"));
         let vendor = vendor_url(&value);
@@ -1230,8 +1429,6 @@ async fn list_bills(
             .map(|(label, name)| (label, state.url(&format!("/bills/{year}/{name}"))))
             .collect();
         let sort_date = due.as_deref().and_then(parse_any_date);
-        // Records with no date in the payload fall back to the shard
-        // year, which is then the only date they carry.
         let due_display = due.unwrap_or_else(|| year.clone());
         let cells = format!(
             "<td><a href=\"{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
@@ -1249,17 +1446,20 @@ async fn list_bills(
             .then(b.1.cmp(&a.1))
             .then(a.2.cmp(&b.2))
     });
+    let base_url = state.url("/bills");
+    let years: Vec<String> = years_seen.into_iter().rev().collect();
+    let bar = filter_bar(&base_url, &query, &years);
     if rows.is_empty() {
         return Ok(Html(page(
             &state,
             "Bills",
-            "<div class=\"empty\">no bills</div>",
+            &format!("{bar}<div class=\"empty\">no bills</div>"),
         )));
     }
     let total = rows.len();
-    let (page_rows, pager) = paginate(&rows, &page_q, &state.url("/bills"));
+    let (page_rows, pager) = paginate(&rows, &query, &base_url);
     let body = format!(
-        "<table><thead><tr><th>payee</th><th>invoice</th><th>due</th><th>amount</th><th></th></tr></thead>\
+        "{bar}<table><thead><tr><th>payee</th><th>invoice</th><th>due</th><th>amount</th><th></th></tr></thead>\
          <tbody>{rows}</tbody></table>{pager}",
         rows = page_rows
             .iter()
@@ -1332,7 +1532,7 @@ async fn view_bill(
 
 async fn list_parcels(
     State(state): State<Arc<AppState>>,
-    Query(page_q): Query<PageQuery>,
+    Query(query): Query<ListQuery>,
 ) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.parcels_dir(), "parcels")?;
     let mut rows: Vec<(Option<NaiveDate>, String, String)> = Vec::new();
@@ -1345,15 +1545,32 @@ async fn list_parcels(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let due = pick_str(
-            &value,
-            &[
-                "actualDeliveryTime",
-                "expectedArrivalUntil",
-                "expectedArrivalFrom",
-            ],
-        )
-        .unwrap_or_default();
+        // For delivered/returned parcels, extractors often don't fill
+        // `actualDeliveryTime`; the `receivedAt` of the delivery email
+        // is a close proxy so the row doesn't render a blank date. If
+        // the record has no `receivedAt` either (older backfilled
+        // parcels), fall back to the newest history entry's `seen_at`
+        // - roughly the pipeline's last touch, close enough for a
+        // list row.
+        let terminal = matches!(
+            status.as_str(),
+            "OrderDelivered" | "Delivered" | "OrderReturned" | "Returned" | "ReturnedToSender"
+        );
+        let mut due_keys: Vec<&str> = vec![
+            "actualDeliveryTime",
+            "expectedArrivalUntil",
+            "expectedArrivalFrom",
+        ];
+        if terminal {
+            due_keys.push("receivedAt");
+        }
+        let due = pick_str(&value, &due_keys)
+            .or_else(|| terminal.then(|| last_history_seen_at(&value)).flatten())
+            .unwrap_or_default();
+        let haystack = format!("{tracking} {carrier} {status} {due}");
+        if !matches_search(&query, &haystack) {
+            continue;
+        }
         let sort_date = pick_str(
             &value,
             &[
@@ -1363,6 +1580,7 @@ async fn list_parcels(
                 "expectedArrivalFrom",
             ],
         )
+        .or_else(|| last_history_seen_at(&value))
         .as_deref()
         .and_then(parse_any_date);
         let vendor = vendor_url(&value);
@@ -1384,20 +1602,20 @@ async fn list_parcels(
         );
         rows.push((sort_date, name, cells));
     }
-    // Newest first; entries with no parseable date sink to the bottom
-    // in alphabetical order so the page is still deterministic.
     rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let base_url = state.url("/parcels");
+    let bar = filter_bar(&base_url, &query, &[]);
     if rows.is_empty() {
         return Ok(Html(page(
             &state,
             "Parcels",
-            "<div class=\"empty\">no parcels</div>",
+            &format!("{bar}<div class=\"empty\">no parcels</div>"),
         )));
     }
     let total = rows.len();
-    let (page_rows, pager) = paginate(&rows, &page_q, &state.url("/parcels"));
+    let (page_rows, pager) = paginate(&rows, &query, &base_url);
     let body = format!(
-        "<table><thead><tr><th>tracking</th><th>carrier</th><th>status</th><th>date</th><th></th></tr></thead>\
+        "{bar}<table><thead><tr><th>tracking</th><th>carrier</th><th>status</th><th>date</th><th></th></tr></thead>\
          <tbody>{rows}</tbody></table>{pager}",
         rows = page_rows
             .iter()
@@ -1479,20 +1697,31 @@ async fn view_parcel(
 
 async fn list_receipts(
     State(state): State<Arc<AppState>>,
-    Query(page_q): Query<PageQuery>,
+    Query(query): Query<ListQuery>,
 ) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.receipts_dir(), "receipts")?;
     let mut rows: Vec<(Option<NaiveDate>, String, String, String)> = Vec::new();
+    let mut years_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (year, slug, value) in walk_year_json(dir)? {
+        years_seen.insert(year.clone());
+        if let Some(y) = &query.year
+            && &year != y
+        {
+            continue;
+        }
         let merchant = pick_str(&value, &["merchant", "seller"]).unwrap_or_default();
         let order = pick_str(&value, &["orderNumber", "identifier"]).unwrap_or_default();
         let date_raw = pick_str(&value, &["orderDate", "date"]);
         let sort_date = date_raw.as_deref().and_then(parse_any_date);
         let date_display = date_raw.unwrap_or_else(|| year.clone());
-        let total = value
+        let total_str = value
             .get("priceSpecification")
             .map(format_price)
             .unwrap_or_default();
+        let haystack = format!("{} {} {} {}", merchant, order, date_display, total_str,);
+        if !matches_search(&query, &haystack) {
+            continue;
+        }
         let vendor = vendor_url(&value);
         let view_href = state.url(&format!("/receipts/{year}/{slug}/view"));
         let blobs: Vec<(String, String)> = sibling_blobs(dir, &year, &slug)
@@ -1505,7 +1734,7 @@ async fn list_receipts(
             esc(&merchant),
             esc(&order),
             esc(&short_date(&date_display)),
-            esc(&total),
+            esc(&total_str),
             links_cell(
                 &state.url(&format!("/receipts/{year}/{slug}.json")),
                 &blobs,
@@ -1515,17 +1744,20 @@ async fn list_receipts(
         rows.push((sort_date, year, slug, cells));
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    let base_url = state.url("/receipts");
+    let years: Vec<String> = years_seen.into_iter().rev().collect();
+    let bar = filter_bar(&base_url, &query, &years);
     if rows.is_empty() {
         return Ok(Html(page(
             &state,
             "Receipts",
-            "<div class=\"empty\">no receipts</div>",
+            &format!("{bar}<div class=\"empty\">no receipts</div>"),
         )));
     }
     let total = rows.len();
-    let (page_rows, pager) = paginate(&rows, &page_q, &state.url("/receipts"));
+    let (page_rows, pager) = paginate(&rows, &query, &base_url);
     let body = format!(
-        "<table><thead><tr><th>merchant</th><th>order</th><th>date</th><th>total</th><th></th></tr></thead>\
+        "{bar}<table><thead><tr><th>merchant</th><th>order</th><th>date</th><th>total</th><th></th></tr></thead>\
          <tbody>{rows}</tbody></table>{pager}",
         rows = page_rows
             .iter()
@@ -1592,7 +1824,10 @@ async fn view_receipt(
     )))
 }
 
-async fn list_subscriptions(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
+async fn list_subscriptions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListQuery>,
+) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.subscriptions_dir(), "subscriptions")?;
     let today = Utc::now().date_naive();
     // (sort_date, active, name, cells): sort active first, then newest.
@@ -1608,6 +1843,10 @@ async fn list_subscriptions(State(state): State<Arc<AppState>>) -> Result<Html<S
             .and_then(parse_any_date);
         let duration = pick_str(&value, &["subscriptionDuration"]);
         let active = is_subscription_active(received, duration.as_deref(), today);
+        let haystack = format!("{display} {started} {renewal} {price}");
+        if !matches_search(&query, &haystack) {
+            continue;
+        }
         let status_html = if active {
             "<span class=\"badge subscription\">active</span>".to_string()
         } else {
@@ -1632,18 +1871,18 @@ async fn list_subscriptions(State(state): State<Arc<AppState>>) -> Result<Html<S
         );
         rows.push((active, sort_date, name, cells));
     }
-    // Active subscriptions first, then newest within each group; ties
-    // by filename for determinism.
     rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    let base_url = state.url("/subscriptions");
+    let bar = filter_bar(&base_url, &query, &[]);
     if rows.is_empty() {
         return Ok(Html(page(
             &state,
             "Subscriptions",
-            "<div class=\"empty\">no subscriptions</div>",
+            &format!("{bar}<div class=\"empty\">no subscriptions</div>"),
         )));
     }
     let body = format!(
-        "<table><thead><tr><th>name</th><th>status</th><th>started</th><th>renews</th>\
+        "{bar}<table><thead><tr><th>name</th><th>status</th><th>started</th><th>renews</th>\
          <th>price</th><th></th></tr></thead>\
          <tbody>{}</tbody></table>",
         rows.into_iter()
@@ -1675,6 +1914,26 @@ fn is_subscription_active(
     age <= i64::from(stale_after_days)
 }
 
+/// `(active_count, total_count)` for the subscriptions overview card.
+/// Applies the same activity heuristic as the list page so the
+/// numbers match.
+fn count_active_subscriptions(dir: &Path) -> Result<(usize, usize)> {
+    let today = Utc::now().date_naive();
+    let mut active = 0;
+    let mut total = 0;
+    for (_, value) in walk_flat_json(dir)? {
+        total += 1;
+        let received = pick_str(&value, &["receivedAt"])
+            .as_deref()
+            .and_then(parse_any_date);
+        let duration = pick_str(&value, &["subscriptionDuration"]);
+        if is_subscription_active(received, duration.as_deref(), today) {
+            active += 1;
+        }
+    }
+    Ok((active, total))
+}
+
 /// Approximate an ISO 8601 duration (`P1M`, `P1Y`, `P7D`, ...) as a
 /// day count. Only supports the single-designator forms schema.org
 /// subscription payloads actually use; anything more elaborate returns
@@ -1698,6 +1957,21 @@ fn parse_iso_duration_days(iso: &str) -> Option<u32> {
 /// Format a subscription/bill/receipt `price` field as `"1.59 GBP"`.
 /// Renders `"free"` when the price parses as exactly zero, and an empty
 /// string when the payload has no numeric price at all.
+/// The `seen_at` timestamp of the last history entry on a parcel
+/// record, if any. Records filed before `receivedAt` stamping was
+/// added carry only this pipeline timestamp; the parcel list uses it
+/// as a last-resort date column so terminal entries don't render
+/// blank.
+fn last_history_seen_at(value: &Value) -> Option<String> {
+    value
+        .get("history")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.last())
+        .and_then(|entry| entry.get("seen_at"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
 fn format_price(value: &Value) -> String {
     let Some(raw) = value.get("price") else {
         return String::new();
@@ -1825,17 +2099,28 @@ fn reservation_date(value: &Value) -> Option<String> {
 
 async fn list_reservations(
     State(state): State<Arc<AppState>>,
-    Query(page_q): Query<PageQuery>,
+    Query(query): Query<ListQuery>,
 ) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.reservations_dir(), "reservations")?;
     let mut rows: Vec<(Option<NaiveDate>, String, String, String)> = Vec::new();
+    let mut years_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (year, slug, value) in walk_year_json(dir)? {
+        years_seen.insert(year.clone());
+        if let Some(y) = &query.year
+            && &year != y
+        {
+            continue;
+        }
         let provider = reservation_provider(&value).unwrap_or_default();
         let number = reservation_number(&value).unwrap_or_default();
         let under = value.get("underName").and_then(named).unwrap_or_default();
         let date_raw = reservation_date(&value).unwrap_or_default();
         let sort_date = parse_any_date(&date_raw);
         let route = reservation_route(&value).unwrap_or_default();
+        let haystack = format!("{provider} {number} {route} {under} {date_raw}");
+        if !matches_search(&query, &haystack) {
+            continue;
+        }
         let view_href = state.url(&format!("/reservations/{year}/{slug}/view"));
         let cells = format!(
             "<td><a href=\"{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
@@ -1853,20 +2138,21 @@ async fn list_reservations(
         );
         rows.push((sort_date, year, slug, cells));
     }
-    // Newest trip date first. Ties broken by shard year (desc) then
-    // slug (asc) for determinism.
     rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    let base_url = state.url("/reservations");
+    let years: Vec<String> = years_seen.into_iter().rev().collect();
+    let bar = filter_bar(&base_url, &query, &years);
     if rows.is_empty() {
         return Ok(Html(page(
             &state,
             "Reservations",
-            "<div class=\"empty\">no reservations</div>",
+            &format!("{bar}<div class=\"empty\">no reservations</div>"),
         )));
     }
     let total = rows.len();
-    let (page_rows, pager) = paginate(&rows, &page_q, &state.url("/reservations"));
+    let (page_rows, pager) = paginate(&rows, &query, &base_url);
     let body = format!(
-        "<table><thead><tr><th>provider</th><th>reference</th><th>route</th>\
+        "{bar}<table><thead><tr><th>provider</th><th>reference</th><th>route</th>\
          <th>name</th><th>date</th><th></th></tr></thead>\
          <tbody>{rows}</tbody></table>{pager}",
         rows = page_rows
@@ -1952,10 +2238,20 @@ async fn view_reservation(
     )))
 }
 
-async fn list_tickets(State(state): State<Arc<AppState>>) -> Result<Html<String>, AppError> {
+async fn list_tickets(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListQuery>,
+) -> Result<Html<String>, AppError> {
     let dir = require_dir(state.tickets_dir(), "tickets")?;
     let mut rows: Vec<(Option<NaiveDate>, String, String, String)> = Vec::new();
+    let mut years_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (year, group) in group_ticket_files(dir)? {
+        years_seen.insert(year.clone());
+        if let Some(y) = &query.year
+            && &year != y
+        {
+            continue;
+        }
         for (slug, files) in group {
             let size: u64 = files.iter().map(|f| f.size).sum();
             let meta = files
@@ -1975,6 +2271,10 @@ async fn list_tickets(State(state): State<Arc<AppState>>) -> Result<Html<String>
                 .and_then(|m| pick_str(m, &["receivedAt"]))
                 .and_then(|s| parse_any_date(&s))
                 .or_else(|| files.iter().filter_map(|f| mtime_date_opt(&f.path)).max());
+            let haystack = format!("{provider} {reference} {slug}");
+            if !matches_search(&query, &haystack) {
+                continue;
+            }
             let received_display = received.map(|d| d.to_string()).unwrap_or_default();
             let downloads = files
                 .iter()
@@ -1987,10 +2287,17 @@ async fn list_tickets(State(state): State<Arc<AppState>>) -> Result<Html<String>
                 })
                 .collect::<Vec<_>>()
                 .join(" &middot; ");
+            let view_href = state.url(&format!("/tickets/{year}/{slug}/view"));
+            let title_display = if !provider.is_empty() {
+                provider.clone()
+            } else {
+                slug.clone()
+            };
             let cells = format!(
-                "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
+                "<td>{}</td><td><a href=\"{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
                 esc(&received_display),
-                esc(&provider),
+                esc(&view_href),
+                esc(&title_display),
                 esc(&reference),
                 esc(&slug),
                 human_size(size),
@@ -1999,17 +2306,19 @@ async fn list_tickets(State(state): State<Arc<AppState>>) -> Result<Html<String>
             rows.push((received, year.clone(), slug, cells));
         }
     }
-    // Newest first; None sinks to the bottom in alphabetical order.
     rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    let base_url = state.url("/tickets");
+    let years: Vec<String> = years_seen.into_iter().rev().collect();
+    let bar = filter_bar(&base_url, &query, &years);
     if rows.is_empty() {
         return Ok(Html(page(
             &state,
             "Tickets",
-            "<div class=\"empty\">no tickets</div>",
+            &format!("{bar}<div class=\"empty\">no tickets</div>"),
         )));
     }
     let body = format!(
-        "<table><thead><tr><th>received</th><th>provider</th><th>reference</th>\
+        "{bar}<table><thead><tr><th>received</th><th>provider</th><th>reference</th>\
          <th>slug</th><th>size</th><th></th></tr></thead>\
          <tbody>{}</tbody></table>",
         rows.into_iter()
@@ -2148,6 +2457,62 @@ async fn get_ticket(
     let body = fs::read(&path).map_err(|e| read_status(&path, e))?;
     let ct = content_type_for(name);
     Ok(([(header::CONTENT_TYPE, HeaderValue::from_static(ct))], body).into_response())
+}
+
+async fn view_ticket(
+    State(state): State<Arc<AppState>>,
+    UrlPath((year, slug)): UrlPath<(String, String)>,
+) -> Result<Html<String>, AppError> {
+    let dir = require_dir(state.tickets_dir(), "tickets")?;
+    let year_seg = safe_segment(&year)?;
+    let slug_seg = safe_segment(&slug)?;
+    let meta_path = dir.join(year_seg).join(format!("{slug_seg}.meta.json"));
+    let value = read_json(&meta_path).map_err(|e| AppError {
+        status: if !meta_path.exists() {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        },
+        err: e,
+    })?;
+    let provider = pick_str(&value, &["provider"]).unwrap_or_else(|| slug.clone());
+    let reference = pick_str(&value, &["reservationNumber", "identifier"]).unwrap_or_default();
+    let fields = [
+        ("Provider", pick_str(&value, &["provider"])),
+        (
+            "Reference",
+            pick_str(&value, &["reservationNumber", "identifier"]),
+        ),
+        ("File", pick_str(&value, &["file"])),
+        ("Content type", pick_str(&value, &["contentType"])),
+        (
+            "Received",
+            pick_str(&value, &["receivedAt"]).map(|s| short_date(&s)),
+        ),
+    ];
+    // Collect every file in the ticket group so the view page links
+    // to both the sidecar json and the blob(s) beside it.
+    let group = group_ticket_files(dir)?
+        .into_iter()
+        .find(|(y, _)| y == &year)
+        .map(|(_, groups)| groups)
+        .unwrap_or_default();
+    let files = group
+        .into_iter()
+        .find(|(s, _)| s == &slug)
+        .map(|(_, f)| f)
+        .unwrap_or_default();
+    let (primary_href_rel, blobs_rel) = ticket_links(&year, &files);
+    let primary_href = state.url(&primary_href_rel);
+    let blobs: Vec<(String, String)> = blobs_rel
+        .into_iter()
+        .map(|(label, path)| (label, state.url(&path)))
+        .collect();
+    Ok(Html(page(
+        &state,
+        &provider,
+        &detail_view(&reference, &fields, &primary_href, &blobs, None),
+    )))
 }
 
 fn content_type_for(name: &str) -> &'static str {
@@ -2489,8 +2854,26 @@ fn detail_view(
         out.push_str(&format!("<dt>{}</dt><dd>{}</dd>", esc(label), esc(v)));
     }
     out.push_str("</dl>");
-    out.push_str("<p class=\"links\">");
-    out.push_str(&links_cell(json_href, blobs, vendor));
+    // The list-page `links_cell` renders the JSON link as plain `json`
+    // because the row title already implies "the record". On a detail
+    // view the reader is looking *at* the record, so make the label
+    // explicit that this link takes you to the raw source.
+    out.push_str("<p class=\"links\"><a href=\"");
+    out.push_str(&esc(json_href));
+    out.push_str("\">raw json</a>");
+    for (label, href) in blobs {
+        out.push_str(&format!(
+            " &middot; <a href=\"{}\">{}</a>",
+            esc(href),
+            esc(label),
+        ));
+    }
+    if let Some(url) = vendor {
+        out.push_str(&format!(
+            " &middot; <a href=\"{}\" rel=\"noopener noreferrer\">open</a>",
+            esc(url),
+        ));
+    }
     out.push_str("</p>");
     out
 }
@@ -3263,6 +3646,229 @@ mod tests {
             body.contains("/bills/2026/acme-INV1/view"),
             "list should link to view page: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn ticket_view_renders_provider_and_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let year = tmp.path().join("tickets/2026");
+        fs::create_dir_all(&year).unwrap();
+        fs::write(year.join("klm-abc.pdf"), b"%PDF-1.4\n").unwrap();
+        fs::write(
+            year.join("klm-abc.meta.json"),
+            br#"{"slug":"klm-abc","file":"klm-abc.pdf","provider":"KLM",
+                 "reservationNumber":"ABC123","receivedAt":"2026-06-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let config = Config {
+            tickets_dir: Some(tmp.path().join("tickets")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/tickets/2026/klm-abc/view").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("<h1>KLM</h1>"), "body: {body}");
+        assert!(
+            body.contains("<dt>Reference</dt><dd>ABC123</dd>"),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("/tickets/2026/klm-abc.pdf"),
+            "pdf link missing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parcel_delivered_row_falls_back_to_received_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("parcels")).unwrap();
+        // Delivered parcel with no actualDeliveryTime; row date should
+        // fall back to receivedAt so the column doesn't render blank.
+        fs::write(
+            tmp.path().join("parcels/DEL.json"),
+            br#"{"trackingNumber":"DEL","deliveryStatus":"OrderDelivered",
+                 "receivedAt":"2026-05-10T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let config = Config {
+            parcels_dir: Some(tmp.path().join("parcels")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/parcels").await;
+        assert!(
+            body.contains(">2026-05-10<"),
+            "expected receivedAt fallback in date column: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bills_year_chip_filters_shard() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("bills/2025")).unwrap();
+        fs::create_dir_all(tmp.path().join("bills/2026")).unwrap();
+        fs::write(
+            tmp.path().join("bills/2025/old.json"),
+            br#"{"payee":"OldCo","invoiceNumber":"O1","dueDate":"2025-01-15"}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("bills/2026/new.json"),
+            br#"{"payee":"NewCo","invoiceNumber":"N1","dueDate":"2026-03-15"}"#,
+        )
+        .unwrap();
+        let config = Config {
+            bills_dir: Some(tmp.path().join("bills")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/bills?year=2025").await;
+        assert!(body.contains("OldCo"), "2025 bill missing: {body}");
+        assert!(
+            !body.contains("NewCo"),
+            "2026 bill should be filtered out: {body}"
+        );
+        // Year chip for 2026 should still be rendered so the user
+        // can jump there.
+        assert!(
+            body.contains(">2026</a>") || body.contains("year=2026"),
+            "2026 chip missing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bills_search_filters_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("bills/2026")).unwrap();
+        fs::write(
+            tmp.path().join("bills/2026/a.json"),
+            br#"{"payee":"Acme","invoiceNumber":"A","dueDate":"2026-01-01"}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("bills/2026/b.json"),
+            br#"{"payee":"Zenith","invoiceNumber":"Z","dueDate":"2026-02-01"}"#,
+        )
+        .unwrap();
+        let config = Config {
+            bills_dir: Some(tmp.path().join("bills")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/bills?q=acme").await;
+        assert!(body.contains("Acme"), "Acme missing: {body}");
+        assert!(
+            !body.contains("Zenith"),
+            "Zenith should be filtered out: {body}"
+        );
+    }
+
+    #[test]
+    fn list_query_to_query_string_preserves_filters() {
+        let q = ListQuery {
+            page: Some(3),
+            q: Some("hello world".into()),
+            year: Some("2026".into()),
+        };
+        let s = q.to_query_string(None);
+        assert!(s.starts_with('?'));
+        assert!(s.contains("q=hello+world"));
+        assert!(s.contains("year=2026"));
+        assert!(s.contains("page=3"));
+    }
+
+    #[test]
+    fn list_query_page_one_omitted() {
+        // page=1 is redundant with the default; keep URLs tidy.
+        let q = ListQuery {
+            page: Some(1),
+            q: None,
+            year: None,
+        };
+        assert_eq!(q.to_query_string(None), "");
+    }
+
+    #[tokio::test]
+    async fn subscription_view_labels_json_link_as_raw() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("subs")).unwrap();
+        fs::write(
+            tmp.path().join("subs/x.json"),
+            br#"{"name":"X","price":1.0,"priceCurrency":"GBP",
+                 "orderDate":"2026-01-01"}"#,
+        )
+        .unwrap();
+        let config = Config {
+            subscriptions_dir: Some(tmp.path().join("subs")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/subscriptions/x/view").await;
+        assert!(
+            body.contains(">raw json</a>"),
+            "view page should label the json link 'raw json': {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overview_subscription_card_shows_active_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("subs")).unwrap();
+        // Recent = active.
+        let now = Utc::now();
+        let recent_iso = now.to_rfc3339();
+        // Long-ago = inactive.
+        let ancient_iso = "2013-06-17T00:00:00Z";
+        fs::write(
+            tmp.path().join("subs/active.json"),
+            format!(
+                r#"{{"name":"Active","price":1,"priceCurrency":"GBP",
+                     "receivedAt":"{recent_iso}","subscriptionDuration":"P1M"}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("subs/stale.json"),
+            format!(
+                r#"{{"name":"Stale","price":1,"priceCurrency":"GBP",
+                     "receivedAt":"{ancient_iso}","subscriptionDuration":"P1M"}}"#
+            ),
+        )
+        .unwrap();
+        let config = Config {
+            subscriptions_dir: Some(tmp.path().join("subs")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/").await;
+        // Card should carry a "1 active" subtitle beside the total 2.
+        assert!(
+            body.contains("1 active"),
+            "expected '1 active' subtitle on card: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_page_paginates_recent() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("bills/2026")).unwrap();
+        for i in 0..(PAGE_SIZE + 5) {
+            fs::write(
+                tmp.path().join(format!("bills/2026/bill-{i:03}.json")),
+                format!(
+                    r#"{{"payee":"P{i:03}","invoiceNumber":"I{i:03}","dueDate":"2025-01-{:02}"}}"#,
+                    (i % 28) + 1
+                ),
+            )
+            .unwrap();
+        }
+        let config = Config {
+            bills_dir: Some(tmp.path().join("bills")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/all").await;
+        assert!(body.contains("page 1 of 2"), "pager missing: {body}");
     }
 
     #[tokio::test]
