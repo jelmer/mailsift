@@ -25,6 +25,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{NaiveDate, NaiveDateTime, Utc};
+use iso_currency::Currency;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::info;
@@ -1679,7 +1680,7 @@ async fn list_parcels(
         // parcels), fall back to the newest history entry's `seen_at`
         // - roughly the pipeline's last touch, close enough for a
         // list row.
-        let terminal = is_terminal_parcel_status(&status);
+        let terminal = crate::targets::parcels::ParcelStatus::from_raw(&status).is_terminal();
         let mut due_keys: Vec<&str> = vec![
             "actualDeliveryTime",
             "expectedArrivalUntil",
@@ -1794,7 +1795,8 @@ async fn view_parcel(
     // list-page fallback so both views tell the same story.
     let terminal = pick_str(&value, &["deliveryStatus"])
         .as_deref()
-        .is_some_and(is_terminal_parcel_status);
+        .map(crate::targets::parcels::ParcelStatus::from_raw)
+        .is_some_and(|s| s.is_terminal());
     let received_display = pick_str(&value, &["receivedAt"])
         .or_else(|| terminal.then(|| last_history_seen_at(&value)).flatten())
         .map(|s| short_date(&s));
@@ -2171,19 +2173,6 @@ fn parse_iso_duration_days(iso: &str) -> Option<u32> {
     }
 }
 
-/// Format a subscription/bill/receipt `price` field as `"1.59 GBP"`.
-/// Renders `"free"` when the price parses as exactly zero, and an empty
-/// string when the payload has no numeric price at all.
-/// Whether a `deliveryStatus` string represents a terminal outcome
-/// (delivered or returned). Matches the schema.org spellings the
-/// parcels sink treats as final in [`crate::targets::parcels`].
-fn is_terminal_parcel_status(status: &str) -> bool {
-    matches!(
-        status,
-        "OrderDelivered" | "Delivered" | "OrderReturned" | "Returned" | "ReturnedToSender"
-    )
-}
-
 /// The `seen_at` timestamp of the last history entry on a parcel
 /// record, if any. Records filed before `receivedAt` stamping was
 /// added carry only this pipeline timestamp; the parcel list uses it
@@ -2199,6 +2188,11 @@ fn last_history_seen_at(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Format a subscription/bill/receipt `price` field as `"$1.59"`, folding
+/// the ISO `priceCurrency` code to a symbol prefix where one exists and
+/// falling back to a `"CHF12.50"`-style code prefix otherwise. Renders
+/// `"free"` when the price parses as exactly zero, and an empty string
+/// when the payload has no numeric price at all.
 fn format_price(value: &Value) -> String {
     let Some(raw) = value.get("price") else {
         return String::new();
@@ -2222,8 +2216,18 @@ fn format_price(value: &Value) -> String {
     if currency.is_empty() {
         format!("{amount}")
     } else {
-        format!("{amount} {currency}")
+        format!("{}{amount}", currency_prefix(currency))
     }
+}
+
+/// Prefix for a price in the given ISO 4217 currency: the crate's symbol
+/// when the code is recognised, otherwise the code itself. `XXX` (the
+/// ISO placeholder for "no currency") also falls back to the code, since
+/// the crate returns the generic `\u{00a4}` sign for it.
+fn currency_prefix(code: &str) -> String {
+    Currency::from_code(&code.to_ascii_uppercase())
+        .filter(|c| *c != Currency::XXX)
+        .map_or_else(|| code.to_string(), |c| c.symbol().to_string())
 }
 
 async fn get_subscription(
@@ -3936,8 +3940,8 @@ mod tests {
         let app = router(state_with(config, ""));
         let (_, body) = get(&app, "/subscriptions").await;
         assert!(
-            body.contains("1.59 GBP"),
-            "paid row missing currency: {body}"
+            body.contains("\u{00a3}1.59"),
+            "paid row missing currency symbol: {body}"
         );
         assert!(
             body.contains(">free<"),
@@ -3954,7 +3958,19 @@ mod tests {
     #[test]
     fn format_price_with_currency() {
         let v: Value = serde_json::from_str(r#"{"price":9.99,"priceCurrency":"EUR"}"#).unwrap();
-        assert_eq!(format_price(&v), "9.99 EUR");
+        assert_eq!(format_price(&v), "\u{20ac}9.99");
+    }
+
+    #[test]
+    fn format_price_known_currency_uses_symbol() {
+        let v: Value = serde_json::from_str(r#"{"price":12.5,"priceCurrency":"CHF"}"#).unwrap();
+        assert_eq!(format_price(&v), "\u{20a3}12.5");
+    }
+
+    #[test]
+    fn format_price_unknown_currency_keeps_code() {
+        let v: Value = serde_json::from_str(r#"{"price":12.5,"priceCurrency":"ZZZ"}"#).unwrap();
+        assert_eq!(format_price(&v), "ZZZ12.5");
     }
 
     #[test]

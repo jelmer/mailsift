@@ -140,6 +140,48 @@ const STATE_FIELDS: [&str; 5] = [
     "trackingUrl",
 ];
 
+/// Recognised values of a parcel's `deliveryStatus` field, folded
+/// across the schema.org `OrderStatus` and `DeliveryEvent` spellings
+/// extractors emit. Unknown values pass through as `Other`; comparison
+/// is case- and separator-insensitive so `OrderDelivered`,
+/// `order-delivered` and `Delivered` all fold to the same variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParcelStatus {
+    OnItsWay,
+    OutForDelivery,
+    Delivered,
+    Returned,
+    Other(String),
+}
+
+impl ParcelStatus {
+    /// Parse an extractor-supplied `deliveryStatus` string. Never fails:
+    /// anything that isn't a recognised variant is preserved verbatim as
+    /// `Other`, matching the pipeline's "extractors are pluggable"
+    /// contract.
+    pub fn from_raw(raw: &str) -> Self {
+        let normalised: String = raw
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        match normalised.as_str() {
+            "onitsway" | "orderintransit" | "intransit" => Self::OnItsWay,
+            "outfordelivery" => Self::OutForDelivery,
+            "delivered" | "orderdelivered" => Self::Delivered,
+            "returned" | "orderreturned" | "returnedtosender" => Self::Returned,
+            _ => Self::Other(raw.to_string()),
+        }
+    }
+
+    /// Whether the parcel has reached a state it won't leave: delivered
+    /// or returned. Used by the merge to refuse to walk a terminal
+    /// record backwards when a later-arriving older mail lacks a date.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Delivered | Self::Returned)
+    }
+}
+
 /// Overlay incoming fields onto existing, appending a history entry.
 ///
 /// A mailbox is not processed in date order -- a rescan, a re-filed
@@ -223,22 +265,12 @@ fn is_duplicate_history_entry(last: Option<&Value>, entry: &Value) -> bool {
     .all(|k| last.get(*k) == entry.get(*k))
 }
 
-/// Whether a record's `deliveryStatus` is a terminal one. Matches the
-/// schema.org `DeliveryEvent` and `OrderStatus` spellings extractors
-/// emit, ignoring case and separators.
+/// Whether a record's `deliveryStatus` is a terminal one.
 fn is_final_status(obj: &Map<String, Value>) -> bool {
-    let Some(status) = obj.get("deliveryStatus").and_then(Value::as_str) else {
-        return false;
-    };
-    let normalised: String = status
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-    matches!(
-        normalised.as_str(),
-        "delivered" | "orderdelivered" | "returned" | "orderreturned" | "returnedtosender"
-    )
+    obj.get("deliveryStatus")
+        .and_then(Value::as_str)
+        .map(ParcelStatus::from_raw)
+        .is_some_and(|s| s.is_terminal())
 }
 
 /// The `receivedAt` of a single record or history entry, as a
@@ -345,6 +377,53 @@ mod tests {
     #[test]
     fn tracking_url_none_for_unknown_carrier() {
         assert!(tracking_url_for("moon-post", "X").is_none());
+    }
+
+    #[test]
+    fn parcel_status_folds_spellings_to_same_variant() {
+        assert_eq!(ParcelStatus::from_raw("Delivered"), ParcelStatus::Delivered);
+        assert_eq!(
+            ParcelStatus::from_raw("OrderDelivered"),
+            ParcelStatus::Delivered
+        );
+        assert_eq!(
+            ParcelStatus::from_raw("order-delivered"),
+            ParcelStatus::Delivered
+        );
+        assert_eq!(
+            ParcelStatus::from_raw("OrderReturned"),
+            ParcelStatus::Returned
+        );
+        assert_eq!(
+            ParcelStatus::from_raw("ReturnedToSender"),
+            ParcelStatus::Returned
+        );
+        assert_eq!(ParcelStatus::from_raw("OnItsWay"), ParcelStatus::OnItsWay);
+        assert_eq!(
+            ParcelStatus::from_raw("OrderInTransit"),
+            ParcelStatus::OnItsWay
+        );
+        assert_eq!(
+            ParcelStatus::from_raw("OutForDelivery"),
+            ParcelStatus::OutForDelivery
+        );
+    }
+
+    #[test]
+    fn parcel_status_preserves_unknown_verbatim() {
+        assert_eq!(
+            ParcelStatus::from_raw("Scheduled"),
+            ParcelStatus::Other("Scheduled".to_string())
+        );
+    }
+
+    #[test]
+    fn only_delivered_and_returned_are_terminal() {
+        assert!(ParcelStatus::Delivered.is_terminal());
+        assert!(ParcelStatus::Returned.is_terminal());
+        assert!(!ParcelStatus::OnItsWay.is_terminal());
+        assert!(!ParcelStatus::OutForDelivery.is_terminal());
+        assert!(!ParcelStatus::Other("Scheduled".into()).is_terminal());
     }
 
     #[test]
