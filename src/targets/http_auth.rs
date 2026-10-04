@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use reqwest::header::{HeaderMap, RETRY_AFTER, WWW_AUTHENTICATE};
+use reqwest::header::{ETAG, HeaderMap, IF_MATCH, IF_NONE_MATCH, RETRY_AFTER, WWW_AUTHENTICATE};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use tracing::{debug, warn};
 
@@ -204,9 +204,21 @@ pub fn apply_auth(
     }
 }
 
+/// How often to redo a read-then-conditional-PUT whose resource keeps
+/// changing in between before giving up.
+pub const MAX_UPDATE_ATTEMPTS: u32 = 5;
+
+/// A resource as [`get_if_exists`] found it.
+pub struct Fetched {
+    pub body: Vec<u8>,
+    /// Its entity tag, if the server sent one a later PUT can be made
+    /// conditional on.
+    pub etag: Option<String>,
+}
+
 /// GET `url` through [`send_with_auth_retry`], or `None` if nothing is
 /// there yet.
-pub async fn get_if_exists(client: &Client, auth: &Auth, url: &str) -> Result<Option<Vec<u8>>> {
+pub async fn get_if_exists(client: &Client, auth: &Auth, url: &str) -> Result<Option<Fetched>> {
     let response = send_with_auth_retry(client, auth, |client| client.get(url))
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -221,11 +233,34 @@ pub async fn get_if_exists(client: &Client, auth: &Auth, url: &str) -> Result<Op
             truncate(&body, 200)
         ));
     }
+    // `If-Match` compares strongly, so a weak tag would never match.
+    let etag = response
+        .headers()
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .filter(|etag| !etag.starts_with("W/"))
+        .map(str::to_string);
     let body = response
         .bytes()
         .await
-        .with_context(|| format!("reading body of {url}"))?;
-    Ok(Some(body.to_vec()))
+        .with_context(|| format!("reading body of {url}"))?
+        .to_vec();
+    Ok(Some(Fetched { body, etag }))
+}
+
+/// Make the PUT `request` conditional on its resource still being as
+/// `found`: absent, or carrying the same entity tag. The server then
+/// answers `412 Precondition Failed` rather than let the PUT land on
+/// top of a change made since, whoever made it.
+pub fn unless_changed(request: RequestBuilder, found: Option<&Fetched>) -> RequestBuilder {
+    match found {
+        None => request.header(IF_NONE_MATCH, "*"),
+        Some(Fetched {
+            etag: Some(etag), ..
+        }) => request.header(IF_MATCH, etag),
+        // Nothing to make it conditional on.
+        Some(Fetched { etag: None, .. }) => request,
+    }
 }
 
 /// Set once we've reported that the preferred scheme can't be applied

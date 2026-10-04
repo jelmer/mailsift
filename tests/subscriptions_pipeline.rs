@@ -57,3 +57,83 @@ fn renewals_out_of_date_order_leave_the_newest() {
     assert_eq!(record["price"], 12.99);
     assert_eq!(record["receivedAt"], "2026-01-28T10:00:00Z");
 }
+
+/// `maildir-scan` runs messages on a thread pool, so renewals for one
+/// subscription are filed concurrently. The newest must still win.
+#[test]
+fn renewals_scanned_in_parallel_leave_the_newest() {
+    let manifest = manifest_dir();
+    let maildir = tempfile::tempdir().expect("maildir tempdir");
+    for sub in ["cur", "new", "tmp"] {
+        std::fs::create_dir(maildir.path().join(sub)).expect("create maildir subdir");
+    }
+    // One renewal a day for 50 days; the price counts the days.
+    for day in 1..=50 {
+        let (month, dom) = if day <= 31 { (1, day) } else { (2, day - 31) };
+        let month_name = ["Jan", "Feb"][month - 1];
+        let message = format!(
+            "From: billing@subscription.fixture.test\r\n\
+To: jelmer@example.org\r\n\
+Subject: fixture-renewal: {day}\r\n\
+Date: {dom} {month_name} 2026 10:00:00 +0000\r\n\
+Message-ID: <fixture-renewal-{day}@subscription.fixture.test>\r\n\
+Authentication-Results: example.org; dkim=pass header.d=subscription.fixture.test\r\n\
+\r\n\
+Your subscription has renewed.\r\n"
+        );
+        std::fs::write(maildir.path().join(format!("cur/{day}.msg")), message)
+            .expect("write message");
+    }
+    let out = tempfile::tempdir().expect("tempdir");
+
+    Command::cargo_bin("mailsift")
+        .expect("binary built")
+        .arg("maildir-scan")
+        .arg(maildir.path())
+        .arg("--extractors")
+        .arg(manifest.join("tests/fixtures/extractors"))
+        .arg("--subscriptions-dir")
+        .arg(out.path())
+        .assert()
+        .success();
+
+    let record = filed(out.path());
+    assert_eq!(record["price"], 50.0);
+    assert_eq!(record["receivedAt"], "2026-02-19T10:00:00Z");
+}
+
+/// The milter, a watcher and a one-off scan are separate processes
+/// that can all file into the same directory. Each has to wait for
+/// whichever of them is in the middle of reading and replacing a
+/// record there.
+#[test]
+fn filing_waits_for_another_process_using_the_directory() {
+    let manifest = manifest_dir();
+    let out = tempfile::tempdir().expect("tempdir");
+
+    let lock = mailsift::targets::sink::lock_dir(out.path()).expect("lock directory");
+    let mut replay = std::process::Command::new(assert_cmd::cargo::cargo_bin("mailsift"))
+        .arg("replay")
+        .arg(manifest.join("tests/fixtures/eml/subscription-renewal-2026-01.eml"))
+        .arg("--extractors")
+        .arg(manifest.join("tests/fixtures/extractors"))
+        .arg("--subscriptions-dir")
+        .arg(out.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn mailsift");
+
+    // Far longer than a replay takes when nothing is in its way.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(
+        replay.try_wait().expect("poll mailsift"),
+        None,
+        "replay finished while another process held the directory"
+    );
+    assert!(!out.path().join("fixture-music.json").exists());
+
+    drop(lock);
+    assert!(replay.wait().expect("wait for mailsift").success());
+    assert_eq!(filed(out.path())["price"], 12.99);
+}

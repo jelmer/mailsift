@@ -49,8 +49,8 @@ use serde::Serialize;
 
 use super::FileOutcome;
 use super::json_target;
-use super::sink::{log_file_outcome, log_kept, sanitize_ext, slugify, write_atomic};
-use super::webdav::{PutOutcome, WebdavSink};
+use super::sink::{lock_dir, log_file_outcome, log_kept, sanitize_ext, slugify, write_atomic};
+use super::webdav::WebdavSink;
 
 /// Identifying fields copied from the sibling reservation artifact, if
 /// there was one. All optional: a ticket can arrive with no
@@ -159,6 +159,9 @@ impl TicketSink {
                 let year_dir = dir.join(format!("{year:04}"));
                 let target = year_dir.join(&blob_filename);
                 let sidecar_target = year_dir.join(&sidecar_filename);
+                // One lock over both files, so they can't end up from
+                // different messages.
+                let _lock = lock_dir(&year_dir)?;
                 if json_target::filed_from_newer(&sidecar_target, received_at)? {
                     return Ok(log_kept(target.display().to_string(), "ticket"));
                 }
@@ -170,14 +173,25 @@ impl TicketSink {
             TicketSink::Webdav(sink) => {
                 let blob_path = format!("{year:04}/{blob_filename}");
                 let sidecar_path = format!("{year:04}/{sidecar_filename}");
-                if sink.filed_from_newer(&sidecar_path, received_at)? {
-                    return Ok(log_kept(sink.target_url(&blob_path), "ticket"));
+                // There is no lock to hold over two resources here.
+                // The sidecar goes first, since it carries the date;
+                // the blob then only lands while the sidecar is still
+                // not from a newer message.
+                let sidecar_outcome = sink.update(
+                    &sidecar_path,
+                    "application/json",
+                    "ticket sidecar",
+                    &json_target::replace_unless_newer(
+                        &sidecar_path,
+                        sidecar.as_bytes(),
+                        received_at,
+                    ),
+                )?;
+                if matches!(sidecar_outcome, FileOutcome::Kept(_)) {
+                    return Ok(FileOutcome::Kept(sink.target_url(&blob_path)));
                 }
-                let outcome = sink.put(&blob_path, content_type_for(&ext), body)?;
-                sink.put(&sidecar_path, "application/json", sidecar.into_bytes())?;
-                Ok(match outcome {
-                    PutOutcome::Created(url) => FileOutcome::Created(url),
-                    PutOutcome::Updated(url) => FileOutcome::Updated(url),
+                sink.update(&blob_path, content_type_for(&ext), "ticket", &|_| {
+                    Ok((!sink.filed_from_newer(&sidecar_path, received_at)?).then(|| body.clone()))
                 })
             }
         }

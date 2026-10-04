@@ -30,7 +30,7 @@ use super::firefly::{self, BillForFirefly, FireflySink};
 use super::json_target::{
     derive_year, filed_from_newer, first_non_empty, read_and_parse, write_unless_newer,
 };
-use super::sink::{log_file_outcome, log_kept, sanitize_ext, slugify, write_atomic};
+use super::sink::{sanitize_ext, slugify, update_file};
 
 /// Shape we read out of a `.bill.json` artifact. Loosely schema.org
 /// `Invoice`-shaped; unknown fields are ignored so extractors can emit
@@ -185,15 +185,12 @@ pub fn file_bill_blob(
 
     let year_dir = dir.join(format!("{year:04}"));
     let target = year_dir.join(format!("{name_stem}.{ext}"));
-    if filed_from_newer(&year_dir.join(format!("{name_stem}.json")), received_at)? {
-        return Ok(log_kept(target.display().to_string(), "bill blob"));
-    }
-
+    let record = year_dir.join(format!("{name_stem}.json"));
     let body = fs::read(src).with_context(|| format!("reading bill blob {}", src.display()))?;
-    let existed = target.exists();
-    write_atomic(&target, &body)?;
 
-    Ok(log_file_outcome(&target, existed, "bill blob"))
+    update_file(&target, "bill blob", &|_| {
+        Ok((!filed_from_newer(&record, received_at)?).then(|| body.clone()))
+    })
 }
 
 /// Parse `body` as a bill JSON and return the paired

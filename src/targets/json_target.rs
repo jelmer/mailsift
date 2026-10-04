@@ -19,7 +19,7 @@ use serde_json::{Map, Value};
 use tracing::warn;
 
 use super::FileOutcome;
-use super::sink::{log_file_outcome, log_kept, read_if_exists, supersedes, write_atomic};
+use super::sink::{read_if_exists, supersedes, update_file};
 
 /// Read a JSON artifact from disk and parse it as `T`, keeping the raw
 /// body so the caller can also write it back out or transform it. Error
@@ -135,19 +135,31 @@ pub fn filed_from_newer(target: &Path, incoming: Option<DateTime<Utc>>) -> Resul
         .is_some_and(|existing| is_from_newer(&existing, &target.display().to_string(), incoming)))
 }
 
+/// The merge for a plain JSON record: file `body`, dated `incoming`,
+/// unless the record already at `label` was filed from a newer message.
+pub fn replace_unless_newer<'a>(
+    label: &'a str,
+    body: &'a [u8],
+    incoming: Option<DateTime<Utc>>,
+) -> impl Fn(Option<&[u8]>) -> Result<Option<Vec<u8>>> + 'a {
+    move |existing| {
+        Ok(match existing {
+            Some(existing) if is_from_newer(existing, label, incoming) => None,
+            _ => Some(body.to_vec()),
+        })
+    }
+}
+
 /// Write the JSON record `body` to `target`, unless the record already
 /// there was filed from a newer message.
 pub fn write_unless_newer(target: &Path, body: &str, kind: &str) -> Result<FileOutcome> {
     let label = target.display().to_string();
     let incoming = received_at_in(body.as_bytes())?;
-    let existing = read_if_exists(target)?;
-    if let Some(existing) = &existing
-        && is_from_newer(existing, &label, incoming)
-    {
-        return Ok(log_kept(label, kind));
-    }
-    write_atomic(target, body.as_bytes())?;
-    Ok(log_file_outcome(target, existing.is_some(), kind))
+    update_file(
+        target,
+        kind,
+        &replace_unless_newer(&label, body.as_bytes(), incoming),
+    )
 }
 
 #[cfg(test)]

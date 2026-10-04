@@ -6,6 +6,9 @@
 //! - [`supersedes`]: the ordering rule every sink applies before
 //!   replacing a record, so that the newest message wins regardless of
 //!   the order messages are processed in.
+//! - [`update_file`]: applies such a rule to one file atomically, so
+//!   two messages about the same thing can't both find an older record
+//!   and then write in either order. [`lock_dir`] is the lock under it.
 //! - [`write_atomic`]: temp file + fsync + rename, so a partial write
 //!   can't leave a truncated file in place.
 //! - [`slugify`]: filesystem-safe ASCII slugger. `uppercase` is `true`
@@ -16,7 +19,7 @@
 //! - [`sanitize_uid`]: defend on-disk paths against weird iCalendar
 //!   UIDs on the local-events sink.
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
@@ -52,6 +55,48 @@ pub enum FileOutcome {
 /// order by and the incoming message is filed.
 pub fn supersedes(existing: Option<DateTime<Utc>>, incoming: Option<DateTime<Utc>>) -> bool {
     matches!((existing, incoming), (Some(existing), Some(incoming)) if existing > incoming)
+}
+
+/// Decides what to file at a location given what is there (`None` if
+/// nothing): `Some(body)` to write, `None` to leave it alone. A remote
+/// sink calls it again if the resource changed before the write landed.
+pub type Merge<'a> = dyn Fn(Option<&[u8]>) -> Result<Option<Vec<u8>>> + 'a;
+
+/// Exclusive hold on a sink directory until dropped.
+pub struct DirLock {
+    _dir: File,
+}
+
+/// Lock `dir`, creating it if needed, waiting for anyone else who
+/// holds it. Hold the lock from looking at what is on file until the
+/// write lands.
+///
+/// Messages are processed on several threads at once, and the milter,
+/// a watcher and a one-off scan can all be running. The lock is an
+/// advisory one on the directory itself, so it holds across all of
+/// them and leaves nothing behind in the directory.
+pub fn lock_dir(dir: &Path) -> Result<DirLock> {
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let handle = File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
+    handle
+        .lock()
+        .with_context(|| format!("locking {}", dir.display()))?;
+    Ok(DirLock { _dir: handle })
+}
+
+/// Replace `target` with whatever `merge` makes of what is there, with
+/// its directory locked throughout.
+pub fn update_file(target: &Path, kind: &str, merge: &Merge<'_>) -> Result<FileOutcome> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow!("target {} has no parent dir", target.display()))?;
+    let _lock = lock_dir(parent)?;
+    let existing = read_if_exists(target)?;
+    let Some(body) = merge(existing.as_deref())? else {
+        return Ok(log_kept(target.display().to_string(), kind));
+    };
+    write_atomic(target, &body)?;
+    Ok(log_file_outcome(target, existing.is_some(), kind))
 }
 
 /// Emit the `"<kind> kept"` log line and return the matching

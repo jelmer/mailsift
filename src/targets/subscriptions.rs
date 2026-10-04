@@ -108,6 +108,30 @@ mod tests {
         assert!(body.contains("Netflix"));
     }
 
+    /// Scans process messages on several threads at once; whichever
+    /// of them gets to the record first, the newest message must be
+    /// the one left on file.
+    #[test]
+    fn concurrent_filing_leaves_the_newest() {
+        for _ in 0..200 {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("subs");
+            std::thread::scope(|scope| {
+                for n in 0..8i64 {
+                    let dir = &dir;
+                    let src = tmp.path().join(format!("{n}.subscription.json"));
+                    scope.spawn(move || {
+                        fs::write(&src, format!(r#"{{"name":"Hinge","n":{n}}}"#)).unwrap();
+                        file_subscription(&src, dir, Some(1_700_000_000 + n)).unwrap();
+                    });
+                }
+            });
+            let v: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(dir.join("hinge.json")).unwrap()).unwrap();
+            assert_eq!(v["n"], 7);
+        }
+    }
+
     #[test]
     fn older_receipt_does_not_roll_back_subscription() {
         let tmp = tempfile::TempDir::new().unwrap();

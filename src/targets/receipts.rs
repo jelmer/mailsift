@@ -34,9 +34,9 @@ use serde::Deserialize;
 use super::FileOutcome;
 use super::json_target::{self, derive_year, first_non_empty, read_and_parse};
 use super::mail_forward::{self, MailForwarder};
-use super::sink::{log_file_outcome, log_kept, sanitize_ext, slugify, write_atomic};
+use super::sink::{Merge, sanitize_ext, slugify, update_file};
 use super::tickets::content_type_for;
-use super::webdav::{PutOutcome, WebdavSink};
+use super::webdav::WebdavSink;
 
 /// Where to file `receipt` artifacts.
 pub enum ReceiptSink {
@@ -114,15 +114,12 @@ impl ReceiptSink {
         let body_out = json_target::body_with_received_at(&body, received_at_epoch);
         let filename = format!("{merchant_slug}-{order_slug}.json");
         let received_at = json_target::received_at_in(body_out.as_bytes())?;
-        if self.filed_from_newer(year, &filename, received_at)? {
-            return Ok(self.kept(year, &filename, "receipt"));
-        }
-        self.put_under_year(
+        self.update(
             year,
             &filename,
             "application/json",
-            body_out.into_bytes(),
             "receipt",
+            &json_target::replace_unless_newer(&filename, body_out.as_bytes(), received_at),
         )
     }
 
@@ -158,18 +155,17 @@ impl ReceiptSink {
         let (merchant, order, year) = pair;
         let name_stem = format!("{merchant}-{order}");
         let filename = format!("{name_stem}.{ext}");
-        if self.filed_from_newer(year, &format!("{name_stem}.json"), received_at)? {
-            return Ok(Some(self.kept(year, &filename, "receipt blob")));
-        }
+        let record = format!("{name_stem}.json");
         let body =
             fs::read(src).with_context(|| format!("reading receipt blob {}", src.display()))?;
-        Ok(Some(self.put_under_year(
+        self.update(
             year,
             &filename,
             content_type_for(&ext),
-            body,
             "receipt blob",
-        )?))
+            &|_| Ok((!self.filed_from_newer(year, &record, received_at)?).then(|| body.clone())),
+        )
+        .map(Some)
     }
 
     /// Whether the receipt JSON at `<year>/<json_filename>`, if any,
@@ -195,50 +191,31 @@ impl ReceiptSink {
         }
     }
 
-    /// Report `<year>/<filename>` as left alone in favour of what a
-    /// newer message filed there.
-    fn kept(&self, year: i32, filename: &str, log_kind: &str) -> FileOutcome {
-        let label = match self {
-            ReceiptSink::LocalDir(dir) => dir
-                .join(format!("{year:04}"))
-                .join(filename)
-                .display()
-                .to_string(),
-            ReceiptSink::Webdav(sink) => sink.target_url(&format!("{year:04}/{filename}")),
-            ReceiptSink::Forward(_) => {
-                unreachable!("callers short-circuit the forward variant before reaching here")
-            }
-        };
-        log_kept(label, log_kind)
-    }
-
-    /// Write `body` to `<year>/<filename>` at whichever local or WebDAV
-    /// backend this sink wraps. Both blob and JSON call sites route
-    /// through here so a new backend only has to be added once. Not
-    /// callable on the forward variant; callers must short-circuit it
-    /// first.
-    fn put_under_year(
+    /// Replace `<year>/<filename>`, at whichever local or WebDAV backend
+    /// this sink wraps, with whatever `merge` makes of what is there.
+    /// Both blob and JSON call sites route through here so a new
+    /// backend only has to be added once. Not callable on the forward
+    /// variant; callers must short-circuit it first.
+    fn update(
         &self,
         year: i32,
         filename: &str,
         content_type: &str,
-        body: Vec<u8>,
         log_kind: &str,
+        merge: &Merge<'_>,
     ) -> Result<FileOutcome> {
         match self {
-            ReceiptSink::LocalDir(dir) => {
-                let target = dir.join(format!("{year:04}")).join(filename);
-                let existed = target.exists();
-                write_atomic(&target, &body)?;
-                Ok(log_file_outcome(&target, existed, log_kind))
-            }
-            ReceiptSink::Webdav(sink) => {
-                let outcome = sink.put(&format!("{year:04}/{filename}"), content_type, body)?;
-                Ok(match outcome {
-                    PutOutcome::Created(url) => FileOutcome::Created(url),
-                    PutOutcome::Updated(url) => FileOutcome::Updated(url),
-                })
-            }
+            ReceiptSink::LocalDir(dir) => update_file(
+                &dir.join(format!("{year:04}")).join(filename),
+                log_kind,
+                merge,
+            ),
+            ReceiptSink::Webdav(sink) => sink.update(
+                &format!("{year:04}/{filename}"),
+                content_type,
+                log_kind,
+                merge,
+            ),
             ReceiptSink::Forward(_) => {
                 unreachable!("callers short-circuit the forward variant before reaching here")
             }

@@ -7,7 +7,6 @@
 //! record gets richer as a parcel progresses ("on its way" →
 //! "out for delivery" → "delivered").
 
-use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -17,7 +16,7 @@ use serde_json::{Map, Value};
 
 use super::FileOutcome;
 use super::json_target::{read_and_parse, received_at_of};
-use super::sink::{log_file_outcome, slugify, supersedes, write_atomic};
+use super::sink::{slugify, supersedes, update_file};
 
 /// Shape we read out of a `.parcel.json` artifact. Loosely schema.org
 /// `ParcelDelivery`-shaped; unknown fields pass through unchanged.
@@ -98,23 +97,20 @@ pub fn file_parcel(
     }
 
     let target = dir.join(format!("{tracking_slug}.json"));
-    let existed = target.exists();
-
-    let merged = if existed {
-        let existing_body = fs::read_to_string(&target)
-            .with_context(|| format!("reading existing parcel {}", target.display()))?;
-        let existing: Value = serde_json::from_str(&existing_body)
-            .with_context(|| format!("parsing existing parcel {}", target.display()))?;
-        merge(existing, incoming)
-    } else {
-        with_initial_history(incoming)
-    };
-
-    let serialised = serde_json::to_vec_pretty(&merged).context("serialising merged parcel")?;
-    write_atomic(&target, &serialised)?;
-
-    let outcome = log_file_outcome(&target, existed, "parcel");
-    if !existed {
+    let outcome = update_file(&target, "parcel", &|existing| {
+        let merged = match existing {
+            Some(existing) => {
+                let existing: Value = serde_json::from_slice(existing)
+                    .with_context(|| format!("parsing existing parcel {}", target.display()))?;
+                merge(existing, incoming.clone())
+            }
+            None => with_initial_history(incoming.clone()),
+        };
+        serde_json::to_vec_pretty(&merged)
+            .context("serialising merged parcel")
+            .map(Some)
+    })?;
+    if matches!(outcome, FileOutcome::Created(_)) {
         // First time we've seen this tracking number; fan out to every
         // configured tracker registration sink so they can start
         // polling the carrier. Silently skip parcels with no
@@ -721,6 +717,35 @@ mod tests {
             1,
             "duplicate history entry should not be appended"
         );
+    }
+
+    /// Scans process messages on several threads at once. Every
+    /// update must make it into the record, and the newest one must
+    /// decide its state.
+    #[test]
+    fn concurrent_filing_keeps_every_update() {
+        const STATUSES: [&str; 4] = ["OnItsWay", "OnItsWay", "OutForDelivery", "Delivered"];
+        for _ in 0..200 {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("out");
+            std::thread::scope(|scope| {
+                for (n, status) in STATUSES.iter().enumerate() {
+                    let dir = &dir;
+                    let src = tmp.path().join(format!("{n}.parcel.json"));
+                    scope.spawn(move || {
+                        let body = serde_json::json!({
+                            "trackingNumber": "X1", "deliveryStatus": status, "step": n,
+                        });
+                        std::fs::write(&src, body.to_string()).unwrap();
+                        file_parcel(&src, dir, None, Some(1_700_000_000 + n as i64)).unwrap();
+                    });
+                }
+            });
+            let body = std::fs::read_to_string(dir.join("X1.json")).unwrap();
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["deliveryStatus"], "Delivered");
+            assert_eq!(v["history"].as_array().unwrap().len(), STATUSES.len());
+        }
     }
 
     #[test]

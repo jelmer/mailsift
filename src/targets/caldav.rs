@@ -11,7 +11,10 @@
 //!   (`CALDAV:schedule-default-calendar-URL` on the schedule inbox).
 //!
 //! Events are then PUT to `<collection>/<UID>.ics`, unless the event
-//! already there is a newer take on it (per `DTSTAMP`). iMIP scheduling
+//! already there is a newer take on it (per `DTSTAMP`). The PUT is
+//! conditional on the event not having changed since we looked
+//! (`If-Match` on its ETag), so another writer, or the user's calendar
+//! client, can't slip a newer take in underneath it. iMIP scheduling
 //! requests (an enclosing `METHOD:REQUEST`) go to the schedule inbox;
 //! everything else goes to the default calendar; that way the user's
 //! calendar app sees plain events directly while invitations still flow
@@ -121,46 +124,60 @@ impl CaldavSink {
             &collections.default_calendar
         };
         let url = event_url(collection, &event.uid);
-        // Without a date there is nothing to order by; spare the GET.
-        if event.dtstamp.is_some()
-            && let Some(existing) = http_auth::get_if_exists(&self.client, &self.auth, &url).await?
-            && event_is_newer(&existing, &url, event.dtstamp)
-        {
-            return Ok(log_kept(url, "event"));
-        }
-        let body = event.body.clone();
-        let response = http_auth::send_with_auth_retry(&self.client, &self.auth, |client| {
-            client
-                .put(&url)
-                .header(
-                    reqwest::header::CONTENT_TYPE,
-                    "text/calendar; charset=utf-8",
-                )
-                .body(body.clone())
-        })
-        .await
-        .with_context(|| format!("PUT {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "CalDAV PUT to {url} returned {status}: {}",
-                truncate(&body, 200)
-            ));
-        }
-
-        match status {
-            StatusCode::CREATED => {
-                info!(target = %url, "event created");
-                Ok(FileOutcome::Created(url))
+        for _ in 0..http_auth::MAX_UPDATE_ATTEMPTS {
+            // Without a date there is nothing to order by: spare the
+            // GET and replace whatever is there.
+            let found = match event.dtstamp {
+                Some(_) => http_auth::get_if_exists(&self.client, &self.auth, &url).await?,
+                None => None,
+            };
+            if let Some(found) = &found
+                && event_is_newer(&found.body, &url, event.dtstamp)
+            {
+                return Ok(log_kept(url, "event"));
             }
-            _ => {
-                // 200, 204 etc.: existing resource updated.
-                info!(target = %url, %status, "event updated");
-                Ok(FileOutcome::Updated(url))
+            let response = http_auth::send_with_auth_retry(&self.client, &self.auth, |client| {
+                let request = client
+                    .put(&url)
+                    .header(
+                        reqwest::header::CONTENT_TYPE,
+                        "text/calendar; charset=utf-8",
+                    )
+                    .body(event.body.clone());
+                match event.dtstamp {
+                    Some(_) => http_auth::unless_changed(request, found.as_ref()),
+                    None => request,
+                }
+            })
+            .await
+            .with_context(|| format!("PUT {url}"))?;
+
+            let status = response.status();
+            if status == StatusCode::PRECONDITION_FAILED {
+                debug!(url, "changed since it was read; starting over");
+                continue;
             }
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(anyhow!(
+                    "CalDAV PUT to {url} returned {status}: {}",
+                    truncate(&body, 200)
+                ));
+            }
+
+            return match status {
+                StatusCode::CREATED => {
+                    info!(target = %url, "event created");
+                    Ok(FileOutcome::Created(url))
+                }
+                _ => {
+                    // 200, 204 etc.: existing resource updated.
+                    info!(target = %url, %status, "event updated");
+                    Ok(FileOutcome::Updated(url))
+                }
+            };
         }
+        Err(anyhow!("{url} kept changing while being updated"))
     }
 
     async fn ensure_collections(&self) -> Result<&Collections> {
@@ -465,6 +482,45 @@ SUMMARY:{summary}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
         sink.file(&original).unwrap();
         let second = sink.file(&rebooked).unwrap();
         assert!(matches!(second, FileOutcome::Updated(_)));
+        assert_eq!(
+            server.resource("/calendar/train-1.ics").unwrap(),
+            rebooked.body.as_bytes()
+        );
+    }
+
+    /// Another writer files a newer take between our GET and our PUT.
+    /// Our PUT must not land on top of it.
+    #[test]
+    fn newer_take_that_overtakes_us_is_not_overwritten() {
+        let server = FakeDav::start();
+        let sink = sink(&server);
+        sink.file(&event("Original", Some("2026-01-20T10:00:00Z")))
+            .unwrap();
+        let rebooked = event("Rebooked", Some("2026-01-28T10:00:00Z"));
+        server.overtake_after_next_get("/calendar/train-1.ics", rebooked.body.as_bytes());
+
+        let outcome = sink
+            .file(&event("Amended", Some("2026-01-25T10:00:00Z")))
+            .unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        assert_eq!(
+            server.resource("/calendar/train-1.ics").unwrap(),
+            rebooked.body.as_bytes()
+        );
+    }
+
+    /// The same, where no event was there when we looked.
+    #[test]
+    fn newer_take_created_under_us_is_not_overwritten() {
+        let server = FakeDav::start();
+        let sink = sink(&server);
+        let rebooked = event("Rebooked", Some("2026-01-28T10:00:00Z"));
+        server.overtake_after_next_get("/calendar/train-1.ics", rebooked.body.as_bytes());
+
+        let outcome = sink
+            .file(&event("Amended", Some("2026-01-25T10:00:00Z")))
+            .unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
         assert_eq!(
             server.resource("/calendar/train-1.ics").unwrap(),
             rebooked.body.as_bytes()

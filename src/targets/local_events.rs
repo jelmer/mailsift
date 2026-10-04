@@ -8,20 +8,18 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use super::sink::{log_file_outcome, log_kept, read_if_exists, sanitize_uid, write_atomic};
+use super::sink::{sanitize_uid, update_file};
 use super::{FileOutcome, SingleEvent, event_is_newer};
 
 pub fn file_single(event: &SingleEvent, dir: &Path) -> Result<FileOutcome> {
     let target = dir.join(sanitize_uid(&event.uid)).with_extension("ics");
     let label = target.display().to_string();
-    let existing = read_if_exists(&target)?;
-    if let Some(existing) = &existing
-        && event_is_newer(existing, &label, event.dtstamp)
-    {
-        return Ok(log_kept(label, "event"));
-    }
-    write_atomic(&target, event.body.as_bytes())?;
-    Ok(log_file_outcome(&target, existing.is_some(), "event"))
+    update_file(&target, "event", &|existing| {
+        Ok(match existing {
+            Some(existing) if event_is_newer(existing, &label, event.dtstamp) => None,
+            _ => Some(event.body.clone().into_bytes()),
+        })
+    })
 }
 
 #[cfg(test)]
