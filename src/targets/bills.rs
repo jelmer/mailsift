@@ -9,7 +9,9 @@
 //!
 //! When a [`super::firefly::FireflySink`] is configured, every filed
 //! bill is also registered with Firefly III (update-or-create on the
-//! Firefly side, so re-runs idempotently refresh the record).
+//! Firefly side, so re-runs idempotently refresh the record). Firefly
+//! keeps one bill per payee, so a bill is only registered while no
+//! bill for that payee from a newer message is on file.
 //!
 //! Extractors may also emit companion blobs (`<slug>.bill.pdf` etc.).
 //! Those go through [`file_bill_blob`], which requires a same-slug
@@ -24,11 +26,13 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use tracing::{debug, warn};
 
 use super::FileOutcome;
 use super::firefly::{self, BillForFirefly, FireflySink};
 use super::json_target::{
-    derive_year, filed_from_newer, first_non_empty, read_and_parse, write_unless_newer,
+    derive_year, filed_from_newer, first_non_empty, is_from_newer, read_and_parse, received_at_in,
+    write_unless_newer,
 };
 use super::sink::{sanitize_ext, slugify, update_file};
 
@@ -118,6 +122,27 @@ pub fn file_bill(
         return Ok(outcome);
     }
 
+    // Firefly keeps one bill per payee, not one per invoice, so an
+    // older invoice must not overwrite what a newer one put there.
+    if firefly.is_some() {
+        let incoming = received_at_in(body_out.as_bytes())?;
+        match payee_has_newer_bill(dir, &payee_slug, incoming) {
+            Ok(false) => {}
+            Ok(true) => {
+                debug!(payee, "a newer bill is on file; leaving Firefly alone");
+                return Ok(outcome);
+            }
+            Err(e) => {
+                warn!(
+                    payee,
+                    error = format!("{e:#}"),
+                    "can't tell whether a newer bill is on file; leaving Firefly alone"
+                );
+                return Ok(outcome);
+            }
+        }
+    }
+
     // Best-effort Firefly registration. We try on every filing (not
     // just on creation) because the Firefly side does its own
     // update-or-create; an "update" here genuinely needs to refresh
@@ -125,6 +150,43 @@ pub fn file_bill(
     register_with_firefly(firefly, payee, &bill);
 
     Ok(outcome)
+}
+
+/// Whether any bill on file for the payee came from a newer message
+/// than one dated `incoming`, whichever invoice or year it is filed
+/// under.
+fn payee_has_newer_bill(
+    dir: &Path,
+    payee_slug: &str,
+    incoming: Option<DateTime<Utc>>,
+) -> Result<bool> {
+    let prefix = format!("{payee_slug}-");
+    for year_dir in fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))? {
+        let year_dir = year_dir?.path();
+        if !year_dir.is_dir() {
+            continue;
+        }
+        let entries =
+            fs::read_dir(&year_dir).with_context(|| format!("listing {}", year_dir.display()))?;
+        for entry in entries {
+            let path = entry?.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if !name.starts_with(&prefix) || !name.ends_with(".json") {
+                continue;
+            }
+            let body = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            // The prefix also matches a payee whose name merely starts
+            // the same way ("Acme" and "Acme Corp"); go by the record.
+            let same_payee = serde_json::from_slice::<Bill>(&body)
+                .ok()
+                .and_then(|bill| bill.payee().map(|payee| slugify(payee, false)))
+                .is_some_and(|slug| slug == payee_slug);
+            if same_payee && is_from_newer(&body, &name, incoming) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Translate a parsed [`Bill`] to a [`BillForFirefly`] and fire the
@@ -306,6 +368,45 @@ mod tests {
             fs::read(dir.join("2024/acme-inv1.pdf")).unwrap(),
             b"reminder"
         );
+    }
+
+    #[test]
+    fn payee_has_newer_bill_looks_across_invoices_and_years() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("bill.json");
+        let dir = tmp.path().join("out");
+        let at = |epoch| DateTime::from_timestamp(epoch, 0);
+        let file = |payee: &str, invoice: &str, due: &str, sent: i64| {
+            let body =
+                serde_json::json!({"payee": payee, "invoiceNumber": invoice, "dueDate": due});
+            fs::write(&src, body.to_string()).unwrap();
+            file_bill(&src, &dir, None, Some(sent)).unwrap();
+        };
+
+        file("Acme", "INV1", "2024-12-05", INVOICE_SENT);
+        assert!(!payee_has_newer_bill(&dir, "acme", at(INVOICE_SENT)).unwrap());
+        assert!(!payee_has_newer_bill(&dir, "acme", at(REMINDER_SENT)).unwrap());
+
+        // A later invoice for the same payee, filed under another year.
+        file("Acme", "INV2", "2025-01-05", REMINDER_SENT);
+        assert!(payee_has_newer_bill(&dir, "acme", at(INVOICE_SENT)).unwrap());
+        assert!(!payee_has_newer_bill(&dir, "acme", at(REMINDER_SENT)).unwrap());
+    }
+
+    #[test]
+    fn payee_has_newer_bill_ignores_other_payees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("bill.json");
+        let dir = tmp.path().join("out");
+        let body = serde_json::json!({
+            "payee": "Acme Corp", "invoiceNumber": "INV9", "dueDate": "2024-12-05",
+        });
+        fs::write(&src, body.to_string()).unwrap();
+        file_bill(&src, &dir, None, Some(REMINDER_SENT)).unwrap();
+
+        let invoice_sent = DateTime::from_timestamp(INVOICE_SENT, 0);
+        assert!(!payee_has_newer_bill(&dir, "acme", invoice_sent).unwrap());
+        assert!(payee_has_newer_bill(&dir, "acme-corp", invoice_sent).unwrap());
     }
 
     #[test]
