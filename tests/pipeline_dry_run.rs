@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use assert_cmd::Command;
+mod common;
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -20,8 +20,7 @@ fn dry_run_reports_counts_and_writes_nothing() {
     let events = tempfile::tempdir().expect("events tempdir");
     let parcels = tempfile::tempdir().expect("parcels tempdir");
 
-    let assert = Command::cargo_bin("mailsift")
-        .expect("binary built")
+    let assert = common::mailsift()
         .arg("replay")
         .arg(manifest.join("tests/fixtures/eml/parcel-delivered.eml"))
         .arg("--extractors")

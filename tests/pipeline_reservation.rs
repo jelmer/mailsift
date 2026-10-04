@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use assert_cmd::Command;
+mod common;
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -22,8 +22,7 @@ fn lodging_reservation_renders_to_ics() {
 
     let out = tempfile::tempdir().expect("tempdir");
 
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("replay")
         .arg(&eml)
         .arg("--extractors")

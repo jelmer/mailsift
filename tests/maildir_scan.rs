@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use assert_cmd::Command;
+mod common;
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -24,8 +24,7 @@ fn maildir_scan_processes_flat_maildir() {
     fs::write(td.path().join("cur/1234.msg"), &eml).unwrap();
     let out = tempfile::tempdir().unwrap();
 
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("maildir-scan")
         .arg(td.path())
         .arg("--extractors")
@@ -55,8 +54,7 @@ fn maildir_scan_recurse_processes_subfolders() {
     let out = tempfile::tempdir().unwrap();
 
     // Without --recurse: the .archive message is not seen, nothing is filed.
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("maildir-scan")
         .arg(td.path())
         .arg("--extractors")
@@ -71,8 +69,7 @@ fn maildir_scan_recurse_processes_subfolders() {
     );
 
     // With --recurse: it is picked up.
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("maildir-scan")
         .arg(td.path())
         .arg("--recurse")
@@ -94,8 +91,7 @@ fn maildir_scan_rejects_non_maildir() {
     let empty_extractors = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
 
-    let output = Command::cargo_bin("mailsift")
-        .expect("binary built")
+    let output = common::mailsift()
         .arg("maildir-scan")
         .arg(td.path())
         .arg("--extractors")
@@ -137,8 +133,7 @@ fn maildir_scan_extractor_flag_selects_one_extractor() {
 
     // Selecting only the flight extractor leaves the ICS message's
     // artifact unfiled, even though its own extractor would match it.
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("maildir-scan")
         .arg(td.path())
         .arg("--extractor")
@@ -177,8 +172,7 @@ fn maildir_scan_rejects_unknown_extractor_name() {
     make_maildir(td.path());
     let out = tempfile::tempdir().unwrap();
 
-    let output = Command::cargo_bin("mailsift")
-        .expect("binary built")
+    let output = common::mailsift()
         .arg("maildir-scan")
         .arg(td.path())
         .arg("--extractor")
@@ -223,8 +217,7 @@ fn maildir_scan_prefilter_skips_messages_from_other_senders() {
     let reservations = tempfile::tempdir().unwrap();
     let tickets = tempfile::tempdir().unwrap();
 
-    let output = Command::cargo_bin("mailsift")
-        .expect("binary built")
+    let output = common::mailsift()
         // The default subscriber styles fields with ANSI escapes,
         // which would sit between the field name and its value.
         .env("NO_COLOR", "1")
@@ -271,8 +264,7 @@ fn scan_to_caldav_opens_seen_store(extra: &[&str]) -> bool {
     let password = state.path().join("caldav.pass");
     fs::write(&password, "secret").unwrap();
 
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .env("XDG_STATE_HOME", state.path())
         .arg("maildir-scan")
         .arg(td.path())

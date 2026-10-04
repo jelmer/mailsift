@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use assert_cmd::Command;
+mod common;
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -14,14 +14,16 @@ fn manifest_dir() -> PathBuf {
 
 fn run_replay(eml: &str, subscriptions_dir: &Path) {
     let manifest = manifest_dir();
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("replay")
         .arg(manifest.join("tests/fixtures/eml").join(eml))
         .arg("--extractors")
         .arg(manifest.join("tests/fixtures/extractors"))
         .arg("--subscriptions-dir")
         .arg(subscriptions_dir)
+        // Nothing files an event here, but every run needs a target.
+        .arg("--events-dir")
+        .arg(subscriptions_dir.join("events"))
         .assert()
         .success();
 }
@@ -86,14 +88,15 @@ Your subscription has renewed.\r\n"
     }
     let out = tempfile::tempdir().expect("tempdir");
 
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("maildir-scan")
         .arg(maildir.path())
         .arg("--extractors")
         .arg(manifest.join("tests/fixtures/extractors"))
         .arg("--subscriptions-dir")
         .arg(out.path())
+        .arg("--events-dir")
+        .arg(out.path().join("events"))
         .assert()
         .success();
 
@@ -112,13 +115,15 @@ fn filing_waits_for_another_process_using_the_directory() {
     let out = tempfile::tempdir().expect("tempdir");
 
     let lock = mailsift::targets::sink::lock_dir(out.path()).expect("lock directory");
-    let mut replay = std::process::Command::new(assert_cmd::cargo::cargo_bin("mailsift"))
+    let mut replay = common::mailsift_std()
         .arg("replay")
         .arg(manifest.join("tests/fixtures/eml/subscription-renewal-2026-01.eml"))
         .arg("--extractors")
         .arg(manifest.join("tests/fixtures/extractors"))
         .arg("--subscriptions-dir")
         .arg(out.path())
+        .arg("--events-dir")
+        .arg(out.path().join("events"))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()

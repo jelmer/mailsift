@@ -16,8 +16,6 @@
 
 use std::path::{Path, PathBuf};
 
-use assert_cmd::Command;
-
 mod common;
 
 fn manifest_dir() -> PathBuf {
@@ -36,8 +34,7 @@ fn replay_flight() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     let tickets = out.path().join("tickets");
     let events = out.path().join("events");
 
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("replay")
         .arg(&eml)
         .arg("--extractors")
@@ -114,8 +111,7 @@ fn reservations_dir_is_optional() {
 
     // Without --reservations-dir the run still succeeds and the
     // calendar conversion happens as before.
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("replay")
         .arg(&eml)
         .arg("--extractors")
@@ -135,8 +131,7 @@ fn reservations_dir_is_optional() {
 /// Replay `eml` with the reservations, tickets and events dirs all
 /// under `out`.
 fn replay_into(eml: &Path, out: &Path) {
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("replay")
         .arg(eml)
         .arg("--extractors")

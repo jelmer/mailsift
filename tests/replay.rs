@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use assert_cmd::Command;
+mod common;
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -14,8 +14,7 @@ fn replay_files_ics_passthrough_event() {
 
     let out = tempfile::tempdir().expect("tempdir");
 
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("replay")
         .arg(&eml)
         .arg("--extractors")
@@ -53,8 +52,7 @@ fn replay_fails_with_empty_extractors_dir() {
     let empty = tempfile::tempdir().expect("tempdir");
     let events = tempfile::tempdir().expect("tempdir");
 
-    let output = Command::cargo_bin("mailsift")
-        .expect("binary built")
+    let output = common::mailsift()
         .arg("replay")
         .arg(&eml)
         .arg("--extractors")
