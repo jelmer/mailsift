@@ -137,3 +137,38 @@ fn filing_waits_for_another_process_using_the_directory() {
     assert!(replay.wait().expect("wait for mailsift").success());
     assert_eq!(filed(out.path())["price"], 12.99);
 }
+
+/// A message with no `Date:` header is ordered by when it was
+/// received instead: the newest `Received:` header.
+#[test]
+fn message_without_a_date_is_ordered_by_when_it_was_received() {
+    let out = tempfile::tempdir().expect("tempdir");
+    let mail = tempfile::tempdir().expect("mail tempdir");
+    let undated = mail.path().join("undated.eml");
+    std::fs::write(
+        &undated,
+        "Received: by mx.example.org with ESMTPS id abc123;\r\n\
+\tSat, 28 Feb 2026 08:30:00 +0000 (UTC)\r\n\
+Received: from mail.subscription.fixture.test by relay.example.org;\r\n\
+\tSat, 28 Feb 2026 08:29:58 +0000\r\n\
+From: billing@subscription.fixture.test\r\n\
+To: jelmer@example.org\r\n\
+Subject: fixture-renewal: 13.99\r\n\
+Message-ID: <fixture-renewal-undated@subscription.fixture.test>\r\n\
+Authentication-Results: example.org; dkim=pass header.d=subscription.fixture.test\r\n\
+\r\n\
+Your subscription has renewed.\r\n",
+    )
+    .expect("write message");
+
+    // Newer than the January renewal, so it replaces it ...
+    run_replay("subscription-renewal-2026-01.eml", out.path());
+    run_replay(undated.to_str().unwrap(), out.path());
+    let record = filed(out.path());
+    assert_eq!(record["price"], 13.99);
+    assert_eq!(record["receivedAt"], "2026-02-28T08:30:00Z");
+
+    // ... and the January one, processed again, doesn't take it back.
+    run_replay("subscription-renewal-2026-01.eml", out.path());
+    assert_eq!(filed(out.path())["price"], 13.99);
+}

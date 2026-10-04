@@ -297,6 +297,100 @@ mod tests {
         assert_eq!(server.resource("/2026/flight.pdf").unwrap(), b"reissued");
     }
 
+    fn webdav_ticket_sink(server: &crate::targets::fake_dav::FakeDav) -> TicketSink {
+        TicketSink::Webdav(server.webdav_sink())
+    }
+
+    #[test]
+    fn webdav_newer_mail_replaces_ticket_and_sidecar() {
+        let server = crate::targets::fake_dav::FakeDav::start();
+        let sink = webdav_ticket_sink(&server);
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("boarding-pass.pdf");
+        let meta = TicketMeta::default();
+
+        std::fs::write(&src, b"issued").unwrap();
+        let first = sink
+            .file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787736600))
+            .unwrap();
+        assert!(matches!(first, FileOutcome::Created(_)));
+        std::fs::write(&src, b"reissued").unwrap();
+        let second = sink
+            .file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787823000))
+            .unwrap();
+        assert!(matches!(second, FileOutcome::Updated(_)));
+
+        assert_eq!(server.resource("/2026/flight.pdf").unwrap(), b"reissued");
+        let sidecar = server.resource("/2026/flight.meta.json").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&sidecar).unwrap();
+        assert_eq!(v["receivedAt"], "2026-08-27T09:30:00Z");
+    }
+
+    /// There is no lock to hold across the sidecar and the blob on
+    /// WebDAV. If a newer ticket's sidecar lands right after ours, our
+    /// blob must not go on to replace that ticket's.
+    #[test]
+    fn webdav_blob_is_not_written_once_a_newer_sidecar_has_landed() {
+        let server = crate::targets::fake_dav::FakeDav::start();
+        let sink = webdav_ticket_sink(&server);
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("boarding-pass.pdf");
+        let reissued_sidecar = br#"{"slug":"flight","receivedAt":"2026-08-27T09:30:00Z"}"#;
+        server.overtake_after_next_put("/2026/flight.meta.json", reissued_sidecar);
+
+        std::fs::write(&src, b"issued").unwrap();
+        let outcome = sink
+            .file_ticket(
+                &src,
+                "flight",
+                "pdf",
+                2026,
+                &TicketMeta::default(),
+                Some(1787736600),
+            )
+            .unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        assert_eq!(server.resource("/2026/flight.pdf"), None);
+        assert_eq!(
+            server.resource("/2026/flight.meta.json").unwrap(),
+            reissued_sidecar
+        );
+    }
+
+    /// Scans file tickets from several threads at once. Whichever
+    /// order they land in, the blob and the sidecar left on file must
+    /// both be the newest ticket's.
+    #[test]
+    fn concurrent_filing_leaves_the_newest_ticket_and_its_sidecar() {
+        for _ in 0..100 {
+            let tmp = tempfile::tempdir().unwrap();
+            let out = tmp.path().join("out");
+            let sink = TicketSink::LocalDir(out.clone());
+            std::thread::scope(|scope| {
+                for n in 0..8i64 {
+                    let sink = &sink;
+                    let src = tmp.path().join(format!("{n}.pdf"));
+                    scope.spawn(move || {
+                        std::fs::write(&src, format!("pass {n}")).unwrap();
+                        let meta = TicketMeta {
+                            reservation_number: Some(format!("R{n}")),
+                            ..TicketMeta::default()
+                        };
+                        sink.file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787736600 + n))
+                            .unwrap();
+                    });
+                }
+            });
+            assert_eq!(
+                std::fs::read(out.join("2026/flight.pdf")).unwrap(),
+                b"pass 7"
+            );
+            let sidecar = std::fs::read(out.join("2026/flight.meta.json")).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&sidecar).unwrap();
+            assert_eq!(v["reservationNumber"], "R7");
+        }
+    }
+
     #[test]
     fn newer_mail_replaces_ticket() {
         let tmp = tempfile::tempdir().unwrap();

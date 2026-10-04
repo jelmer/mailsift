@@ -67,6 +67,52 @@ fn parcels_target_merges_status_updates_into_history() {
     assert_eq!(history[2]["deliveryStatus"], "Delivered");
 }
 
+/// The same three mails, scanned three times over and never in date
+/// order: each pass ends on a mail from before the delivery. The
+/// record must come out exactly as when they arrive in order, once.
+#[test]
+fn parcel_mails_out_of_order_and_rescanned_settle_on_the_same_record() {
+    let events = tempfile::tempdir().expect("events tempdir");
+    let parcels = tempfile::tempdir().expect("parcels tempdir");
+    let events_dir = events.path().to_path_buf();
+    let parcels_dir = parcels.path().to_path_buf();
+
+    for _ in 0..3 {
+        for eml in [
+            "parcel-delivered.eml",
+            "parcel-on-its-way.eml",
+            "parcel-out-for-delivery.eml",
+        ] {
+            run_replay(eml, &events_dir, &parcels_dir);
+        }
+    }
+
+    let body = std::fs::read_to_string(parcels_dir.join("FIXT-12345.json")).expect("read parcel");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("parcel is valid JSON");
+    assert_eq!(parsed["deliveryStatus"], "Delivered");
+
+    let mut history: Vec<(&str, &str)> = parsed["history"]
+        .as_array()
+        .expect("history is an array")
+        .iter()
+        .map(|entry| {
+            (
+                entry["receivedAt"].as_str().unwrap(),
+                entry["deliveryStatus"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    history.sort();
+    assert_eq!(
+        history,
+        vec![
+            ("2026-02-01T10:00:00Z", "OnItsWay"),
+            ("2026-02-02T09:00:00Z", "OutForDelivery"),
+            ("2026-02-02T14:00:00Z", "Delivered"),
+        ]
+    );
+}
+
 /// A `.reservation.json` emitted alongside a `.parcel.json` (when the
 /// mail carries a delivery window) is converted by the reservation
 /// renderer into an `EventReservation`-shaped iCalendar entry, with

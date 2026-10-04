@@ -393,6 +393,40 @@ mod tests {
         assert!(!payee_has_newer_bill(&dir, "acme", at(REMINDER_SENT)).unwrap());
     }
 
+    /// Firefly keeps one bill per payee. An invoice older than one
+    /// already filed for that payee is a record of its own on disk,
+    /// but must not reach Firefly.
+    #[test]
+    fn older_invoice_is_not_registered_with_firefly() {
+        use crate::targets::fake_dav::{FakeDav, runtime_handle};
+
+        let server = FakeDav::start();
+        let firefly =
+            FireflySink::new(server.base_url.clone(), "token".into(), runtime_handle()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("bill.json");
+        let dir = tmp.path().join("out");
+        let file = |invoice: &str, due: &str, sent: i64| {
+            let body = serde_json::json!({
+                "payee": "Acme", "invoiceNumber": invoice, "dueDate": due,
+                "totalPaymentDue": {"price": 42.5, "priceCurrency": "GBP"},
+            });
+            fs::write(&src, body.to_string()).unwrap();
+            file_bill(&src, &dir, Some(&firefly), Some(sent)).unwrap()
+        };
+        const LOOKUP: &str = "GET /api/v1/bills?query=Acme";
+
+        file("INV2", "2025-01-05", REMINDER_SENT);
+        assert_eq!(server.requests(), vec![LOOKUP]);
+
+        let outcome = file("INV1", "2024-12-05", INVOICE_SENT);
+        assert!(matches!(outcome, FileOutcome::Created(_)));
+        assert_eq!(server.requests(), vec![LOOKUP]);
+
+        file("INV3", "2025-02-05", REMINDER_SENT + 86400);
+        assert_eq!(server.requests(), vec![LOOKUP, LOOKUP]);
+    }
+
     #[test]
     fn payee_has_newer_bill_ignores_other_payees() {
         let tmp = tempfile::tempdir().unwrap();

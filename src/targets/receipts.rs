@@ -353,6 +353,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn webdav_newer_mail_replaces_receipt_and_its_blob() {
+        let server = crate::targets::fake_dav::FakeDav::start();
+        let sink = ReceiptSink::Webdav(server.webdav_sink());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("receipt.json");
+        let blob = tmp.path().join("receipt.pdf");
+        let pair = ("digital-ocean", "inv-42", 2026);
+        let at = |epoch| DateTime::from_timestamp(epoch, 0);
+
+        write_receipt(&src, 10.0);
+        std::fs::write(&blob, b"invoice").unwrap();
+        sink.file_receipt(&src, b"", Some(INVOICE_SENT)).unwrap();
+        sink.file_receipt_blob(&blob, "pdf", pair, at(INVOICE_SENT))
+            .unwrap();
+
+        write_receipt(&src, 12.0);
+        std::fs::write(&blob, b"correction").unwrap();
+        let outcome = sink.file_receipt(&src, b"", Some(CORRECTION_SENT)).unwrap();
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+        let outcome = sink
+            .file_receipt_blob(&blob, "pdf", pair, at(CORRECTION_SENT))
+            .unwrap();
+        assert!(matches!(outcome, Some(FileOutcome::Updated(_))));
+
+        let json = server.resource("/2026/digital-ocean-inv-42.json").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["price"], 12.0);
+        assert_eq!(
+            server.resource("/2026/digital-ocean-inv-42.pdf").unwrap(),
+            b"correction"
+        );
+    }
+
     // 2026-08-01T00:00:00Z and a corrected invoice sent a week later.
     const INVOICE_SENT: i64 = 1785542400;
     const CORRECTION_SENT: i64 = 1786147200;

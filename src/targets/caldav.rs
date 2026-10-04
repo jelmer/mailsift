@@ -528,6 +528,75 @@ SUMMARY:{summary}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
     }
 
     #[test]
+    fn event_that_keeps_changing_is_an_error() {
+        let server = FakeDav::start();
+        let sink = sink(&server);
+        let original = event("Original", Some("2026-01-20T10:00:00Z"));
+        sink.file(&original).unwrap();
+        server.keep_changing("/calendar/train-1.ics");
+
+        let err = sink
+            .file(&event("Amended", Some("2026-01-25T10:00:00Z")))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{}calendar/train-1.ics kept changing while being updated",
+                server.base_url
+            )
+        );
+        assert_eq!(
+            server.resource("/calendar/train-1.ics").unwrap(),
+            original.body.as_bytes()
+        );
+    }
+
+    /// A lookup that fails must not be taken for "no event there".
+    #[test]
+    fn failing_lookup_is_an_error_and_nothing_is_put() {
+        let server = FakeDav::start();
+        let sink = sink(&server);
+        server.fail_gets_with("403 Forbidden");
+
+        let err = sink
+            .file(&event("Amended", Some("2026-01-25T10:00:00Z")))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "GET {}calendar/train-1.ics returned 403 Forbidden: ",
+                server.base_url
+            )
+        );
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.starts_with("PUT"))
+                .count(),
+            0
+        );
+    }
+
+    /// With nothing to order it by, an undated event replaces what is
+    /// there, as every event used to.
+    #[test]
+    fn undated_event_replaces_a_dated_one() {
+        let server = FakeDav::start();
+        let sink = sink(&server);
+        sink.file(&event("Dated", Some("2026-01-28T10:00:00Z")))
+            .unwrap();
+        let undated = event("Undated", None);
+
+        let outcome = sink.file(&undated).unwrap();
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+        assert_eq!(
+            server.resource("/calendar/train-1.ics").unwrap(),
+            undated.body.as_bytes()
+        );
+    }
+
+    #[test]
     fn event_without_dtstamp_on_the_server_is_replaced() {
         let server = FakeDav::start();
         let sink = sink(&server);

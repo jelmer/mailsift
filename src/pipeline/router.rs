@@ -1018,23 +1018,116 @@ END:VCALENDAR\r
         assert_eq!(summary.render(), "ex=2 events");
     }
 
+    fn caldav_sink(server: &crate::targets::fake_dav::FakeDav) -> EventSinkKind {
+        EventSinkKind::Caldav(
+            crate::targets::caldav::CaldavSink::new(
+                server.base_url.clone(),
+                Some("u".into()),
+                Some("p".into()),
+                crate::targets::fake_dav::runtime_handle(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// An event the server has a newer take on was not filed, so the
+    /// dedup store must not record it as filed, nor the summary count
+    /// it.
+    #[test]
+    fn file_single_does_not_mark_a_kept_event_as_seen() {
+        let server = crate::targets::fake_dav::FakeDav::start();
+        let sink = caldav_sink(&server);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = SeenStore::open(&store_dir.path().join("seen.db")).unwrap();
+        let mut summary = Summary::default();
+
+        // Sent 2026-01-28, filed without the store; then one sent 2026-01-20.
+        file_single(
+            "ex",
+            &event_about("Rebooked"),
+            &sink,
+            None,
+            Some(1769594400),
+            &mut summary,
+        );
+        let mut summary = Summary::default();
+        file_single(
+            "ex",
+            &event_about("Original"),
+            &sink,
+            Some(&store),
+            Some(1768903200),
+            &mut summary,
+        );
+        assert_eq!(store.len().unwrap(), 0);
+        assert!(summary.is_empty());
+    }
+
+    /// A record left alone in favour of a newer one wasn't filed, so
+    /// it doesn't show up in the per-message summary.
+    #[test]
+    fn kept_subscription_is_not_counted() {
+        let out = tempfile::TempDir::new().unwrap();
+        let (_d, path) = write_temp(r#"{"name":"Fixture Music"}"#, ".subscription.json");
+        let art = artifact(Kind::Subscription, path);
+        let mut summary = Summary::default();
+
+        file_subscription_artifact("ex", &art, out.path(), Some(1769594400), &mut summary);
+        assert_eq!(summary.render(), "ex=1 subscription");
+        file_subscription_artifact("ex", &art, out.path(), Some(1768903200), &mut summary);
+        assert_eq!(summary.render(), "ex=1 subscription");
+    }
+
+    /// An extractor may date a bill itself. Its blob has to be ordered
+    /// by that same date; ordered by the message date instead, it
+    /// would look older than the record just filed and never land.
+    #[test]
+    fn bill_blob_is_filed_beside_a_bill_dated_by_the_extractor() {
+        let out = tempfile::TempDir::new().unwrap();
+        let src = tempfile::TempDir::new().unwrap();
+        let json = src.path().join("acme.bill.json");
+        let pdf = src.path().join("acme.bill.pdf");
+        fs::write(
+            &json,
+            r#"{"payee":"Acme","invoiceNumber":"INV1","dueDate":"2024-12-05",
+                "receivedAt":"2030-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        fs::write(&pdf, b"%PDF").unwrap();
+        let arts = vec![
+            Artifact {
+                kind: Kind::Bill,
+                path: json,
+                slug: "acme".into(),
+                ext: "json".into(),
+            },
+            Artifact {
+                kind: Kind::Bill,
+                path: pdf,
+                slug: "acme".into(),
+                ext: "pdf".into(),
+            },
+        ];
+        let mut summary = Summary::default();
+        // The message itself was sent 2024-11-01.
+        let sent = Some(1730419200);
+
+        file_bill_artifact("ex", &arts[0], out.path(), None, sent, &mut summary);
+        file_bill_blob_artifact("ex", &arts[1], &arts, out.path(), sent, &mut summary);
+
+        assert_eq!(
+            fs::read(out.path().join("2024/acme-inv1.pdf")).unwrap(),
+            b"%PDF"
+        );
+        assert_eq!(summary.render(), "ex=2 bills");
+    }
+
     /// With a dedup store, an event CalDAV already has unchanged
     /// costs no request at all; a changed one is sent.
     #[test]
     fn file_single_skips_caldav_for_an_event_already_filed() {
-        use crate::targets::caldav::CaldavSink;
-        use crate::targets::fake_dav::{FakeDav, runtime_handle};
-
-        let server = FakeDav::start();
-        let sink = EventSinkKind::Caldav(
-            CaldavSink::new(
-                server.base_url.clone(),
-                Some("u".into()),
-                Some("p".into()),
-                runtime_handle(),
-            )
-            .unwrap(),
-        );
+        let server = crate::targets::fake_dav::FakeDav::start();
+        let sink = caldav_sink(&server);
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = SeenStore::open(&store_dir.path().join("seen.db")).unwrap();
         let mut summary = Summary::default();

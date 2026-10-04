@@ -424,6 +424,44 @@ mod tests {
     use super::*;
     use reqwest::header::HeaderValue;
 
+    fn precondition_headers(found: Option<&Fetched>) -> Vec<(String, String)> {
+        let request = Client::new().put("http://dav.example.org/x");
+        let request = unless_changed(request, found).build().unwrap();
+        request
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_string()))
+            .collect()
+    }
+
+    fn fetched(etag: Option<&str>) -> Fetched {
+        Fetched {
+            body: Vec::new(),
+            etag: etag.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn unless_changed_requires_absence_when_nothing_was_found() {
+        assert_eq!(
+            precondition_headers(None),
+            vec![("if-none-match".to_string(), "*".to_string())]
+        );
+    }
+
+    #[test]
+    fn unless_changed_requires_the_etag_that_was_found() {
+        assert_eq!(
+            precondition_headers(Some(&fetched(Some("\"v3\"")))),
+            vec![("if-match".to_string(), "\"v3\"".to_string())]
+        );
+    }
+
+    #[test]
+    fn unless_changed_is_unconditional_without_an_etag() {
+        assert_eq!(precondition_headers(Some(&fetched(None))), vec![]);
+    }
+
     fn headers_with(values: &[&str]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for v in values {

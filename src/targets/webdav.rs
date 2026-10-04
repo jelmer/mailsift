@@ -379,6 +379,108 @@ mod tests {
         );
     }
 
+    /// `If-Match` can't be used with a weak ETag, so against such a
+    /// server the PUT goes out unconditionally, as it always used to.
+    #[test]
+    fn update_is_unconditional_against_weak_etags() {
+        let server = FakeDav::start();
+        server.use_weak_etags();
+        let s = server.webdav_sink();
+        server.put("/2026/acme-1.json", &record("2026-01-20T10:00:00Z"));
+        server.overtake_after_next_get("/2026/acme-1.json", &record("2026-01-28T10:00:00Z"));
+
+        let outcome = file(&s, &record("2026-01-25T10:00:00Z"));
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+        assert_eq!(
+            server.requests(),
+            vec!["GET /2026/acme-1.json", "PUT /2026/acme-1.json"]
+        );
+    }
+
+    #[test]
+    fn update_gives_up_on_a_resource_that_keeps_changing() {
+        let server = FakeDav::start();
+        let s = server.webdav_sink();
+        server.put("/2026/acme-1.json", &record("2026-01-20T10:00:00Z"));
+        server.keep_changing("/2026/acme-1.json");
+
+        let body = record("2026-01-25T10:00:00Z");
+        let incoming = json_target::received_at_in(&body).unwrap();
+        let err = s
+            .update(
+                "2026/acme-1.json",
+                "application/json",
+                "receipt",
+                &json_target::replace_unless_newer("acme-1", &body, incoming),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{}2026/acme-1.json kept changing while being updated",
+                server.base_url
+            )
+        );
+        assert_eq!(
+            server.resource("/2026/acme-1.json").unwrap(),
+            record("2026-01-20T10:00:00Z")
+        );
+        assert_eq!(
+            server.requests().len(),
+            2 * http_auth::MAX_UPDATE_ATTEMPTS as usize
+        );
+    }
+
+    /// A lookup that fails must not be taken for "nothing there".
+    #[test]
+    fn update_reports_a_failing_lookup_and_writes_nothing() {
+        let server = FakeDav::start();
+        let s = server.webdav_sink();
+        server.fail_gets_with("403 Forbidden");
+
+        let body = record("2026-01-25T10:00:00Z");
+        let incoming = json_target::received_at_in(&body).unwrap();
+        let err = s
+            .update(
+                "2026/acme-1.json",
+                "application/json",
+                "receipt",
+                &json_target::replace_unless_newer("acme-1", &body, incoming),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "GET {}2026/acme-1.json returned 403 Forbidden: ",
+                server.base_url
+            )
+        );
+        assert_eq!(server.requests(), vec!["GET /2026/acme-1.json"]);
+    }
+
+    #[test]
+    fn update_creates_missing_parent_collections() {
+        let server = FakeDav::start();
+        server.require_collections();
+        let s = server.webdav_sink();
+
+        let outcome = file(&s, &record("2026-01-25T10:00:00Z"));
+        assert!(matches!(outcome, FileOutcome::Created(_)));
+        assert_eq!(
+            server.requests(),
+            vec![
+                "GET /2026/acme-1.json",
+                "PUT /2026/acme-1.json",
+                "MKCOL /2026",
+                "PUT /2026/acme-1.json",
+            ]
+        );
+        assert_eq!(
+            server.resource("/2026/acme-1.json").unwrap(),
+            record("2026-01-25T10:00:00Z")
+        );
+    }
+
     #[test]
     fn filed_from_newer_is_false_when_nothing_is_stored() {
         let server = FakeDav::start();

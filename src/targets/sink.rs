@@ -229,6 +229,96 @@ mod tests {
         assert!(!supersedes(None, None));
     }
 
+    fn replace_with(body: &'static [u8]) -> impl Fn(Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        move |_| Ok(Some(body.to_vec()))
+    }
+
+    #[test]
+    fn update_file_creates_then_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("2026/record.json");
+
+        let first = update_file(&target, "record", &replace_with(b"one")).unwrap();
+        assert!(matches!(first, FileOutcome::Created(_)));
+        let second = update_file(&target, "record", &replace_with(b"two")).unwrap();
+        assert!(matches!(second, FileOutcome::Updated(_)));
+        assert_eq!(fs::read(&target).unwrap(), b"two");
+    }
+
+    #[test]
+    fn update_file_shows_the_merge_what_is_on_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("record.json");
+
+        update_file(&target, "record", &|existing| {
+            assert_eq!(existing, None);
+            Ok(Some(b"one".to_vec()))
+        })
+        .unwrap();
+        update_file(&target, "record", &|existing| {
+            assert_eq!(existing, Some(b"one".as_slice()));
+            Ok(Some([existing.unwrap(), b"+two"].concat()))
+        })
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"one+two");
+    }
+
+    #[test]
+    fn update_file_keeps_what_is_there_when_the_merge_declines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("record.json");
+        fs::write(&target, b"one").unwrap();
+
+        let outcome = update_file(&target, "record", &|_| Ok(None)).unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        assert_eq!(fs::read(&target).unwrap(), b"one");
+
+        // Declining when nothing is there leaves nothing there.
+        let absent = tmp.path().join("absent.json");
+        let outcome = update_file(&absent, "record", &|_| Ok(None)).unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        assert!(!absent.exists());
+    }
+
+    #[test]
+    fn update_file_passes_on_a_merge_failure_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("record.json");
+        fs::write(&target, b"one").unwrap();
+
+        let err = update_file(&target, "record", &|_| bail!("can't merge")).unwrap_err();
+        assert_eq!(err.to_string(), "can't merge");
+        assert_eq!(fs::read(&target).unwrap(), b"one");
+    }
+
+    #[test]
+    fn lock_dir_makes_a_second_taker_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let got_it = AtomicBool::new(false);
+        let lock = lock_dir(tmp.path()).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _lock = lock_dir(tmp.path()).unwrap();
+                got_it.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!got_it.load(Ordering::SeqCst));
+            drop(lock);
+        });
+        assert!(got_it.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn lock_dir_creates_the_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("bills/2026");
+        let _lock = lock_dir(&dir).unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
     #[test]
     fn read_if_exists_distinguishes_missing_from_present() {
         let tmp = tempfile::tempdir().unwrap();
