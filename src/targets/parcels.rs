@@ -234,27 +234,49 @@ fn merge(mut existing: Value, incoming: Value) -> Value {
     let history = existing_obj
         .entry("history")
         .or_insert_with(|| Value::Array(Vec::new()));
-    if let Value::Array(arr) = history
-        && !is_duplicate_history_entry(arr.last(), &history_entry)
-    {
+    if let Value::Array(arr) = history {
         arr.push(history_entry);
+        drop_repeated_entries(arr);
     }
 
     Value::Object(existing_obj)
 }
 
-/// Whether `entry` records the same tracker snapshot as `last`,
-/// ignoring their own `seen_at`. Repeated poll cycles that see the
-/// same status with the same event timestamps produce identical
-/// entries; keeping only the first stops the history from growing
-/// unboundedly.
-fn is_duplicate_history_entry(last: Option<&Value>, entry: &Value) -> bool {
-    let Some(last) = last.and_then(Value::as_object) else {
-        return false;
-    };
-    let Some(entry) = entry.as_object() else {
-        return false;
-    };
+/// Drop every history entry that repeats one before it, keeping the
+/// first. Covers the entry just appended as well as repeats left
+/// behind by rescans from before they were recognised.
+fn drop_repeated_entries(history: &mut Vec<Value>) {
+    let mut kept: Vec<Value> = Vec::with_capacity(history.len());
+    for entry in history.drain(..) {
+        if !is_recorded(&kept, &entry) {
+            kept.push(entry);
+        }
+    }
+    *history = kept;
+}
+
+/// Whether `history` already records `entry`.
+///
+/// A dated entry stands for one mail, and a rescan replays a parcel's
+/// whole run of mails, so a match anywhere in the history is that mail
+/// processed before. An undated entry only repeats the one right
+/// before it: a parcel can go back to a status it had earlier, and
+/// without a date that is not told apart from a replay.
+fn is_recorded(history: &[Value], entry: &Value) -> bool {
+    if entry.get("receivedAt").is_some() {
+        history
+            .iter()
+            .any(|earlier| is_same_snapshot(earlier, entry))
+    } else {
+        history
+            .last()
+            .is_some_and(|last| is_same_snapshot(last, entry))
+    }
+}
+
+/// Whether two history entries record the same snapshot of a parcel,
+/// ignoring when each was seen.
+fn is_same_snapshot(a: &Value, b: &Value) -> bool {
     [
         "receivedAt",
         "deliveryStatus",
@@ -263,7 +285,7 @@ fn is_duplicate_history_entry(last: Option<&Value>, entry: &Value) -> bool {
         "actualDeliveryTime",
     ]
     .iter()
-    .all(|k| last.get(*k) == entry.get(*k))
+    .all(|k| a.get(*k) == b.get(*k))
 }
 
 /// Whether a record's `deliveryStatus` is a terminal one.
@@ -716,6 +738,83 @@ mod tests {
             history.len(),
             1,
             "duplicate history entry should not be appended"
+        );
+    }
+
+    fn status_at(status: &str, received_at: &str) -> Value {
+        serde_json::json!({
+            "trackingNumber": "X", "deliveryStatus": status, "receivedAt": received_at,
+        })
+    }
+
+    fn history_statuses(parcel: &Value) -> Vec<&str> {
+        parcel["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["deliveryStatus"].as_str().unwrap())
+            .collect()
+    }
+
+    /// A rescan hands us every mail about a parcel again, in sequence.
+    /// None of them is news.
+    #[test]
+    fn replaying_a_parcels_mails_adds_no_history() {
+        let mails = [
+            status_at("OnItsWay", "2025-09-24T12:56:20Z"),
+            status_at("OutForDelivery", "2025-09-25T12:05:06Z"),
+            status_at("Delivered", "2025-09-27T14:37:31Z"),
+        ];
+        let mut parcel = with_initial_history(mails[0].clone());
+        for mail in mails.iter().skip(1).chain(&mails).chain(&mails) {
+            parcel = merge(parcel, mail.clone());
+        }
+        assert_eq!(
+            history_statuses(&parcel),
+            vec!["OnItsWay", "OutForDelivery", "Delivered"]
+        );
+        assert_eq!(parcel["deliveryStatus"], "Delivered");
+    }
+
+    /// Records filed before replays were recognised carry the same
+    /// run of mails several times over. The next update tidies them.
+    #[test]
+    fn merge_drops_repeats_already_in_the_history() {
+        let entry = |status: &str, received_at: &str, seen_at: &str| {
+            serde_json::json!({
+                "deliveryStatus": status, "receivedAt": received_at, "seen_at": seen_at,
+            })
+        };
+        let existing = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "Delivered",
+            "receivedAt": "2025-09-24T12:56:20Z",
+            "history": [
+                entry("OnItsWay", "2025-09-24T12:56:20Z", "2026-08-28T23:11:41Z"),
+                entry("Delivered", "2025-09-27T14:37:31Z", "2026-08-28T23:32:37Z"),
+                entry("OnItsWay", "2025-09-24T12:56:20Z", "2026-08-29T20:09:11Z"),
+                entry("Delivered", "2025-09-27T14:37:31Z", "2026-08-29T20:13:00Z"),
+            ]
+        });
+        let merged = merge(existing, status_at("Delivered", "2025-09-27T14:37:31Z"));
+        assert_eq!(history_statuses(&merged), vec!["OnItsWay", "Delivered"]);
+        // The first sighting of each mail is the one kept.
+        assert_eq!(merged["history"][1]["seen_at"], "2026-08-28T23:32:37Z");
+    }
+
+    /// Without dates a return to an earlier status can't be told from
+    /// a replay, so only an immediate repeat is dropped.
+    #[test]
+    fn undated_return_to_an_earlier_status_is_kept() {
+        let undated =
+            |status: &str| serde_json::json!({"trackingNumber": "X", "deliveryStatus": status});
+        let mut parcel = with_initial_history(undated("OnItsWay"));
+        for status in ["OutForDelivery", "OutForDelivery", "OnItsWay"] {
+            parcel = merge(parcel, undated(status));
+        }
+        assert_eq!(
+            history_statuses(&parcel),
+            vec!["OnItsWay", "OutForDelivery", "OnItsWay"]
         );
     }
 
