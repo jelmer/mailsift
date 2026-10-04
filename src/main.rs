@@ -400,6 +400,12 @@ struct ImapScanArgs {
     /// dashboard.
     #[arg(long)]
     no_stats: bool,
+    /// Send every event to CalDAV again, even those the dedup store
+    /// (`$XDG_STATE_HOME/mailsift/seen.db`) says were filed unchanged
+    /// before. Use it to restore events that were edited or deleted
+    /// on the server.
+    #[arg(long)]
+    no_dedup: bool,
     /// After the initial scan, stay connected and process new
     /// messages as they arrive (IMAP IDLE, RFC 2177). Runs until
     /// interrupted (Ctrl-C). On transport errors the connection is
@@ -517,6 +523,12 @@ enum Command {
         /// in the dashboard.
         #[arg(long)]
         no_stats: bool,
+        /// Send every event to CalDAV again, even those the dedup
+        /// store (`$XDG_STATE_HOME/mailsift/seen.db`) says were filed
+        /// unchanged before. Use it to restore events that were
+        /// edited or deleted on the server.
+        #[arg(long)]
+        no_dedup: bool,
     },
     /// Validate every discoverable extractor manifest. Parses each
     /// `<name>.yaml`, compiles the `subject_regex`, parses `requires:`
@@ -1161,6 +1173,38 @@ fn render_paths(paths: &[PathBuf]) -> String {
         .join(", ")
 }
 
+/// Open the dedup store at its default location, best-effort: if it
+/// can't be opened we warn and run without it. The sinks stay correct
+/// either way; we just pay the network cost.
+fn open_seen_store() -> Option<mailsift::seen::Store> {
+    let path = mailsift::seen::Store::default_path()?;
+    match mailsift::seen::Store::open(&path) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                path = %path.display(),
+                "seen.db open failed; running without dedup"
+            );
+            None
+        }
+    }
+}
+
+/// The dedup store for a scan, so a rescan doesn't send CalDAV every
+/// event it already has. Only the CalDAV sink consults the store, so a
+/// scan that files events elsewhere leaves it alone.
+fn scan_seen_store(
+    sink: &EventSinkKind,
+    no_dedup: bool,
+    dry_run: bool,
+) -> Option<mailsift::seen::Store> {
+    if no_dedup || dry_run || !matches!(sink, EventSinkKind::Caldav(_)) {
+        return None;
+    }
+    open_seen_store()
+}
+
 /// Build the per-process set of tracker-registration sinks. Each
 /// sink-source (CLI flag or config section) contributes one element;
 /// the returned value is empty when nothing is configured, which the
@@ -1435,9 +1479,11 @@ fn run() -> Result<()> {
                 firefly,
                 dry_run,
                 no_stats,
+                no_dedup,
                 watch,
             } = *args;
             let sink = target.build_sink(&config, runtime.handle())?;
+            let seen = scan_seen_store(&sink, no_dedup, dry_run);
             let extractors_dir = resolve_extractors(extractors, &config);
             let extractors = discover_required(&extractors_dir)?;
             let extractors = select_extractors(extractors, &only)?;
@@ -1534,9 +1580,7 @@ fn run() -> Result<()> {
                     trackers: (!trackers.is_empty()).then_some(&trackers),
                     trusted_forwarders: &config.trusted_forwarders,
                     recorder: &recorder,
-                    // Bulk import: bypass the dedup store so every
-                    // event is re-PUT.
-                    seen: None,
+                    seen: seen.as_ref(),
                 },
                 dry_run,
                 watch,
@@ -1556,8 +1600,10 @@ fn run() -> Result<()> {
             firefly,
             dry_run,
             no_stats,
+            no_dedup,
         } => {
             let sink = target.build_sink(&config, runtime.handle())?;
+            let seen = scan_seen_store(&sink, no_dedup, dry_run);
             let extractors_dir = resolve_extractors(extractors, &config);
             let extractors = discover_required(&extractors_dir)?;
             let extractors = select_extractors(extractors, &only)?;
@@ -1591,9 +1637,7 @@ fn run() -> Result<()> {
                     trackers: (!trackers.is_empty()).then_some(&trackers),
                     trusted_forwarders: &config.trusted_forwarders,
                     recorder: &recorder,
-                    // Bulk import: bypass the dedup store; upstream
-                    // sinks are already idempotent.
-                    seen: None,
+                    seen: seen.as_ref(),
                 },
                 dry_run,
             })
@@ -1643,23 +1687,7 @@ fn run() -> Result<()> {
                     // Long-running daemon: record every extractor
                     // decision so `mailsift stats` has useful data.
                     recorder: mailsift::stats::Recorder::default_file(),
-                    // Open seen.db best-effort; if it can't be
-                    // opened we warn and fall back to no dedup
-                    // (server-side replace handles correctness, we
-                    // just pay the network cost).
-                    seen: mailsift::seen::Store::default_path().and_then(|p| {
-                        match mailsift::seen::Store::open(&p) {
-                            Ok(s) => Some(s),
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = format!("{e:#}"),
-                                    path = %p.display(),
-                                    "seen.db open failed; running without dedup"
-                                );
-                                None
-                            }
-                        }
-                    }),
+                    seen: open_seen_store(),
                 },
                 deadline: Duration::from_secs(deadline_secs),
             };

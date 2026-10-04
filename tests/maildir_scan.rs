@@ -256,3 +256,53 @@ fn maildir_scan_prefilter_skips_messages_from_other_senders() {
         "expected only the matching message to be processed: {log}"
     );
 }
+
+/// Scan the fixture message into a CalDAV server nobody is listening
+/// on, with `extra` flags, and report whether the scan opened the
+/// dedup store. Filing fails, which a scan only warns about; the
+/// store is opened before that.
+fn scan_to_caldav_opens_seen_store(extra: &[&str]) -> bool {
+    let manifest = manifest_dir();
+    let eml = fs::read(manifest.join("tests/fixtures/eml/ics-attachment.eml")).unwrap();
+    let td = tempfile::tempdir().unwrap();
+    make_maildir(td.path());
+    fs::write(td.path().join("cur/1234.msg"), &eml).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let password = state.path().join("caldav.pass");
+    fs::write(&password, "secret").unwrap();
+
+    Command::cargo_bin("mailsift")
+        .expect("binary built")
+        .env("XDG_STATE_HOME", state.path())
+        .arg("maildir-scan")
+        .arg(td.path())
+        .arg("--extractors")
+        .arg(manifest.join("tests/fixtures/extractors"))
+        .arg("--caldav-url")
+        .arg("http://u@127.0.0.1:1/")
+        .arg("--caldav-password-file")
+        .arg(&password)
+        .arg("--no-stats")
+        .args(extra)
+        .assert()
+        .success();
+
+    state.path().join("mailsift/seen.db").exists()
+}
+
+/// A rescan shouldn't send CalDAV every event it already has, so a
+/// scan consults the dedup store just as the milter does.
+#[test]
+fn maildir_scan_to_caldav_uses_the_dedup_store() {
+    assert!(scan_to_caldav_opens_seen_store(&[]));
+}
+
+#[test]
+fn maildir_scan_no_dedup_leaves_the_dedup_store_alone() {
+    assert!(!scan_to_caldav_opens_seen_store(&["--no-dedup"]));
+}
+
+#[test]
+fn maildir_scan_dry_run_leaves_the_dedup_store_alone() {
+    assert!(!scan_to_caldav_opens_seen_store(&["--dry-run"]));
+}

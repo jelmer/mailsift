@@ -1,7 +1,7 @@
 pub mod bills;
 pub mod caldav;
 #[cfg(test)]
-mod fake_dav;
+pub(crate) mod fake_dav;
 pub mod firefly;
 pub mod http_auth;
 pub mod http_client;

@@ -1018,6 +1018,65 @@ END:VCALENDAR\r
         assert_eq!(summary.render(), "ex=2 events");
     }
 
+    /// With a dedup store, an event CalDAV already has unchanged
+    /// costs no request at all; a changed one is sent.
+    #[test]
+    fn file_single_skips_caldav_for_an_event_already_filed() {
+        use crate::targets::caldav::CaldavSink;
+        use crate::targets::fake_dav::{FakeDav, runtime_handle};
+
+        let server = FakeDav::start();
+        let sink = EventSinkKind::Caldav(
+            CaldavSink::new(
+                server.base_url.clone(),
+                Some("u".into()),
+                Some("p".into()),
+                runtime_handle(),
+            )
+            .unwrap(),
+        );
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = SeenStore::open(&store_dir.path().join("seen.db")).unwrap();
+        let mut summary = Summary::default();
+        let sent = Some(1769594400);
+
+        file_single(
+            "ex",
+            &event_about("Booked"),
+            &sink,
+            Some(&store),
+            sent,
+            &mut summary,
+        );
+        let after_first = server.requests().len();
+        file_single(
+            "ex",
+            &event_about("Booked"),
+            &sink,
+            Some(&store),
+            sent,
+            &mut summary,
+        );
+        assert_eq!(server.requests().len(), after_first);
+        assert_eq!(summary.render(), "ex=2 events");
+
+        file_single(
+            "ex",
+            &event_about("Rebooked"),
+            &sink,
+            Some(&store),
+            sent,
+            &mut summary,
+        );
+        assert_eq!(
+            server.requests()[after_first..],
+            [
+                "GET /calendar/evt-1%40example.com.ics",
+                "PUT /calendar/evt-1%40example.com.ics"
+            ]
+        );
+    }
+
     #[test]
     fn file_single_replaces_event_from_older_message() {
         let out_dir = tempfile::TempDir::new().unwrap();
