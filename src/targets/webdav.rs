@@ -9,7 +9,8 @@
 //! is set by the caller (e.g. `<year>/<slug>.<ext>`). The first time a
 //! PUT to a sub-collection fails with 409 we MKCOL the parent(s) and
 //! retry. PUT semantics are idempotent: an existing resource at the
-//! same name is replaced.
+//! same name is replaced. Callers that must not replace a record filed
+//! from a newer message ask [`WebdavSink::filed_from_newer`] first.
 //!
 //! Like CalDAV, the public entry point is sync and blocks on the
 //! supplied tokio runtime handle. Each request runs through the shared
@@ -18,6 +19,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Utc};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Client, Method, StatusCode};
 use tokio::runtime::Handle;
@@ -25,6 +27,7 @@ use tracing::{debug, info};
 
 use super::http_auth::{self, Auth};
 use super::http_client::{build_client_with_timeout, truncate};
+use super::json_target;
 
 /// What we did with a PUT.
 #[derive(Debug)]
@@ -110,6 +113,24 @@ impl WebdavSink {
         self.classify(&url, response).await
     }
 
+    /// Whether the JSON record at `<base_url>/<sub_path>`, if any, was
+    /// filed from a newer message than one dated `incoming`.
+    pub fn filed_from_newer(
+        &self,
+        sub_path: &str,
+        incoming: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        // Nothing to order by; spare the round trip.
+        if incoming.is_none() {
+            return Ok(false);
+        }
+        let url = self.target_url(sub_path);
+        Ok(self
+            .runtime
+            .block_on(http_auth::get_if_exists(&self.client, &self.auth, &url))?
+            .is_some_and(|existing| json_target::is_from_newer(&existing, &url, incoming)))
+    }
+
     async fn classify(&self, url: &str, response: reqwest::Response) -> Result<PutOutcome> {
         let status = response.status();
         if !status.is_success() {
@@ -193,7 +214,7 @@ impl WebdavSink {
 
     /// Compose `<base_url>/<sub_path>`, percent-encoding the sub-path
     /// while preserving `/` separators.
-    fn target_url(&self, sub_path: &str) -> String {
+    pub(super) fn target_url(&self, sub_path: &str) -> String {
         let sep = if self.base_url.ends_with('/') {
             ""
         } else {
@@ -224,6 +245,56 @@ mod tests {
             test_handle(),
         )
         .unwrap()
+    }
+
+    use crate::targets::fake_dav::FakeDav;
+
+    fn at(rfc3339: &str) -> Option<DateTime<Utc>> {
+        Some(rfc3339.parse().unwrap())
+    }
+
+    #[test]
+    fn filed_from_newer_compares_against_the_stored_record() {
+        let server = FakeDav::start();
+        let s = server.webdav_sink();
+        s.put(
+            "2026/acme-1.json",
+            "application/json",
+            br#"{"receivedAt":"2026-01-28T10:00:00Z"}"#.to_vec(),
+        )
+        .unwrap();
+
+        assert!(
+            s.filed_from_newer("2026/acme-1.json", at("2025-10-28T10:00:00Z"))
+                .unwrap()
+        );
+        assert!(
+            !s.filed_from_newer("2026/acme-1.json", at("2026-01-28T10:00:00Z"))
+                .unwrap()
+        );
+        assert!(
+            !s.filed_from_newer("2026/acme-1.json", at("2026-02-01T10:00:00Z"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn filed_from_newer_is_false_when_nothing_is_stored() {
+        let server = FakeDav::start();
+        let s = server.webdav_sink();
+        assert!(
+            !s.filed_from_newer("2026/acme-1.json", at("2025-10-28T10:00:00Z"))
+                .unwrap()
+        );
+        assert_eq!(server.requests(), vec!["GET /2026/acme-1.json"]);
+    }
+
+    #[test]
+    fn filed_from_newer_skips_the_request_for_an_undated_message() {
+        let server = FakeDav::start();
+        let s = server.webdav_sink();
+        assert!(!s.filed_from_newer("2026/acme-1.json", None).unwrap());
+        assert_eq!(server.requests(), Vec::<String>::new());
     }
 
     #[test]

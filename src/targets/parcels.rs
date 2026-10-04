@@ -16,8 +16,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::FileOutcome;
-use super::json_target::read_and_parse;
-use super::sink::{log_file_outcome, slugify, write_atomic};
+use super::json_target::{read_and_parse, received_at_of};
+use super::sink::{log_file_outcome, slugify, supersedes, write_atomic};
 
 /// Shape we read out of a `.parcel.json` artifact. Loosely schema.org
 /// `ParcelDelivery`-shaped; unknown fields pass through unchanged.
@@ -130,8 +130,9 @@ pub fn file_parcel(
 }
 
 /// Fields describing where a parcel is right now, as opposed to what
-/// it is. Only a mail newer than everything already recorded may
-/// overwrite these; the rest merge unconditionally.
+/// it is. A stale mail contributes none of these, not even ones the
+/// record lacks: an arrival estimate from before the delivery is not
+/// worth having.
 const STATE_FIELDS: [&str; 5] = [
     "deliveryStatus",
     "expectedArrivalFrom",
@@ -188,10 +189,10 @@ impl ParcelStatus {
 /// folder or an IMAP scan that walks messages by UID can all hand us
 /// an older mail after a newer one. Applying every incoming field
 /// blindly then rolls the parcel's state backwards, leaving a
-/// delivered parcel claiming to be out for delivery. So the state
-/// fields above are only taken from a mail at least as new as the
-/// newest one already merged; everything else still overlays, and the
-/// history records the mail either way.
+/// delivered parcel claiming to be out for delivery. So a mail older
+/// than the newest one already merged only fills in fields the record
+/// lacks and never replaces one; the history records the mail either
+/// way.
 fn merge(mut existing: Value, incoming: Value) -> Value {
     let Value::Object(mut existing_obj) = existing.take() else {
         // Existing isn't an object; replace wholesale.
@@ -204,15 +205,16 @@ fn merge(mut existing: Value, incoming: Value) -> Value {
     let history_entry = history_entry_from(&incoming_obj);
     let incoming_date = received_at_of(&incoming_obj);
     let newest_known = newest_received_at(&existing_obj);
-    let is_stale = match (incoming_date, newest_known) {
-        (Some(incoming), Some(newest)) => incoming < newest,
-        // Undated mail can't be ordered by date. Fall back on the one
-        // thing we know regardless: a parcel that has been delivered
-        // or returned does not go back to being in transit. Not every
-        // extractor sets `receivedAt`, and those records hit this path
-        // exclusively.
-        _ => is_final_status(&existing_obj) && !is_final_status(&incoming_obj),
-    };
+    let is_older = supersedes(newest_known, incoming_date);
+    // Undated mail can't be ordered by date. Fall back on the one
+    // thing we know regardless: a parcel that has been delivered or
+    // returned does not go back to being in transit. Not every
+    // extractor sets `receivedAt`, and those records hit this path
+    // exclusively.
+    let is_stale = is_older
+        || ((incoming_date.is_none() || newest_known.is_none())
+            && is_final_status(&existing_obj)
+            && !is_final_status(&incoming_obj));
 
     for (k, v) in incoming_obj {
         if k == "history" {
@@ -225,6 +227,9 @@ fn merge(mut existing: Value, incoming: Value) -> Value {
             continue;
         }
         if is_stale && STATE_FIELDS.contains(&k.as_str()) {
+            continue;
+        }
+        if is_older && existing_obj.contains_key(&k) {
             continue;
         }
         existing_obj.insert(k, v);
@@ -271,15 +276,6 @@ fn is_final_status(obj: &Map<String, Value>) -> bool {
         .and_then(Value::as_str)
         .map(ParcelStatus::from_raw)
         .is_some_and(|s| s.is_terminal())
-}
-
-/// The `receivedAt` of a single record or history entry, as a
-/// comparable timestamp.
-fn received_at_of(obj: &Map<String, Value>) -> Option<DateTime<Utc>> {
-    let raw = obj.get("receivedAt")?.as_str()?;
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// The newest mail date already merged into a record: the top-level
@@ -551,6 +547,27 @@ mod tests {
         let obj = obj.as_object().unwrap();
         assert_eq!(obj.get("deliveryStatus").unwrap(), "Delivered");
         assert_eq!(obj.get("description").unwrap(), "A book");
+    }
+
+    #[test]
+    fn a_stale_mail_does_not_replace_non_state_fields() {
+        let existing = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "Delivered",
+            "description": "A book, signed for by a neighbour",
+            "receivedAt": "2024-12-20T15:00:00Z"
+        });
+        let incoming = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "OnItsWay",
+            "description": "A book",
+            "receivedAt": "2024-12-19T08:00:00Z"
+        });
+        let obj = merge(existing, incoming);
+        assert_eq!(
+            obj.as_object().unwrap().get("description").unwrap(),
+            "A book, signed for by a neighbour"
+        );
     }
 
     #[test]

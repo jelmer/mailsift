@@ -18,12 +18,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-#[cfg(feature = "gssapi")]
-use anyhow::anyhow;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::header::{HeaderMap, RETRY_AFTER, WWW_AUTHENTICATE};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use tracing::{debug, warn};
+
+use super::http_client::truncate;
 
 /// Maximum number of send attempts against a single request. One attempt
 /// plus this many additional retries on transient failure.
@@ -202,6 +202,30 @@ pub fn apply_auth(
             Ok(req.header(reqwest::header::AUTHORIZATION, format!("Negotiate {token}")))
         }
     }
+}
+
+/// GET `url` through [`send_with_auth_retry`], or `None` if nothing is
+/// there yet.
+pub async fn get_if_exists(client: &Client, auth: &Auth, url: &str) -> Result<Option<Vec<u8>>> {
+    let response = send_with_auth_retry(client, auth, |client| client.get(url))
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = response.status();
+    if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "GET {url} returned {status}: {}",
+            truncate(&body, 200)
+        ));
+    }
+    let body = response
+        .bytes()
+        .await
+        .with_context(|| format!("reading body of {url}"))?;
+    Ok(Some(body.to_vec()))
 }
 
 /// Set once we've reported that the preferred scheme can't be applied

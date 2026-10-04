@@ -1,7 +1,11 @@
 //! Building blocks shared by every artifact sink.
 //!
 //! - [`FileOutcome`]: what a sink did with one artifact (created or
-//!   updated something at the returned location label).
+//!   updated something at the returned location label, or kept what
+//!   was already there).
+//! - [`supersedes`]: the ordering rule every sink applies before
+//!   replacing a record, so that the newest message wins regardless of
+//!   the order messages are processed in.
 //! - [`write_atomic`]: temp file + fsync + rename, so a partial write
 //!   can't leave a truncated file in place.
 //! - [`slugify`]: filesystem-safe ASCII slugger. `uppercase` is `true`
@@ -17,6 +21,7 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use tracing::info;
 
 /// What a sink did with one artifact.
@@ -32,6 +37,37 @@ pub enum FileOutcome {
     Created(String),
     /// Existing record at this location was overwritten / re-sent.
     Updated(String),
+    /// The record at this location was filed from a newer message and
+    /// was left alone.
+    Kept(String),
+}
+
+/// Whether a record filed from a message dated `existing` must be kept
+/// over one from a message dated `incoming`.
+///
+/// A mailbox is not processed in date order: a rescan, a re-filed
+/// folder or an IMAP scan can all hand us an older mail after a newer
+/// one. Only a strictly newer record is kept, so reprocessing the same
+/// message still refreshes it. Without both dates there is nothing to
+/// order by and the incoming message is filed.
+pub fn supersedes(existing: Option<DateTime<Utc>>, incoming: Option<DateTime<Utc>>) -> bool {
+    matches!((existing, incoming), (Some(existing), Some(incoming)) if existing > incoming)
+}
+
+/// Emit the `"<kind> kept"` log line and return the matching
+/// [`FileOutcome`] for a record at `label` that was left alone.
+pub fn log_kept(label: String, kind: &str) -> FileOutcome {
+    info!(target = %label, "{kind} kept; already filed from a newer message");
+    FileOutcome::Kept(label)
+}
+
+/// Read `path`, or `None` if nothing is there yet.
+pub fn read_if_exists(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(body) => Ok(Some(body)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 /// Emit the `"<kind> created"` or `"<kind> updated"` log line and
@@ -126,6 +162,36 @@ pub fn sanitize_uid(uid: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(rfc3339: &str) -> Option<DateTime<Utc>> {
+        Some(rfc3339.parse().unwrap())
+    }
+
+    #[test]
+    fn supersedes_only_when_existing_is_strictly_newer() {
+        let older = at("2025-10-28T10:00:00Z");
+        let newer = at("2026-01-28T10:00:00Z");
+        assert!(supersedes(newer, older));
+        assert!(!supersedes(older, newer));
+        assert!(!supersedes(newer, newer));
+    }
+
+    #[test]
+    fn supersedes_needs_both_dates() {
+        let dated = at("2026-01-28T10:00:00Z");
+        assert!(!supersedes(dated, None));
+        assert!(!supersedes(None, dated));
+        assert!(!supersedes(None, None));
+    }
+
+    #[test]
+    fn read_if_exists_distinguishes_missing_from_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("record.json");
+        assert_eq!(read_if_exists(&path).unwrap(), None);
+        fs::write(&path, b"{}").unwrap();
+        assert_eq!(read_if_exists(&path).unwrap(), Some(b"{}".to_vec()));
+    }
 
     #[test]
     fn slug_lowercase_collapses_runs() {

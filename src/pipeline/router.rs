@@ -17,8 +17,8 @@ use crate::artifacts::{Artifact, Kind};
 use crate::reservation;
 use crate::seen::{self, Store as SeenStore};
 use crate::targets::{
-    EventSink, EventSinkKind, FileOutcome, SingleEvent, bills, parcels, receipts, reservations,
-    split_calendar, subscriptions, tickets,
+    EventSink, EventSinkKind, FileOutcome, SingleEvent, bills, json_target, parcels, receipts,
+    reservations, split_calendar, subscriptions, tickets,
 };
 
 pub(super) const KIND_EVENT: usize = 0;
@@ -171,8 +171,10 @@ pub(super) fn file_reservation_json(
         // One bump per record written, matching the event side, where
         // a multi-leg itinerary counts as several events.
         Ok(outcomes) => {
-            for _ in outcomes {
-                summary.bump(extractor, KIND_RESERVATION);
+            for outcome in outcomes {
+                if !matches!(outcome, FileOutcome::Kept(_)) {
+                    summary.bump(extractor, KIND_RESERVATION);
+                }
             }
         }
         Err(e) => {
@@ -234,6 +236,7 @@ pub(super) fn file_bill_artifact(
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_BILL);
         }
+        Ok(FileOutcome::Kept(_)) => {}
         Err(e) => {
             warn!(
                 extractor,
@@ -255,14 +258,18 @@ pub(super) fn file_bill_blob_artifact(
     artifact: &Artifact,
     all_artifacts: &[Artifact],
     bills_dir: &Path,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
     if summary.dry_run {
         summary.bump(extractor, KIND_BILL);
         return;
     }
-    let Some(pair) = sibling_json_body(all_artifacts, Kind::Bill, &artifact.slug)
-        .and_then(|body| bills::paired_name_from_json(&body))
+    let Some((pair, received_at)) = sibling_json_body(all_artifacts, Kind::Bill, &artifact.slug)
+        .and_then(|body| {
+            let pair = bills::paired_name_from_json(&body)?;
+            Some((pair, sibling_received_at(&body, received_at_epoch)))
+        })
     else {
         warn!(
             extractor,
@@ -277,10 +284,12 @@ pub(super) fn file_bill_blob_artifact(
         &artifact.ext,
         (pair.0.as_str(), pair.1.as_str(), pair.2),
         bills_dir,
+        received_at,
     ) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_BILL);
         }
+        Ok(FileOutcome::Kept(_)) => {}
         Err(e) => {
             warn!(
                 extractor,
@@ -308,6 +317,7 @@ pub(super) fn file_parcel_artifact(
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_PARCEL);
         }
+        Ok(FileOutcome::Kept(_)) => {}
         Err(e) => {
             warn!(
                 extractor,
@@ -354,6 +364,7 @@ fn file_single(
                 store.mark(seen::Kind::Event, &event.uid, h);
             }
         }
+        Ok(FileOutcome::Kept(_)) => {}
         Err(e) => {
             warn!(
                 extractor,
@@ -384,6 +395,7 @@ pub(super) fn file_receipt_artifact(
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_RECEIPT);
         }
+        Ok(FileOutcome::Kept(_)) => {}
         Err(e) => {
             warn!(
                 extractor,
@@ -431,14 +443,18 @@ pub(super) fn file_receipt_blob_artifact(
     artifact: &Artifact,
     all_artifacts: &[Artifact],
     sink: &receipts::ReceiptSink,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
     if summary.dry_run {
         summary.bump(extractor, KIND_RECEIPT);
         return;
     }
-    let Some(pair) = sibling_json_body(all_artifacts, Kind::Receipt, &artifact.slug)
-        .and_then(|body| receipts::paired_name_from_json(&body))
+    let Some((pair, received_at)) = sibling_json_body(all_artifacts, Kind::Receipt, &artifact.slug)
+        .and_then(|body| {
+            let pair = receipts::paired_name_from_json(&body)?;
+            Some((pair, sibling_received_at(&body, received_at_epoch)))
+        })
     else {
         warn!(
             extractor,
@@ -452,10 +468,12 @@ pub(super) fn file_receipt_blob_artifact(
         &artifact.path,
         &artifact.ext,
         (pair.0.as_str(), pair.1.as_str(), pair.2),
+        received_at,
     ) {
         Ok(Some(FileOutcome::Created(_) | FileOutcome::Updated(_))) => {
             summary.bump(extractor, KIND_RECEIPT);
         }
+        Ok(Some(FileOutcome::Kept(_))) => {}
         Ok(None) => {
             // Forward-sink no-op: nothing to record.
         }
@@ -480,6 +498,21 @@ fn sibling_json_body(all_artifacts: &[Artifact], kind: Kind, slug: &str) -> Opti
     fs::read_to_string(&sibling.path).ok()
 }
 
+/// The date a sibling JSON record is filed under: its own `receivedAt`
+/// when the extractor set one, the message date otherwise. Mirrors the
+/// stamping the JSON sinks do, so a companion blob is ordered exactly
+/// like the record it belongs to.
+fn sibling_received_at(
+    body: &str,
+    received_at_epoch: Option<i64>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    // `body` already parsed as a bill or receipt, so this can't fail.
+    json_target::received_at_in(
+        json_target::body_with_received_at(body, received_at_epoch).as_bytes(),
+    )
+    .expect("sibling JSON parsed a moment ago")
+}
+
 pub(super) fn file_subscription_artifact(
     extractor: &str,
     artifact: &Artifact,
@@ -495,6 +528,7 @@ pub(super) fn file_subscription_artifact(
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_SUBSCRIPTION);
         }
+        Ok(FileOutcome::Kept(_)) => {}
         Err(e) => {
             warn!(
                 extractor,
@@ -530,6 +564,7 @@ pub(super) fn file_ticket_artifact(
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_TICKET);
         }
+        Ok(FileOutcome::Kept(_)) => {}
         Err(e) => {
             warn!(
                 extractor,

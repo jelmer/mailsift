@@ -5,7 +5,9 @@
 //! don't carry a per-cycle invoice number; a subscription is a
 //! recurring relationship, and re-running mailsift over a fresh
 //! confirmation should refresh the existing record (renewal date,
-//! current price) rather than file a sibling.
+//! current price) rather than file a sibling. The record always
+//! reflects the newest message seen for it, whatever order messages
+//! are processed in.
 //!
 //! The artifact JSON is schema.org-ish, but loose: extractors that
 //! recognise an `Offer` with a `subscriptionDuration` field can emit
@@ -20,8 +22,8 @@ use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 
 use super::FileOutcome;
-use super::json_target::{first_non_empty, read_and_parse};
-use super::sink::{log_file_outcome, slugify, write_atomic};
+use super::json_target::{first_non_empty, read_and_parse, write_unless_newer};
+use super::sink::slugify;
 
 /// Shape we read out of a `.subscription.json` artifact. Loosely
 /// schema.org-shaped (most fields mirror `Offer` / `Subscription`).
@@ -62,11 +64,8 @@ pub fn file_subscription(
     }
 
     let target = dir.join(format!("{slug}.json"));
-    let existed = target.exists();
     let body_out = super::json_target::body_with_received_at(&body, received_at_epoch);
-    write_atomic(&target, body_out.as_bytes())?;
-
-    Ok(log_file_outcome(&target, existed, "subscription"))
+    write_unless_newer(&target, &body_out, "subscription")
 }
 
 #[cfg(test)]
@@ -107,5 +106,25 @@ mod tests {
         assert!(matches!(outcome, FileOutcome::Created(_)));
         let body = fs::read_to_string(dir.join("netflix.json")).unwrap();
         assert!(body.contains("Netflix"));
+    }
+
+    #[test]
+    fn older_receipt_does_not_roll_back_subscription() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("subs");
+        let src = tmp.path().join("incoming.subscription.json");
+
+        // 2026-01-28 renewal, processed first.
+        fs::write(&src, r#"{"name":"Hinge","orderDate":"2026-01-28"}"#).unwrap();
+        file_subscription(&src, &dir, Some(1769594400)).unwrap();
+        // 2025-10-28 renewal, processed afterwards by a rescan.
+        fs::write(&src, r#"{"name":"Hinge","orderDate":"2025-10-28"}"#).unwrap();
+        let outcome = file_subscription(&src, &dir, Some(1761645600)).unwrap();
+
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("hinge.json")).unwrap()).unwrap();
+        assert_eq!(v["orderDate"], "2026-01-28");
+        assert_eq!(v["receivedAt"], "2026-01-28T10:00:00Z");
     }
 }

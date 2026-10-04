@@ -180,7 +180,8 @@ companion attachments (typically the vendor's PDF). Pair by using the
 same slug for the JSON and the blob (`digitalocean-2026-08.receipt.json`
 next to `digitalocean-2026-08.receipt.pdf`); the pipeline files the
 blob under the same `<merchant>-<order>` (or `<payee>-<invoice>`) name
-as the JSON, so a re-run overwrites in place. A blob with no
+as the JSON, so a re-run overwrites in place and the blob is kept or
+replaced along with its JSON. A blob with no
 same-slug JSON sibling is dropped with a warning: always emit the
 structured record too.
 
@@ -217,6 +218,13 @@ artifacts - the `UID` in an `.ics`, `trackingNumber` in a parcel,
 derives the dedup key from there. The same message replayed twice, or a
 follow-up status email for the same parcel, collapses onto the same
 record.
+
+When two messages collapse onto one record, the one sent last wins,
+whatever order they are processed in: a rescan of older mail doesn't
+roll a record back. mailsift takes the date from the message's `Date:`
+header, falling back to its newest `Received:` header, and stamps it on
+the JSON records it files as `receivedAt`. Set `receivedAt` yourself
+only if the message date is the wrong one to order by.
 
 ### Optional `_manifest.json`
 

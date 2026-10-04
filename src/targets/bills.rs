@@ -22,12 +22,15 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use super::FileOutcome;
 use super::firefly::{self, BillForFirefly, FireflySink};
-use super::json_target::{derive_year, first_non_empty, read_and_parse};
-use super::sink::{log_file_outcome, sanitize_ext, slugify, write_atomic};
+use super::json_target::{
+    derive_year, filed_from_newer, first_non_empty, read_and_parse, write_unless_newer,
+};
+use super::sink::{log_file_outcome, log_kept, sanitize_ext, slugify, write_atomic};
 
 /// Shape we read out of a `.bill.json` artifact. Loosely schema.org
 /// `Invoice`-shaped; unknown fields are ignored so extractors can emit
@@ -109,9 +112,11 @@ pub fn file_bill(
         .join(format!("{year:04}"))
         .join(format!("{payee_slug}-{invoice_slug}.json"));
 
-    let existed = target.exists();
     let body_out = super::json_target::body_with_received_at(&body, received_at_epoch);
-    write_atomic(&target, body_out.as_bytes())?;
+    let outcome = write_unless_newer(&target, &body_out, "bill")?;
+    if matches!(outcome, FileOutcome::Kept(_)) {
+        return Ok(outcome);
+    }
 
     // Best-effort Firefly registration. We try on every filing (not
     // just on creation) because the Firefly side does its own
@@ -119,7 +124,7 @@ pub fn file_bill(
     // the bill's amount and due-date on the Firefly server too.
     register_with_firefly(firefly, payee, &bill);
 
-    Ok(log_file_outcome(&target, existed, "bill"))
+    Ok(outcome)
 }
 
 /// Translate a parsed [`Bill`] to a [`BillForFirefly`] and fire the
@@ -163,19 +168,26 @@ fn register_with_firefly(sink: Option<&FireflySink>, payee: &str, bill: &Bill) {
 /// from a same-slug `.bill.json` sibling in the same extractor run;
 /// the blob is filed under `<year>/<payee>-<invoice>.<ext>` so it sits
 /// beside the JSON.
+///
+/// `received_at` is the date that sibling was filed under. A blob has
+/// no date of its own, so it follows the JSON: when the record on file
+/// came from a newer message, the blob on file did too and is kept.
 pub fn file_bill_blob(
     src: &Path,
     ext: &str,
     pair: (&str, &str, i32),
     dir: &Path,
+    received_at: Option<DateTime<Utc>>,
 ) -> Result<FileOutcome> {
     let ext = sanitize_ext(ext)?;
     let (payee, invoice, year) = pair;
     let name_stem = format!("{payee}-{invoice}");
 
-    let target = dir
-        .join(format!("{year:04}"))
-        .join(format!("{name_stem}.{ext}"));
+    let year_dir = dir.join(format!("{year:04}"));
+    let target = year_dir.join(format!("{name_stem}.{ext}"));
+    if filed_from_newer(&year_dir.join(format!("{name_stem}.json")), received_at)? {
+        return Ok(log_kept(target.display().to_string(), "bill blob"));
+    }
 
     let body = fs::read(src).with_context(|| format!("reading bill blob {}", src.display()))?;
     let existed = target.exists();
@@ -246,14 +258,86 @@ mod tests {
         std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
         let dir = tmp.path().join("out");
 
-        let outcome = file_bill_blob(&src, "pdf", ("acme-corp", "inv-42", 2024), &dir).unwrap();
+        let outcome =
+            file_bill_blob(&src, "pdf", ("acme-corp", "inv-42", 2024), &dir, None).unwrap();
         let path = match outcome {
             FileOutcome::Created(p) => p,
-            FileOutcome::Updated(_) => panic!("expected Created"),
+            other => panic!("expected Created, got {other:?}"),
         };
         assert_eq!(
             std::path::PathBuf::from(&path),
             dir.join("2024/acme-corp-inv-42.pdf")
+        );
+    }
+
+    // 2024-11-01T00:00:00Z and a reminder sent two weeks later.
+    const INVOICE_SENT: i64 = 1730419200;
+    const REMINDER_SENT: i64 = 1731628800;
+
+    fn write_bill(path: &Path, total: f64) {
+        let body = serde_json::json!({
+            "payee": "Acme", "invoiceNumber": "INV1", "dueDate": "2024-12-05", "total": total,
+        });
+        fs::write(path, body.to_string()).unwrap();
+    }
+
+    #[test]
+    fn older_mail_does_not_replace_bill_or_its_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("bill.json");
+        let blob = tmp.path().join("bill.pdf");
+        let dir = tmp.path().join("out");
+        let pair = ("acme", "inv1", 2024);
+        let at = |epoch| DateTime::from_timestamp(epoch, 0);
+
+        write_bill(&src, 120.0);
+        fs::write(&blob, b"reminder").unwrap();
+        file_bill(&src, &dir, None, Some(REMINDER_SENT)).unwrap();
+        file_bill_blob(&blob, "pdf", pair, &dir, at(REMINDER_SENT)).unwrap();
+
+        write_bill(&src, 100.0);
+        fs::write(&blob, b"invoice").unwrap();
+        let outcome = file_bill(&src, &dir, None, Some(INVOICE_SENT)).unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        let outcome = file_bill_blob(&blob, "pdf", pair, &dir, at(INVOICE_SENT)).unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+
+        let v: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("2024/acme-inv1.json")).unwrap()).unwrap();
+        assert_eq!(v["total"], 120.0);
+        assert_eq!(
+            fs::read(dir.join("2024/acme-inv1.pdf")).unwrap(),
+            b"reminder"
+        );
+    }
+
+    #[test]
+    fn newer_mail_replaces_bill_and_its_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("bill.json");
+        let blob = tmp.path().join("bill.pdf");
+        let dir = tmp.path().join("out");
+        let pair = ("acme", "inv1", 2024);
+        let at = |epoch| DateTime::from_timestamp(epoch, 0);
+
+        write_bill(&src, 100.0);
+        fs::write(&blob, b"invoice").unwrap();
+        file_bill(&src, &dir, None, Some(INVOICE_SENT)).unwrap();
+        file_bill_blob(&blob, "pdf", pair, &dir, at(INVOICE_SENT)).unwrap();
+
+        write_bill(&src, 120.0);
+        fs::write(&blob, b"reminder").unwrap();
+        let outcome = file_bill(&src, &dir, None, Some(REMINDER_SENT)).unwrap();
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+        let outcome = file_bill_blob(&blob, "pdf", pair, &dir, at(REMINDER_SENT)).unwrap();
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+
+        let v: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("2024/acme-inv1.json")).unwrap()).unwrap();
+        assert_eq!(v["total"], 120.0);
+        assert_eq!(
+            fs::read(dir.join("2024/acme-inv1.pdf")).unwrap(),
+            b"reminder"
         );
     }
 }
