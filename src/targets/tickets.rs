@@ -14,7 +14,8 @@
 //! - [`TicketSink::Webdav`]: PUTs to `<base_url>/<year>/<slug>.<ext>`.
 //!
 //! Same `<slug>` + `<ext>` overwrites in place either way, matching
-//! the PUT-by-name idempotency used elsewhere.
+//! the PUT-by-name idempotency used elsewhere, unless the ticket on
+//! file came from a newer message (per its sidecar's `receivedAt`).
 //!
 //! Unlike the other kinds, a ticket can't be renamed from its own
 //! contents, so the extractor's slug is the filed name. Extractors are
@@ -43,11 +44,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use chrono::DateTime;
 use serde::Serialize;
 
 use super::FileOutcome;
-use super::sink::{log_file_outcome, sanitize_ext, slugify, write_atomic};
-use super::webdav::{PutOutcome, WebdavSink};
+use super::json_target;
+use super::sink::{lock_dir, log_file_outcome, log_kept, sanitize_ext, slugify, write_atomic};
+use super::webdav::WebdavSink;
 
 /// Identifying fields copied from the sibling reservation artifact, if
 /// there was one. All optional: a ticket can arrive with no
@@ -109,7 +112,7 @@ fn sidecar_body(
         file: format!("{slug}.{ext}"),
         content_type: content_type_for(ext),
         meta,
-        received_at: received_at_epoch.and_then(super::json_target::format_received_at),
+        received_at: received_at_epoch.and_then(json_target::format_received_at),
     };
     serde_json::to_string_pretty(&sidecar).context("serialising ticket sidecar")
 }
@@ -147,30 +150,48 @@ impl TicketSink {
             fs::read(src).with_context(|| format!("reading ticket source {}", src.display()))?;
         let sidecar_filename = sidecar_name(&slug);
         let blob_filename = format!("{slug}.{ext}");
+        // The blob can't say which message it came from; its sidecar
+        // can, so the pair is ordered by the sidecar's date.
+        let received_at = received_at_epoch.and_then(|epoch| DateTime::from_timestamp(epoch, 0));
 
         match self {
             TicketSink::LocalDir(dir) => {
                 let year_dir = dir.join(format!("{year:04}"));
                 let target = year_dir.join(&blob_filename);
+                let sidecar_target = year_dir.join(&sidecar_filename);
+                // One lock over both files, so they can't end up from
+                // different messages.
+                let _lock = lock_dir(&year_dir)?;
+                if json_target::filed_from_newer(&sidecar_target, received_at)? {
+                    return Ok(log_kept(target.display().to_string(), "ticket"));
+                }
                 let existed = target.exists();
                 write_atomic(&target, &body)?;
-                write_atomic(&year_dir.join(&sidecar_filename), sidecar.as_bytes())?;
+                write_atomic(&sidecar_target, sidecar.as_bytes())?;
                 Ok(log_file_outcome(&target, existed, "ticket"))
             }
             TicketSink::Webdav(sink) => {
-                let outcome = sink.put(
-                    &format!("{year:04}/{blob_filename}"),
-                    content_type_for(&ext),
-                    body,
-                )?;
-                sink.put(
-                    &format!("{year:04}/{sidecar_filename}"),
+                let blob_path = format!("{year:04}/{blob_filename}");
+                let sidecar_path = format!("{year:04}/{sidecar_filename}");
+                // There is no lock to hold over two resources here.
+                // The sidecar goes first, since it carries the date;
+                // the blob then only lands while the sidecar is still
+                // not from a newer message.
+                let sidecar_outcome = sink.update(
+                    &sidecar_path,
                     "application/json",
-                    sidecar.into_bytes(),
+                    "ticket sidecar",
+                    &json_target::replace_unless_newer(
+                        &sidecar_path,
+                        sidecar.as_bytes(),
+                        received_at,
+                    ),
                 )?;
-                Ok(match outcome {
-                    PutOutcome::Created(url) => FileOutcome::Created(url),
-                    PutOutcome::Updated(url) => FileOutcome::Updated(url),
+                if matches!(sidecar_outcome, FileOutcome::Kept(_)) {
+                    return Ok(FileOutcome::Kept(sink.target_url(&blob_path)));
+                }
+                sink.update(&blob_path, content_type_for(&ext), "ticket", &|_| {
+                    Ok((!sink.filed_from_newer(&sidecar_path, received_at)?).then(|| body.clone()))
                 })
             }
         }
@@ -200,7 +221,7 @@ mod tests {
             .unwrap();
         let path = match outcome {
             FileOutcome::Created(p) => p,
-            FileOutcome::Updated(_) => panic!("expected Created on first write"),
+            other => panic!("expected Created on first write, got {other:?}"),
         };
         let expected = tmp.path().join("2024/easyjet-ezy2521.pdf");
         assert_eq!(PathBuf::from(&path), expected);
@@ -226,6 +247,173 @@ mod tests {
 
         let target = tmp.path().join("2024/flight.pdf");
         assert_eq!(std::fs::read(&target).unwrap(), b"v2");
+    }
+
+    #[test]
+    fn older_mail_does_not_replace_ticket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("boarding-pass.pdf");
+        let sink = TicketSink::LocalDir(tmp.path().to_path_buf());
+        let meta = TicketMeta::default();
+        // 2026-08-27T09:30:00Z, and the pass as first issued a day earlier.
+        let reissued = Some(1787823000);
+        let issued = Some(1787736600);
+
+        std::fs::write(&src, b"reissued").unwrap();
+        sink.file_ticket(&src, "flight", "pdf", 2026, &meta, reissued)
+            .unwrap();
+        std::fs::write(&src, b"issued").unwrap();
+        let outcome = sink
+            .file_ticket(&src, "flight", "pdf", 2026, &meta, issued)
+            .unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+
+        assert_eq!(
+            std::fs::read(tmp.path().join("2026/flight.pdf")).unwrap(),
+            b"reissued"
+        );
+        let sidecar = std::fs::read(tmp.path().join("2026/flight.meta.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&sidecar).unwrap();
+        assert_eq!(v["receivedAt"], "2026-08-27T09:30:00Z");
+    }
+
+    #[test]
+    fn webdav_older_mail_does_not_replace_ticket() {
+        let server = crate::targets::fake_dav::FakeDav::start();
+        let sink = TicketSink::Webdav(server.webdav_sink());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("boarding-pass.pdf");
+        let meta = TicketMeta::default();
+
+        std::fs::write(&src, b"reissued").unwrap();
+        sink.file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787823000))
+            .unwrap();
+        std::fs::write(&src, b"issued").unwrap();
+        let outcome = sink
+            .file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787736600))
+            .unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        assert_eq!(server.resource("/2026/flight.pdf").unwrap(), b"reissued");
+    }
+
+    fn webdav_ticket_sink(server: &crate::targets::fake_dav::FakeDav) -> TicketSink {
+        TicketSink::Webdav(server.webdav_sink())
+    }
+
+    #[test]
+    fn webdav_newer_mail_replaces_ticket_and_sidecar() {
+        let server = crate::targets::fake_dav::FakeDav::start();
+        let sink = webdav_ticket_sink(&server);
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("boarding-pass.pdf");
+        let meta = TicketMeta::default();
+
+        std::fs::write(&src, b"issued").unwrap();
+        let first = sink
+            .file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787736600))
+            .unwrap();
+        assert!(matches!(first, FileOutcome::Created(_)));
+        std::fs::write(&src, b"reissued").unwrap();
+        let second = sink
+            .file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787823000))
+            .unwrap();
+        assert!(matches!(second, FileOutcome::Updated(_)));
+
+        assert_eq!(server.resource("/2026/flight.pdf").unwrap(), b"reissued");
+        let sidecar = server.resource("/2026/flight.meta.json").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&sidecar).unwrap();
+        assert_eq!(v["receivedAt"], "2026-08-27T09:30:00Z");
+    }
+
+    /// There is no lock to hold across the sidecar and the blob on
+    /// WebDAV. If a newer ticket's sidecar lands right after ours, our
+    /// blob must not go on to replace that ticket's.
+    #[test]
+    fn webdav_blob_is_not_written_once_a_newer_sidecar_has_landed() {
+        let server = crate::targets::fake_dav::FakeDav::start();
+        let sink = webdav_ticket_sink(&server);
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("boarding-pass.pdf");
+        let reissued_sidecar = br#"{"slug":"flight","receivedAt":"2026-08-27T09:30:00Z"}"#;
+        server.overtake_after_next_put("/2026/flight.meta.json", reissued_sidecar);
+
+        std::fs::write(&src, b"issued").unwrap();
+        let outcome = sink
+            .file_ticket(
+                &src,
+                "flight",
+                "pdf",
+                2026,
+                &TicketMeta::default(),
+                Some(1787736600),
+            )
+            .unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        assert_eq!(server.resource("/2026/flight.pdf"), None);
+        assert_eq!(
+            server.resource("/2026/flight.meta.json").unwrap(),
+            reissued_sidecar
+        );
+    }
+
+    /// Scans file tickets from several threads at once. Whichever
+    /// order they land in, the blob and the sidecar left on file must
+    /// both be the newest ticket's.
+    #[test]
+    fn concurrent_filing_leaves_the_newest_ticket_and_its_sidecar() {
+        for _ in 0..100 {
+            let tmp = tempfile::tempdir().unwrap();
+            let out = tmp.path().join("out");
+            let sink = TicketSink::LocalDir(out.clone());
+            std::thread::scope(|scope| {
+                for n in 0..8i64 {
+                    let sink = &sink;
+                    let src = tmp.path().join(format!("{n}.pdf"));
+                    scope.spawn(move || {
+                        std::fs::write(&src, format!("pass {n}")).unwrap();
+                        let meta = TicketMeta {
+                            reservation_number: Some(format!("R{n}")),
+                            ..TicketMeta::default()
+                        };
+                        sink.file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787736600 + n))
+                            .unwrap();
+                    });
+                }
+            });
+            assert_eq!(
+                std::fs::read(out.join("2026/flight.pdf")).unwrap(),
+                b"pass 7"
+            );
+            let sidecar = std::fs::read(out.join("2026/flight.meta.json")).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&sidecar).unwrap();
+            assert_eq!(v["reservationNumber"], "R7");
+        }
+    }
+
+    #[test]
+    fn newer_mail_replaces_ticket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("boarding-pass.pdf");
+        let sink = TicketSink::LocalDir(tmp.path().to_path_buf());
+        let meta = TicketMeta::default();
+
+        std::fs::write(&src, b"issued").unwrap();
+        sink.file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787736600))
+            .unwrap();
+        std::fs::write(&src, b"reissued").unwrap();
+        let outcome = sink
+            .file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787823000))
+            .unwrap();
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+
+        assert_eq!(
+            std::fs::read(tmp.path().join("2026/flight.pdf")).unwrap(),
+            b"reissued"
+        );
+        let sidecar = std::fs::read(tmp.path().join("2026/flight.meta.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&sidecar).unwrap();
+        assert_eq!(v["receivedAt"], "2026-08-27T09:30:00Z");
     }
 
     #[test]

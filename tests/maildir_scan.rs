@@ -1,8 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-use assert_cmd::Command;
-
 mod common;
 
 fn manifest_dir() -> PathBuf {
@@ -26,8 +24,7 @@ fn maildir_scan_processes_flat_maildir() {
     fs::write(td.path().join("cur/1234.msg"), &eml).unwrap();
     let out = tempfile::tempdir().unwrap();
 
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("maildir-scan")
         .arg(td.path())
         .arg("--extractors")
@@ -39,7 +36,7 @@ fn maildir_scan_processes_flat_maildir() {
 
     let path = out.path().join("fixture-ics-1@example.ics");
     assert!(path.exists(), "expected {} to exist", path.display());
-    let actual = common::read_event_stable(&path);
+    let actual = fs::read_to_string(&path).unwrap();
     assert!(actual.contains("UID:fixture-ics-1@example.com"), "{actual}");
 }
 
@@ -57,8 +54,7 @@ fn maildir_scan_recurse_processes_subfolders() {
     let out = tempfile::tempdir().unwrap();
 
     // Without --recurse: the .archive message is not seen, nothing is filed.
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("maildir-scan")
         .arg(td.path())
         .arg("--extractors")
@@ -73,8 +69,7 @@ fn maildir_scan_recurse_processes_subfolders() {
     );
 
     // With --recurse: it is picked up.
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("maildir-scan")
         .arg(td.path())
         .arg("--recurse")
@@ -96,8 +91,7 @@ fn maildir_scan_rejects_non_maildir() {
     let empty_extractors = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
 
-    let output = Command::cargo_bin("mailsift")
-        .expect("binary built")
+    let output = common::mailsift()
         .arg("maildir-scan")
         .arg(td.path())
         .arg("--extractors")
@@ -139,8 +133,7 @@ fn maildir_scan_extractor_flag_selects_one_extractor() {
 
     // Selecting only the flight extractor leaves the ICS message's
     // artifact unfiled, even though its own extractor would match it.
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("maildir-scan")
         .arg(td.path())
         .arg("--extractor")
@@ -179,8 +172,7 @@ fn maildir_scan_rejects_unknown_extractor_name() {
     make_maildir(td.path());
     let out = tempfile::tempdir().unwrap();
 
-    let output = Command::cargo_bin("mailsift")
-        .expect("binary built")
+    let output = common::mailsift()
         .arg("maildir-scan")
         .arg(td.path())
         .arg("--extractor")
@@ -225,8 +217,7 @@ fn maildir_scan_prefilter_skips_messages_from_other_senders() {
     let reservations = tempfile::tempdir().unwrap();
     let tickets = tempfile::tempdir().unwrap();
 
-    let output = Command::cargo_bin("mailsift")
-        .expect("binary built")
+    let output = common::mailsift()
         // The default subscriber styles fields with ANSI escapes,
         // which would sit between the field name and its value.
         .env("NO_COLOR", "1")
@@ -257,4 +248,53 @@ fn maildir_scan_prefilter_skips_messages_from_other_senders() {
         log.contains("processing messages count=1"),
         "expected only the matching message to be processed: {log}"
     );
+}
+
+/// Scan the fixture message into a CalDAV server nobody is listening
+/// on, with `extra` flags, and report whether the scan opened the
+/// dedup store. Filing fails, which a scan only warns about; the
+/// store is opened before that.
+fn scan_to_caldav_opens_seen_store(extra: &[&str]) -> bool {
+    let manifest = manifest_dir();
+    let eml = fs::read(manifest.join("tests/fixtures/eml/ics-attachment.eml")).unwrap();
+    let td = tempfile::tempdir().unwrap();
+    make_maildir(td.path());
+    fs::write(td.path().join("cur/1234.msg"), &eml).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let password = state.path().join("caldav.pass");
+    fs::write(&password, "secret").unwrap();
+
+    common::mailsift()
+        .env("XDG_STATE_HOME", state.path())
+        .arg("maildir-scan")
+        .arg(td.path())
+        .arg("--extractors")
+        .arg(manifest.join("tests/fixtures/extractors"))
+        .arg("--caldav-url")
+        .arg("http://u@127.0.0.1:1/")
+        .arg("--caldav-password-file")
+        .arg(&password)
+        .arg("--no-stats")
+        .args(extra)
+        .assert()
+        .success();
+
+    state.path().join("mailsift/seen.db").exists()
+}
+
+/// A rescan shouldn't send CalDAV every event it already has, so a
+/// scan consults the dedup store just as the milter does.
+#[test]
+fn maildir_scan_to_caldav_uses_the_dedup_store() {
+    assert!(scan_to_caldav_opens_seen_store(&[]));
+}
+
+#[test]
+fn maildir_scan_no_dedup_leaves_the_dedup_store_alone() {
+    assert!(!scan_to_caldav_opens_seen_store(&["--no-dedup"]));
+}
+
+#[test]
+fn maildir_scan_dry_run_leaves_the_dedup_store_alone() {
+    assert!(!scan_to_caldav_opens_seen_store(&["--dry-run"]));
 }

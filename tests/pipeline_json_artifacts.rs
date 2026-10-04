@@ -14,9 +14,9 @@
 // `<slug>.ticket.json` attachment would otherwise land on the
 // sidecar's own path.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use assert_cmd::Command;
+mod common;
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -34,8 +34,7 @@ fn replay_flight() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     let tickets = out.path().join("tickets");
     let events = out.path().join("events");
 
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("replay")
         .arg(&eml)
         .arg("--extractors")
@@ -112,8 +111,7 @@ fn reservations_dir_is_optional() {
 
     // Without --reservations-dir the run still succeeds and the
     // calendar conversion happens as before.
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("replay")
         .arg(&eml)
         .arg("--extractors")
@@ -128,4 +126,101 @@ fn reservations_dir_is_optional() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(entries.len(), 1, "expected one event, got {entries:?}");
+}
+
+/// Replay `eml` with the reservations, tickets and events dirs all
+/// under `out`.
+fn replay_into(eml: &Path, out: &Path) {
+    common::mailsift()
+        .arg("replay")
+        .arg(eml)
+        .arg("--extractors")
+        .arg(manifest_dir().join("tests/fixtures/extractors"))
+        .arg("--events-dir")
+        .arg(out.join("events"))
+        .arg("--reservations-dir")
+        .arg(out.join("reservations"))
+        .arg("--tickets-dir")
+        .arg(out.join("tickets"))
+        .assert()
+        .success();
+}
+
+/// What each record filed for the fixture flight says about the
+/// message it came from: the reservation's and the ticket sidecar's
+/// `receivedAt`, and the event's `DTSTAMP`.
+fn filed_dates(out: &Path) -> (String, String, String) {
+    let json = |path: PathBuf| -> serde_json::Value {
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        serde_json::from_str(&body).expect("valid JSON")
+    };
+    let reservation = json(out.join("reservations/2026/fixture-air-fx7qt2.json"));
+    let sidecar = json(out.join("tickets/2026/fixture-air-fx123-2026-04-10.meta.json"));
+
+    let events: Vec<_> = std::fs::read_dir(out.join("events"))
+        .expect("events dir")
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(events.len(), 1, "expected one event, got {events:?}");
+    let event = std::fs::read_to_string(&events[0]).expect("read event");
+    let dtstamp = event
+        .lines()
+        .find(|l| l.starts_with("DTSTAMP:"))
+        .expect("event has a DTSTAMP");
+
+    (
+        reservation["receivedAt"].as_str().unwrap().to_string(),
+        sidecar["receivedAt"].as_str().unwrap().to_string(),
+        dtstamp.to_string(),
+    )
+}
+
+fn dates(received_at: &str, dtstamp: &str) -> (String, String, String) {
+    (
+        received_at.to_string(),
+        received_at.to_string(),
+        format!("DTSTAMP:{dtstamp}"),
+    )
+}
+
+/// The same booking arrives in three mails. Whichever order they are
+/// processed in, what is filed comes from the one sent last.
+#[test]
+fn booking_mails_out_of_order_leave_the_newest() {
+    let fixture = manifest_dir().join("tests/fixtures/eml/flight-confirmation.eml");
+    let (_d1, earlier) =
+        common::redated_fixture("flight-confirmation.eml", "Sun, 1 Mar 2026 09:00:00 +0000");
+    let (_d2, later) =
+        common::redated_fixture("flight-confirmation.eml", "Tue, 3 Mar 2026 09:00:00 +0000");
+    let out = tempfile::tempdir().expect("tempdir");
+
+    // Sent 2 March.
+    replay_into(&fixture, out.path());
+    assert_eq!(
+        filed_dates(out.path()),
+        dates("2026-03-02T09:00:00Z", "20260302T090000Z")
+    );
+
+    // An older one turns up afterwards: nothing moves.
+    replay_into(&earlier, out.path());
+    assert_eq!(
+        filed_dates(out.path()),
+        dates("2026-03-02T09:00:00Z", "20260302T090000Z")
+    );
+
+    // A newer one replaces all three.
+    replay_into(&later, out.path());
+    assert_eq!(
+        filed_dates(out.path()),
+        dates("2026-03-03T09:00:00Z", "20260303T090000Z")
+    );
+
+    // And a rescan of everything, oldest last, leaves it there.
+    replay_into(&fixture, out.path());
+    replay_into(&earlier, out.path());
+    assert_eq!(
+        filed_dates(out.path()),
+        dates("2026-03-03T09:00:00Z", "20260303T090000Z")
+    );
 }

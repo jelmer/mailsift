@@ -4,11 +4,22 @@
 //! a year from one of several possible date fields. The filesystem
 //! bits (slugify, atomic write) live in [`super::sink`] alongside the
 //! shared `FileOutcome`.
+//!
+//! Every filed record carries the date of the message it came from in
+//! `receivedAt`. [`write_unless_newer`] and friends compare that
+//! against an incoming record so an older message never replaces what
+//! a newer one filed.
 
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde_json::{Map, Value};
+use tracing::warn;
+
+use super::FileOutcome;
+use super::sink::{read_if_exists, supersedes, update_file};
 
 /// Read a JSON artifact from disk and parse it as `T`, keeping the raw
 /// body so the caller can also write it back out or transform it. Error
@@ -88,9 +99,177 @@ pub fn body_with_received_at(body: &str, received_at_epoch: Option<i64>) -> Stri
     body.to_string()
 }
 
+/// The `receivedAt` of a single record or history entry, as a
+/// comparable timestamp.
+pub fn received_at_of(obj: &Map<String, Value>) -> Option<DateTime<Utc>> {
+    let raw = obj.get("receivedAt")?.as_str()?;
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// The `receivedAt` of a JSON record body: the date of the message it
+/// was filed from. `None` when the record doesn't carry a usable one.
+pub fn received_at_in(body: &[u8]) -> Result<Option<DateTime<Utc>>> {
+    let value: Value = serde_json::from_slice(body).context("parsing record JSON")?;
+    Ok(value.as_object().and_then(received_at_of))
+}
+
+/// Whether the record body `existing`, found at `label`, was filed
+/// from a newer message than one dated `incoming`.
+///
+/// A record we can't parse has no date to order by, so it never wins:
+/// replacing a corrupt record is better than keeping it forever.
+pub fn is_from_newer(existing: &[u8], label: &str, incoming: Option<DateTime<Utc>>) -> bool {
+    let existing = received_at_in(existing).unwrap_or_else(|e| {
+        warn!(target = %label, error = format!("{e:#}"), "existing record is unreadable; replacing");
+        None
+    });
+    supersedes(existing, incoming)
+}
+
+/// Whether the record at `target`, if any, was filed from a newer
+/// message than one dated `incoming`.
+pub fn filed_from_newer(target: &Path, incoming: Option<DateTime<Utc>>) -> Result<bool> {
+    Ok(read_if_exists(target)?
+        .is_some_and(|existing| is_from_newer(&existing, &target.display().to_string(), incoming)))
+}
+
+/// The merge for a plain JSON record: file `body`, dated `incoming`,
+/// unless the record already at `label` was filed from a newer message.
+pub fn replace_unless_newer<'a>(
+    label: &'a str,
+    body: &'a [u8],
+    incoming: Option<DateTime<Utc>>,
+) -> impl Fn(Option<&[u8]>) -> Result<Option<Vec<u8>>> + 'a {
+    move |existing| {
+        Ok(match existing {
+            Some(existing) if is_from_newer(existing, label, incoming) => None,
+            _ => Some(body.to_vec()),
+        })
+    }
+}
+
+/// Write the JSON record `body` to `target`, unless the record already
+/// there was filed from a newer message.
+pub fn write_unless_newer(target: &Path, body: &str, kind: &str) -> Result<FileOutcome> {
+    let label = target.display().to_string();
+    let incoming = received_at_in(body.as_bytes())?;
+    update_file(
+        target,
+        kind,
+        &replace_unless_newer(&label, body.as_bytes(), incoming),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(received_at: &str, price: f64) -> String {
+        serde_json::json!({"name": "Spotify", "price": price, "receivedAt": received_at})
+            .to_string()
+    }
+
+    fn price_at(path: &Path) -> Value {
+        let v: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        v["price"].clone()
+    }
+
+    #[test]
+    fn write_unless_newer_keeps_record_from_newer_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("spotify.json");
+        let newer = record("2026-01-28T10:00:00Z", 12.99);
+        let older = record("2025-10-28T10:00:00Z", 11.99);
+
+        let first = write_unless_newer(&target, &newer, "subscription").unwrap();
+        assert!(matches!(first, FileOutcome::Created(_)));
+        let second = write_unless_newer(&target, &older, "subscription").unwrap();
+        assert!(matches!(second, FileOutcome::Kept(_)));
+        assert_eq!(price_at(&target), 12.99);
+    }
+
+    #[test]
+    fn write_unless_newer_replaces_record_from_older_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("spotify.json");
+        write_unless_newer(
+            &target,
+            &record("2025-10-28T10:00:00Z", 11.99),
+            "subscription",
+        )
+        .unwrap();
+        let outcome = write_unless_newer(
+            &target,
+            &record("2026-01-28T10:00:00Z", 12.99),
+            "subscription",
+        )
+        .unwrap();
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+        assert_eq!(price_at(&target), 12.99);
+    }
+
+    #[test]
+    fn write_unless_newer_refreshes_record_from_same_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("spotify.json");
+        write_unless_newer(
+            &target,
+            &record("2026-01-28T10:00:00Z", 11.99),
+            "subscription",
+        )
+        .unwrap();
+        let outcome = write_unless_newer(
+            &target,
+            &record("2026-01-28T10:00:00Z", 12.99),
+            "subscription",
+        )
+        .unwrap();
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+        assert_eq!(price_at(&target), 12.99);
+    }
+
+    #[test]
+    fn write_unless_newer_replaces_undated_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("spotify.json");
+        fs::write(&target, r#"{"name":"Spotify","price":9.99}"#).unwrap();
+        let outcome = write_unless_newer(
+            &target,
+            &record("2025-10-28T10:00:00Z", 11.99),
+            "subscription",
+        )
+        .unwrap();
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+        assert_eq!(price_at(&target), 11.99);
+    }
+
+    #[test]
+    fn write_unless_newer_replaces_unreadable_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("spotify.json");
+        fs::write(&target, "{ truncated").unwrap();
+        let outcome = write_unless_newer(
+            &target,
+            &record("2025-10-28T10:00:00Z", 11.99),
+            "subscription",
+        )
+        .unwrap();
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+        assert_eq!(price_at(&target), 11.99);
+    }
+
+    #[test]
+    fn received_at_in_normalises_offsets() {
+        let body = br#"{"receivedAt":"2024-12-20T09:00:00+02:00"}"#;
+        assert_eq!(
+            received_at_in(body).unwrap(),
+            Some("2024-12-20T07:00:00Z".parse().unwrap())
+        );
+        assert_eq!(received_at_in(b"{}").unwrap(), None);
+        assert_eq!(received_at_in(b"42").unwrap(), None);
+    }
 
     #[test]
     fn first_non_empty_skips_blanks() {

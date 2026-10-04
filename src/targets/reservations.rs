@@ -22,8 +22,8 @@ use serde::Deserialize;
 use tracing::warn;
 
 use super::FileOutcome;
-use super::json_target::{derive_year, first_non_empty, read_and_parse};
-use super::sink::{log_file_outcome, slugify, write_atomic};
+use super::json_target::{derive_year, first_non_empty, read_and_parse, write_unless_newer};
+use super::sink::slugify;
 
 /// Identifying fields we pull out of a `.reservation.json` artifact.
 ///
@@ -386,11 +386,8 @@ fn file_one(
     }
 
     let target = dir.join(format!("{year:04}")).join(format!("{stem}.json"));
-    let existed = target.exists();
     let body_out = super::json_target::body_with_received_at(body, received_at_epoch);
-    write_atomic(&target, body_out.as_bytes())?;
-
-    Ok(log_file_outcome(&target, existed, "reservation"))
+    write_unless_newer(&target, &body_out, "reservation")
 }
 
 /// The dash-separated tail of the source filename that follows the
@@ -805,6 +802,34 @@ mod tests {
         file_reservation(&src, &dir, Some(1730419200)).unwrap();
         let body = fs::read_to_string(dir.join("2024/abc123.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["receivedAt"], "2024-11-01T00:00:00Z");
+    }
+
+    #[test]
+    fn older_mail_does_not_replace_reservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("trip.reservation.json");
+        let dir = tmp.path().join("out");
+
+        // The amended booking, sent 2024-11-01, is processed first.
+        fs::write(
+            &src,
+            br#"{"reservationNumber":"ABC123","checkinTime":"2024-11-06"}"#,
+        )
+        .unwrap();
+        file_reservation(&src, &dir, Some(1730419200)).unwrap();
+        // The original, sent a day earlier, turns up afterwards.
+        fs::write(
+            &src,
+            br#"{"reservationNumber":"ABC123","checkinTime":"2024-11-05"}"#,
+        )
+        .unwrap();
+        let outcomes = file_reservation(&src, &dir, Some(1730332800)).unwrap();
+        assert!(matches!(outcomes[..], [FileOutcome::Kept(_)]));
+
+        let body = fs::read_to_string(dir.join("2024/abc123.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["checkinTime"], "2024-11-06");
         assert_eq!(v["receivedAt"], "2024-11-01T00:00:00Z");
     }
 

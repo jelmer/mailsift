@@ -571,6 +571,7 @@ fn render(r: Reservation) -> Option<SingleEvent> {
         uid,
         body,
         method: None,
+        dtstamp: None,
     })
 }
 

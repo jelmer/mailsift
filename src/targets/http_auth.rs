@@ -18,12 +18,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-#[cfg(feature = "gssapi")]
-use anyhow::anyhow;
-use anyhow::{Context, Result};
-use reqwest::header::{HeaderMap, RETRY_AFTER, WWW_AUTHENTICATE};
+use anyhow::{Context, Result, anyhow};
+use reqwest::header::{ETAG, HeaderMap, IF_MATCH, IF_NONE_MATCH, RETRY_AFTER, WWW_AUTHENTICATE};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use tracing::{debug, warn};
+
+use super::http_client::truncate;
 
 /// Maximum number of send attempts against a single request. One attempt
 /// plus this many additional retries on transient failure.
@@ -204,6 +204,65 @@ pub fn apply_auth(
     }
 }
 
+/// How often to redo a read-then-conditional-PUT whose resource keeps
+/// changing in between before giving up.
+pub const MAX_UPDATE_ATTEMPTS: u32 = 5;
+
+/// A resource as [`get_if_exists`] found it.
+pub struct Fetched {
+    pub body: Vec<u8>,
+    /// Its entity tag, if the server sent one a later PUT can be made
+    /// conditional on.
+    pub etag: Option<String>,
+}
+
+/// GET `url` through [`send_with_auth_retry`], or `None` if nothing is
+/// there yet.
+pub async fn get_if_exists(client: &Client, auth: &Auth, url: &str) -> Result<Option<Fetched>> {
+    let response = send_with_auth_retry(client, auth, |client| client.get(url))
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = response.status();
+    if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "GET {url} returned {status}: {}",
+            truncate(&body, 200)
+        ));
+    }
+    // `If-Match` compares strongly, so a weak tag would never match.
+    let etag = response
+        .headers()
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .filter(|etag| !etag.starts_with("W/"))
+        .map(str::to_string);
+    let body = response
+        .bytes()
+        .await
+        .with_context(|| format!("reading body of {url}"))?
+        .to_vec();
+    Ok(Some(Fetched { body, etag }))
+}
+
+/// Make the PUT `request` conditional on its resource still being as
+/// `found`: absent, or carrying the same entity tag. The server then
+/// answers `412 Precondition Failed` rather than let the PUT land on
+/// top of a change made since, whoever made it.
+pub fn unless_changed(request: RequestBuilder, found: Option<&Fetched>) -> RequestBuilder {
+    match found {
+        None => request.header(IF_NONE_MATCH, "*"),
+        Some(Fetched {
+            etag: Some(etag), ..
+        }) => request.header(IF_MATCH, etag),
+        // Nothing to make it conditional on.
+        Some(Fetched { etag: None, .. }) => request,
+    }
+}
+
 /// Set once we've reported that the preferred scheme can't be applied
 /// locally, so a bulk run doesn't repeat the same warning per request.
 static LOCAL_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
@@ -364,6 +423,44 @@ pub fn parse_www_authenticate(headers: &HeaderMap) -> WwwAuthenticate {
 mod tests {
     use super::*;
     use reqwest::header::HeaderValue;
+
+    fn precondition_headers(found: Option<&Fetched>) -> Vec<(String, String)> {
+        let request = Client::new().put("http://dav.example.org/x");
+        let request = unless_changed(request, found).build().unwrap();
+        request
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_string()))
+            .collect()
+    }
+
+    fn fetched(etag: Option<&str>) -> Fetched {
+        Fetched {
+            body: Vec::new(),
+            etag: etag.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn unless_changed_requires_absence_when_nothing_was_found() {
+        assert_eq!(
+            precondition_headers(None),
+            vec![("if-none-match".to_string(), "*".to_string())]
+        );
+    }
+
+    #[test]
+    fn unless_changed_requires_the_etag_that_was_found() {
+        assert_eq!(
+            precondition_headers(Some(&fetched(Some("\"v3\"")))),
+            vec![("if-match".to_string(), "\"v3\"".to_string())]
+        );
+    }
+
+    #[test]
+    fn unless_changed_is_unconditional_without_an_etag() {
+        assert_eq!(precondition_headers(Some(&fetched(None))), vec![]);
+    }
 
     fn headers_with(values: &[&str]) -> HeaderMap {
         let mut h = HeaderMap::new();

@@ -7,7 +7,6 @@
 //! record gets richer as a parcel progresses ("on its way" →
 //! "out for delivery" → "delivered").
 
-use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -16,8 +15,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::FileOutcome;
-use super::json_target::read_and_parse;
-use super::sink::{log_file_outcome, slugify, write_atomic};
+use super::json_target::{read_and_parse, received_at_of};
+use super::sink::{slugify, supersedes, update_file};
 
 /// Shape we read out of a `.parcel.json` artifact. Loosely schema.org
 /// `ParcelDelivery`-shaped; unknown fields pass through unchanged.
@@ -98,23 +97,20 @@ pub fn file_parcel(
     }
 
     let target = dir.join(format!("{tracking_slug}.json"));
-    let existed = target.exists();
-
-    let merged = if existed {
-        let existing_body = fs::read_to_string(&target)
-            .with_context(|| format!("reading existing parcel {}", target.display()))?;
-        let existing: Value = serde_json::from_str(&existing_body)
-            .with_context(|| format!("parsing existing parcel {}", target.display()))?;
-        merge(existing, incoming)
-    } else {
-        with_initial_history(incoming)
-    };
-
-    let serialised = serde_json::to_vec_pretty(&merged).context("serialising merged parcel")?;
-    write_atomic(&target, &serialised)?;
-
-    let outcome = log_file_outcome(&target, existed, "parcel");
-    if !existed {
+    let outcome = update_file(&target, "parcel", &|existing| {
+        let merged = match existing {
+            Some(existing) => {
+                let existing: Value = serde_json::from_slice(existing)
+                    .with_context(|| format!("parsing existing parcel {}", target.display()))?;
+                merge(existing, incoming.clone())
+            }
+            None => with_initial_history(incoming.clone()),
+        };
+        serde_json::to_vec_pretty(&merged)
+            .context("serialising merged parcel")
+            .map(Some)
+    })?;
+    if matches!(outcome, FileOutcome::Created(_)) {
         // First time we've seen this tracking number; fan out to every
         // configured tracker registration sink so they can start
         // polling the carrier. Silently skip parcels with no
@@ -130,8 +126,9 @@ pub fn file_parcel(
 }
 
 /// Fields describing where a parcel is right now, as opposed to what
-/// it is. Only a mail newer than everything already recorded may
-/// overwrite these; the rest merge unconditionally.
+/// it is. A stale mail contributes none of these, not even ones the
+/// record lacks: an arrival estimate from before the delivery is not
+/// worth having.
 const STATE_FIELDS: [&str; 5] = [
     "deliveryStatus",
     "expectedArrivalFrom",
@@ -188,10 +185,10 @@ impl ParcelStatus {
 /// folder or an IMAP scan that walks messages by UID can all hand us
 /// an older mail after a newer one. Applying every incoming field
 /// blindly then rolls the parcel's state backwards, leaving a
-/// delivered parcel claiming to be out for delivery. So the state
-/// fields above are only taken from a mail at least as new as the
-/// newest one already merged; everything else still overlays, and the
-/// history records the mail either way.
+/// delivered parcel claiming to be out for delivery. So a mail older
+/// than the newest one already merged only fills in fields the record
+/// lacks and never replaces one; the history records the mail either
+/// way.
 fn merge(mut existing: Value, incoming: Value) -> Value {
     let Value::Object(mut existing_obj) = existing.take() else {
         // Existing isn't an object; replace wholesale.
@@ -204,15 +201,16 @@ fn merge(mut existing: Value, incoming: Value) -> Value {
     let history_entry = history_entry_from(&incoming_obj);
     let incoming_date = received_at_of(&incoming_obj);
     let newest_known = newest_received_at(&existing_obj);
-    let is_stale = match (incoming_date, newest_known) {
-        (Some(incoming), Some(newest)) => incoming < newest,
-        // Undated mail can't be ordered by date. Fall back on the one
-        // thing we know regardless: a parcel that has been delivered
-        // or returned does not go back to being in transit. Not every
-        // extractor sets `receivedAt`, and those records hit this path
-        // exclusively.
-        _ => is_final_status(&existing_obj) && !is_final_status(&incoming_obj),
-    };
+    let is_older = supersedes(newest_known, incoming_date);
+    // Undated mail can't be ordered by date. Fall back on the one
+    // thing we know regardless: a parcel that has been delivered or
+    // returned does not go back to being in transit. Not every
+    // extractor sets `receivedAt`, and those records hit this path
+    // exclusively.
+    let is_stale = is_older
+        || ((incoming_date.is_none() || newest_known.is_none())
+            && is_final_status(&existing_obj)
+            && !is_final_status(&incoming_obj));
 
     for (k, v) in incoming_obj {
         if k == "history" {
@@ -227,33 +225,58 @@ fn merge(mut existing: Value, incoming: Value) -> Value {
         if is_stale && STATE_FIELDS.contains(&k.as_str()) {
             continue;
         }
+        if is_older && existing_obj.contains_key(&k) {
+            continue;
+        }
         existing_obj.insert(k, v);
     }
 
     let history = existing_obj
         .entry("history")
         .or_insert_with(|| Value::Array(Vec::new()));
-    if let Value::Array(arr) = history
-        && !is_duplicate_history_entry(arr.last(), &history_entry)
-    {
+    if let Value::Array(arr) = history {
         arr.push(history_entry);
+        drop_repeated_entries(arr);
     }
 
     Value::Object(existing_obj)
 }
 
-/// Whether `entry` records the same tracker snapshot as `last`,
-/// ignoring their own `seen_at`. Repeated poll cycles that see the
-/// same status with the same event timestamps produce identical
-/// entries; keeping only the first stops the history from growing
-/// unboundedly.
-fn is_duplicate_history_entry(last: Option<&Value>, entry: &Value) -> bool {
-    let Some(last) = last.and_then(Value::as_object) else {
-        return false;
-    };
-    let Some(entry) = entry.as_object() else {
-        return false;
-    };
+/// Drop every history entry that repeats one before it, keeping the
+/// first. Covers the entry just appended as well as repeats left
+/// behind by rescans from before they were recognised.
+fn drop_repeated_entries(history: &mut Vec<Value>) {
+    let mut kept: Vec<Value> = Vec::with_capacity(history.len());
+    for entry in history.drain(..) {
+        if !is_recorded(&kept, &entry) {
+            kept.push(entry);
+        }
+    }
+    *history = kept;
+}
+
+/// Whether `history` already records `entry`.
+///
+/// A dated entry stands for one mail, and a rescan replays a parcel's
+/// whole run of mails, so a match anywhere in the history is that mail
+/// processed before. An undated entry only repeats the one right
+/// before it: a parcel can go back to a status it had earlier, and
+/// without a date that is not told apart from a replay.
+fn is_recorded(history: &[Value], entry: &Value) -> bool {
+    if entry.get("receivedAt").is_some() {
+        history
+            .iter()
+            .any(|earlier| is_same_snapshot(earlier, entry))
+    } else {
+        history
+            .last()
+            .is_some_and(|last| is_same_snapshot(last, entry))
+    }
+}
+
+/// Whether two history entries record the same snapshot of a parcel,
+/// ignoring when each was seen.
+fn is_same_snapshot(a: &Value, b: &Value) -> bool {
     [
         "receivedAt",
         "deliveryStatus",
@@ -262,7 +285,7 @@ fn is_duplicate_history_entry(last: Option<&Value>, entry: &Value) -> bool {
         "actualDeliveryTime",
     ]
     .iter()
-    .all(|k| last.get(*k) == entry.get(*k))
+    .all(|k| a.get(*k) == b.get(*k))
 }
 
 /// Whether a record's `deliveryStatus` is a terminal one.
@@ -271,15 +294,6 @@ fn is_final_status(obj: &Map<String, Value>) -> bool {
         .and_then(Value::as_str)
         .map(ParcelStatus::from_raw)
         .is_some_and(|s| s.is_terminal())
-}
-
-/// The `receivedAt` of a single record or history entry, as a
-/// comparable timestamp.
-fn received_at_of(obj: &Map<String, Value>) -> Option<DateTime<Utc>> {
-    let raw = obj.get("receivedAt")?.as_str()?;
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// The newest mail date already merged into a record: the top-level
@@ -554,6 +568,27 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_mail_does_not_replace_non_state_fields() {
+        let existing = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "Delivered",
+            "description": "A book, signed for by a neighbour",
+            "receivedAt": "2024-12-20T15:00:00Z"
+        });
+        let incoming = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "OnItsWay",
+            "description": "A book",
+            "receivedAt": "2024-12-19T08:00:00Z"
+        });
+        let obj = merge(existing, incoming);
+        assert_eq!(
+            obj.as_object().unwrap().get("description").unwrap(),
+            "A book, signed for by a neighbour"
+        );
+    }
+
+    #[test]
     fn ordering_considers_history_dates_not_just_the_top_level() {
         // The top-level receivedAt stays at the first mail's date, so
         // ordering has to look at the history to find the newest.
@@ -704,6 +739,112 @@ mod tests {
             1,
             "duplicate history entry should not be appended"
         );
+    }
+
+    fn status_at(status: &str, received_at: &str) -> Value {
+        serde_json::json!({
+            "trackingNumber": "X", "deliveryStatus": status, "receivedAt": received_at,
+        })
+    }
+
+    fn history_statuses(parcel: &Value) -> Vec<&str> {
+        parcel["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["deliveryStatus"].as_str().unwrap())
+            .collect()
+    }
+
+    /// A rescan hands us every mail about a parcel again, in sequence.
+    /// None of them is news.
+    #[test]
+    fn replaying_a_parcels_mails_adds_no_history() {
+        let mails = [
+            status_at("OnItsWay", "2025-09-24T12:56:20Z"),
+            status_at("OutForDelivery", "2025-09-25T12:05:06Z"),
+            status_at("Delivered", "2025-09-27T14:37:31Z"),
+        ];
+        let mut parcel = with_initial_history(mails[0].clone());
+        for mail in mails.iter().skip(1).chain(&mails).chain(&mails) {
+            parcel = merge(parcel, mail.clone());
+        }
+        assert_eq!(
+            history_statuses(&parcel),
+            vec!["OnItsWay", "OutForDelivery", "Delivered"]
+        );
+        assert_eq!(parcel["deliveryStatus"], "Delivered");
+    }
+
+    /// Records filed before replays were recognised carry the same
+    /// run of mails several times over. The next update tidies them.
+    #[test]
+    fn merge_drops_repeats_already_in_the_history() {
+        let entry = |status: &str, received_at: &str, seen_at: &str| {
+            serde_json::json!({
+                "deliveryStatus": status, "receivedAt": received_at, "seen_at": seen_at,
+            })
+        };
+        let existing = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "Delivered",
+            "receivedAt": "2025-09-24T12:56:20Z",
+            "history": [
+                entry("OnItsWay", "2025-09-24T12:56:20Z", "2026-08-28T23:11:41Z"),
+                entry("Delivered", "2025-09-27T14:37:31Z", "2026-08-28T23:32:37Z"),
+                entry("OnItsWay", "2025-09-24T12:56:20Z", "2026-08-29T20:09:11Z"),
+                entry("Delivered", "2025-09-27T14:37:31Z", "2026-08-29T20:13:00Z"),
+            ]
+        });
+        let merged = merge(existing, status_at("Delivered", "2025-09-27T14:37:31Z"));
+        assert_eq!(history_statuses(&merged), vec!["OnItsWay", "Delivered"]);
+        // The first sighting of each mail is the one kept.
+        assert_eq!(merged["history"][1]["seen_at"], "2026-08-28T23:32:37Z");
+    }
+
+    /// Without dates a return to an earlier status can't be told from
+    /// a replay, so only an immediate repeat is dropped.
+    #[test]
+    fn undated_return_to_an_earlier_status_is_kept() {
+        let undated =
+            |status: &str| serde_json::json!({"trackingNumber": "X", "deliveryStatus": status});
+        let mut parcel = with_initial_history(undated("OnItsWay"));
+        for status in ["OutForDelivery", "OutForDelivery", "OnItsWay"] {
+            parcel = merge(parcel, undated(status));
+        }
+        assert_eq!(
+            history_statuses(&parcel),
+            vec!["OnItsWay", "OutForDelivery", "OnItsWay"]
+        );
+    }
+
+    /// Scans process messages on several threads at once. Every
+    /// update must make it into the record, and the newest one must
+    /// decide its state.
+    #[test]
+    fn concurrent_filing_keeps_every_update() {
+        const STATUSES: [&str; 4] = ["OnItsWay", "OnItsWay", "OutForDelivery", "Delivered"];
+        for _ in 0..200 {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("out");
+            std::thread::scope(|scope| {
+                for (n, status) in STATUSES.iter().enumerate() {
+                    let dir = &dir;
+                    let src = tmp.path().join(format!("{n}.parcel.json"));
+                    scope.spawn(move || {
+                        let body = serde_json::json!({
+                            "trackingNumber": "X1", "deliveryStatus": status, "step": n,
+                        });
+                        std::fs::write(&src, body.to_string()).unwrap();
+                        file_parcel(&src, dir, None, Some(1_700_000_000 + n as i64)).unwrap();
+                    });
+                }
+            });
+            let body = std::fs::read_to_string(dir.join("X1.json")).unwrap();
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["deliveryStatus"], "Delivered");
+            assert_eq!(v["history"].as_array().unwrap().len(), STATUSES.len());
+        }
     }
 
     #[test]

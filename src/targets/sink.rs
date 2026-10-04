@@ -1,7 +1,14 @@
 //! Building blocks shared by every artifact sink.
 //!
 //! - [`FileOutcome`]: what a sink did with one artifact (created or
-//!   updated something at the returned location label).
+//!   updated something at the returned location label, or kept what
+//!   was already there).
+//! - [`supersedes`]: the ordering rule every sink applies before
+//!   replacing a record, so that the newest message wins regardless of
+//!   the order messages are processed in.
+//! - [`update_file`]: applies such a rule to one file atomically, so
+//!   two messages about the same thing can't both find an older record
+//!   and then write in either order. [`lock_dir`] is the lock under it.
 //! - [`write_atomic`]: temp file + fsync + rename, so a partial write
 //!   can't leave a truncated file in place.
 //! - [`slugify`]: filesystem-safe ASCII slugger. `uppercase` is `true`
@@ -12,11 +19,12 @@
 //! - [`sanitize_uid`]: defend on-disk paths against weird iCalendar
 //!   UIDs on the local-events sink.
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use tracing::info;
 
 /// What a sink did with one artifact.
@@ -32,6 +40,79 @@ pub enum FileOutcome {
     Created(String),
     /// Existing record at this location was overwritten / re-sent.
     Updated(String),
+    /// The record at this location was filed from a newer message and
+    /// was left alone.
+    Kept(String),
+}
+
+/// Whether a record filed from a message dated `existing` must be kept
+/// over one from a message dated `incoming`.
+///
+/// A mailbox is not processed in date order: a rescan, a re-filed
+/// folder or an IMAP scan can all hand us an older mail after a newer
+/// one. Only a strictly newer record is kept, so reprocessing the same
+/// message still refreshes it. Without both dates there is nothing to
+/// order by and the incoming message is filed.
+pub fn supersedes(existing: Option<DateTime<Utc>>, incoming: Option<DateTime<Utc>>) -> bool {
+    matches!((existing, incoming), (Some(existing), Some(incoming)) if existing > incoming)
+}
+
+/// Decides what to file at a location given what is there (`None` if
+/// nothing): `Some(body)` to write, `None` to leave it alone. A remote
+/// sink calls it again if the resource changed before the write landed.
+pub type Merge<'a> = dyn Fn(Option<&[u8]>) -> Result<Option<Vec<u8>>> + 'a;
+
+/// Exclusive hold on a sink directory until dropped.
+pub struct DirLock {
+    _dir: File,
+}
+
+/// Lock `dir`, creating it if needed, waiting for anyone else who
+/// holds it. Hold the lock from looking at what is on file until the
+/// write lands.
+///
+/// Messages are processed on several threads at once, and the milter,
+/// a watcher and a one-off scan can all be running. The lock is an
+/// advisory one on the directory itself, so it holds across all of
+/// them and leaves nothing behind in the directory.
+pub fn lock_dir(dir: &Path) -> Result<DirLock> {
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let handle = File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
+    handle
+        .lock()
+        .with_context(|| format!("locking {}", dir.display()))?;
+    Ok(DirLock { _dir: handle })
+}
+
+/// Replace `target` with whatever `merge` makes of what is there, with
+/// its directory locked throughout.
+pub fn update_file(target: &Path, kind: &str, merge: &Merge<'_>) -> Result<FileOutcome> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow!("target {} has no parent dir", target.display()))?;
+    let _lock = lock_dir(parent)?;
+    let existing = read_if_exists(target)?;
+    let Some(body) = merge(existing.as_deref())? else {
+        return Ok(log_kept(target.display().to_string(), kind));
+    };
+    write_atomic(target, &body)?;
+    Ok(log_file_outcome(target, existing.is_some(), kind))
+}
+
+/// Emit the `"<kind> kept"` log line and return the matching
+/// [`FileOutcome`] for a record at `label` that was left alone.
+pub fn log_kept(label: String, kind: &str) -> FileOutcome {
+    info!(target = %label, "{kind} kept; already filed from a newer message");
+    FileOutcome::Kept(label)
+}
+
+/// Read `path`, or `None` if nothing is there yet.
+pub fn read_if_exists(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(body) => Ok(Some(body)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 /// Emit the `"<kind> created"` or `"<kind> updated"` log line and
@@ -126,6 +207,126 @@ pub fn sanitize_uid(uid: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(rfc3339: &str) -> Option<DateTime<Utc>> {
+        Some(rfc3339.parse().unwrap())
+    }
+
+    #[test]
+    fn supersedes_only_when_existing_is_strictly_newer() {
+        let older = at("2025-10-28T10:00:00Z");
+        let newer = at("2026-01-28T10:00:00Z");
+        assert!(supersedes(newer, older));
+        assert!(!supersedes(older, newer));
+        assert!(!supersedes(newer, newer));
+    }
+
+    #[test]
+    fn supersedes_needs_both_dates() {
+        let dated = at("2026-01-28T10:00:00Z");
+        assert!(!supersedes(dated, None));
+        assert!(!supersedes(None, dated));
+        assert!(!supersedes(None, None));
+    }
+
+    fn replace_with(body: &'static [u8]) -> impl Fn(Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        move |_| Ok(Some(body.to_vec()))
+    }
+
+    #[test]
+    fn update_file_creates_then_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("2026/record.json");
+
+        let first = update_file(&target, "record", &replace_with(b"one")).unwrap();
+        assert!(matches!(first, FileOutcome::Created(_)));
+        let second = update_file(&target, "record", &replace_with(b"two")).unwrap();
+        assert!(matches!(second, FileOutcome::Updated(_)));
+        assert_eq!(fs::read(&target).unwrap(), b"two");
+    }
+
+    #[test]
+    fn update_file_shows_the_merge_what_is_on_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("record.json");
+
+        update_file(&target, "record", &|existing| {
+            assert_eq!(existing, None);
+            Ok(Some(b"one".to_vec()))
+        })
+        .unwrap();
+        update_file(&target, "record", &|existing| {
+            assert_eq!(existing, Some(b"one".as_slice()));
+            Ok(Some([existing.unwrap(), b"+two"].concat()))
+        })
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"one+two");
+    }
+
+    #[test]
+    fn update_file_keeps_what_is_there_when_the_merge_declines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("record.json");
+        fs::write(&target, b"one").unwrap();
+
+        let outcome = update_file(&target, "record", &|_| Ok(None)).unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        assert_eq!(fs::read(&target).unwrap(), b"one");
+
+        // Declining when nothing is there leaves nothing there.
+        let absent = tmp.path().join("absent.json");
+        let outcome = update_file(&absent, "record", &|_| Ok(None)).unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        assert!(!absent.exists());
+    }
+
+    #[test]
+    fn update_file_passes_on_a_merge_failure_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("record.json");
+        fs::write(&target, b"one").unwrap();
+
+        let err = update_file(&target, "record", &|_| bail!("can't merge")).unwrap_err();
+        assert_eq!(err.to_string(), "can't merge");
+        assert_eq!(fs::read(&target).unwrap(), b"one");
+    }
+
+    #[test]
+    fn lock_dir_makes_a_second_taker_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let got_it = AtomicBool::new(false);
+        let lock = lock_dir(tmp.path()).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _lock = lock_dir(tmp.path()).unwrap();
+                got_it.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!got_it.load(Ordering::SeqCst));
+            drop(lock);
+        });
+        assert!(got_it.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn lock_dir_creates_the_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("bills/2026");
+        let _lock = lock_dir(&dir).unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn read_if_exists_distinguishes_missing_from_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("record.json");
+        assert_eq!(read_if_exists(&path).unwrap(), None);
+        fs::write(&path, b"{}").unwrap();
+        assert_eq!(read_if_exists(&path).unwrap(), Some(b"{}".to_vec()));
+    }
 
     #[test]
     fn slug_lowercase_collapses_runs() {

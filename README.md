@@ -207,8 +207,13 @@ mailsift maildir-scan /srv/mail/jelmer/Maildir --recurse --extractor parcel-dhl
 
 Reads `cur/` and `new/` (`tmp/` is skipped); `--recurse` also descends
 into Maildir++ subfolders. Useful for one-off backfills against archived
-mail. Like `imap-scan`, it bypasses the milter's dedup store and stats
-recorder; upstream sinks (CalDAV etc.) are idempotent.
+mail.
+
+Both scans share the milter's dedup store
+(`$XDG_STATE_HOME/mailsift/seen.db`), so scanning the same mail again
+only sends CalDAV the events that changed. Pass `--no-dedup` to send
+every event regardless, e.g. to restore ones that were edited or
+deleted on the server.
 
 `--extractor NAME` restricts the run to one extractor; repeat it to
 select several. Unknown names are an error rather than a silently
