@@ -69,6 +69,11 @@ impl FakeDav {
         self.state.lock().unwrap().resources.get(path).cloned()
     }
 
+    pub fn put(&self, path: &str, body: &[u8]) {
+        let mut state = self.state.lock().unwrap();
+        state.resources.insert(path.to_string(), body.to_vec());
+    }
+
     /// Every request served so far, as `"<METHOD> <path>"`.
     pub fn requests(&self) -> Vec<String> {
         self.state.lock().unwrap().requests.clone()

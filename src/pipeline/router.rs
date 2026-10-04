@@ -108,6 +108,7 @@ pub(super) fn file_event_artifact(
     artifact: &Artifact,
     event_sink: &EventSinkKind,
     seen: Option<&SeenStore>,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
     let body = match fs::read_to_string(&artifact.path) {
@@ -146,7 +147,14 @@ pub(super) fn file_event_artifact(
     }
 
     for event in &singles {
-        file_single(extractor, event, event_sink, seen, summary);
+        file_single(
+            extractor,
+            event,
+            event_sink,
+            seen,
+            received_at_epoch,
+            summary,
+        );
     }
 }
 
@@ -193,6 +201,7 @@ pub(super) fn file_reservation_artifact(
     artifact: &Artifact,
     event_sink: &EventSinkKind,
     seen: Option<&SeenStore>,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
     let singles = match reservation::convert_file(&artifact.path) {
@@ -216,7 +225,14 @@ pub(super) fn file_reservation_artifact(
         return;
     }
     for single in &singles {
-        file_single(extractor, single, event_sink, seen, summary);
+        file_single(
+            extractor,
+            single,
+            event_sink,
+            seen,
+            received_at_epoch,
+            summary,
+        );
     }
 }
 
@@ -334,12 +350,35 @@ fn file_single(
     event: &SingleEvent,
     event_sink: &EventSinkKind,
     seen: Option<&SeenStore>,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
     if summary.dry_run {
         summary.bump(extractor, KIND_EVENT);
         return;
     }
+    // An event whose source didn't say when it was created is dated by
+    // the message it arrived in. That lets the sink order it against
+    // other takes on the same UID, and makes its body the same every
+    // time the message is processed.
+    let dated = match received_at_epoch
+        .and_then(|epoch| chrono::DateTime::from_timestamp(epoch, 0))
+        .filter(|_| event.dtstamp.is_none())
+        .map(|message_date| event.with_dtstamp(message_date))
+        .transpose()
+    {
+        Ok(dated) => dated,
+        Err(e) => {
+            warn!(
+                extractor,
+                uid = %event.uid,
+                error = format!("{e:#}"),
+                "failed to date event by its message"
+            );
+            return;
+        }
+    };
+    let event = dated.as_ref().unwrap_or(event);
     // Skip the network round-trip when (a) we have a seen.db, (b) the
     // sink is CalDAV (local-dir rewrites are cheap, no point gating),
     // and (c) we've already PUT this exact body for this UID. Local
@@ -935,6 +974,76 @@ END:VCALENDAR\r
         assert_eq!(earliest_sibling_year(&arts), None);
     }
 
+    fn event_about(summary: &str) -> SingleEvent {
+        SingleEvent {
+            uid: "evt-1@example.com".to_string(),
+            body: format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+                BEGIN:VEVENT\r\nUID:evt-1@example.com\r\n\
+                DTSTART:20260201T100000Z\r\n\
+                SUMMARY:{summary}\r\n\
+                END:VEVENT\r\nEND:VCALENDAR\r\n"
+            ),
+            method: None,
+            dtstamp: None,
+        }
+    }
+
+    fn filed_summary(dir: &Path) -> String {
+        let body = fs::read_to_string(dir.join("evt-1@example.ics")).unwrap();
+        let line = body.lines().find(|l| l.starts_with("SUMMARY:")).unwrap();
+        line.to_string()
+    }
+
+    /// An event that doesn't say when it was created is ordered by
+    /// its message: one from an older message must not replace what a
+    /// newer one filed under the same UID.
+    #[test]
+    fn file_single_keeps_event_from_newer_message() {
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let sink = EventSinkKind::LocalDir(out_dir.path().to_path_buf());
+        let mut summary = Summary::default();
+
+        // Sent 2026-01-28 and 2026-01-20 respectively.
+        let rebooked = (event_about("Rebooked"), Some(1769594400));
+        let original = (event_about("Original"), Some(1768903200));
+
+        file_single("ex", &rebooked.0, &sink, None, rebooked.1, &mut summary);
+        file_single("ex", &original.0, &sink, None, original.1, &mut summary);
+        assert_eq!(filed_summary(out_dir.path()), "SUMMARY:Rebooked");
+        assert_eq!(summary.render(), "ex=1 event");
+
+        file_single("ex", &rebooked.0, &sink, None, rebooked.1, &mut summary);
+        assert_eq!(filed_summary(out_dir.path()), "SUMMARY:Rebooked");
+        assert_eq!(summary.render(), "ex=2 events");
+    }
+
+    #[test]
+    fn file_single_replaces_event_from_older_message() {
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let sink = EventSinkKind::LocalDir(out_dir.path().to_path_buf());
+        let mut summary = Summary::default();
+
+        file_single(
+            "ex",
+            &event_about("Original"),
+            &sink,
+            None,
+            Some(1768903200),
+            &mut summary,
+        );
+        file_single(
+            "ex",
+            &event_about("Rebooked"),
+            &sink,
+            None,
+            Some(1769594400),
+            &mut summary,
+        );
+        assert_eq!(filed_summary(out_dir.path()), "SUMMARY:Rebooked");
+        assert_eq!(summary.render(), "ex=2 events");
+    }
+
     /// LocalDir sinks must NOT consult or update seen.db; rewriting
     /// a tiny .ics file is cheaper than the lookup, and gating it
     /// would mean a deleted file (user reorganising on disk) stays
@@ -956,10 +1065,11 @@ END:VCALENDAR\r
                 END:VEVENT\r\nEND:VCALENDAR\r\n"
                 .to_string(),
             method: None,
+            dtstamp: None,
         };
 
         let mut summary = Summary::default();
-        file_single("ex", &event, &sink, Some(&store), &mut summary);
+        file_single("ex", &event, &sink, Some(&store), None, &mut summary);
 
         assert_eq!(store.len().unwrap(), 0, "LocalDir must not mark seen.db");
         // local_events::file_single sanitises the UID into a

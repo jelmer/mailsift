@@ -14,8 +14,6 @@ use std::path::PathBuf;
 
 use assert_cmd::Command;
 
-mod common;
-
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -85,7 +83,7 @@ fn parcel_delivery_window_renders_to_calendar_event() {
     run_replay("parcel-with-window.eml", &events_dir, &parcels_dir);
 
     let event_path = events_dir.join("event-WIN-9876@mailsift.ics");
-    let event = common::read_event_stable(&event_path);
+    let event = std::fs::read_to_string(&event_path).expect("read event");
     let expected = "\
 BEGIN:VCALENDAR\r
 VERSION:2.0\r
@@ -93,6 +91,7 @@ PRODID:ICALENDAR-RS\r
 CALSCALE:GREGORIAN\r
 BEGIN:VEVENT\r
 DTEND:20260209T144000\r
+DTSTAMP:20260207T090000Z\r
 DTSTART:20260209T134000\r
 SUMMARY:Fixture delivery\r
 UID:event-WIN-9876@mailsift\r

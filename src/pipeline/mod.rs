@@ -450,7 +450,14 @@ pub fn run(
         });
 
         for artifact in events {
-            router::file_event_artifact(&run.extractor, artifact, event_sink, seen, &mut summary);
+            router::file_event_artifact(
+                &run.extractor,
+                artifact,
+                event_sink,
+                seen,
+                received_at_epoch,
+                &mut summary,
+            );
         }
 
         for artifact in &reservations {
@@ -459,6 +466,7 @@ pub fn run(
                 artifact,
                 event_sink,
                 seen,
+                received_at_epoch,
                 &mut summary,
             );
         }

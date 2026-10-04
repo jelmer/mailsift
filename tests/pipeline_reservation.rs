@@ -10,8 +10,6 @@ use std::path::PathBuf;
 
 use assert_cmd::Command;
 
-mod common;
-
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -36,7 +34,7 @@ fn lodging_reservation_renders_to_ics() {
         .success();
 
     let expected_path = out.path().join("hotel-LDG-7777@mailsift.ics");
-    let actual = common::read_event_stable(&expected_path);
+    let actual = std::fs::read_to_string(&expected_path).expect("read event");
     let expected = "\
 BEGIN:VCALENDAR\r
 VERSION:2.0\r
@@ -44,6 +42,7 @@ PRODID:ICALENDAR-RS\r
 CALSCALE:GREGORIAN\r
 BEGIN:VEVENT\r
 DTEND:20260412T110000\r
+DTSTAMP:20260301T100000Z\r
 DTSTART:20260410T150000\r
 LOCATION:1 Example Street\\, Amsterdam\\, NL\r
 SUMMARY:Stay at Fixture Inn\r

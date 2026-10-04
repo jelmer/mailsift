@@ -3,8 +3,6 @@ use std::path::PathBuf;
 
 use assert_cmd::Command;
 
-mod common;
-
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -39,7 +37,7 @@ fn maildir_scan_processes_flat_maildir() {
 
     let path = out.path().join("fixture-ics-1@example.ics");
     assert!(path.exists(), "expected {} to exist", path.display());
-    let actual = common::read_event_stable(&path);
+    let actual = fs::read_to_string(&path).unwrap();
     assert!(actual.contains("UID:fixture-ics-1@example.com"), "{actual}");
 }
 

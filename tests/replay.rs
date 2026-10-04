@@ -2,8 +2,6 @@ use std::path::PathBuf;
 
 use assert_cmd::Command;
 
-mod common;
-
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -28,7 +26,7 @@ fn replay_files_ics_passthrough_event() {
         .success();
 
     let path = out.path().join("fixture-ics-1@example.ics");
-    let actual = common::read_event_stable(&path);
+    let actual = std::fs::read_to_string(&path).expect("read event");
     // split_calendar re-serializes with its own PRODID and orders
     // fields alphabetically, which is why DTEND precedes DTSTART here.
     let expected = "\
@@ -38,6 +36,7 @@ PRODID:ICALENDAR-RS\r
 CALSCALE:GREGORIAN\r
 BEGIN:VEVENT\r
 DTEND:20260720T200000Z\r
+DTSTAMP:20260620T081400Z\r
 DTSTART:20260720T180000Z\r
 SUMMARY:Fixture reservation\r
 UID:fixture-ics-1@example.com\r

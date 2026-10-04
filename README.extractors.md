@@ -226,6 +226,10 @@ header, falling back to its newest `Received:` header, and stamps it on
 the JSON records it files as `receivedAt`. Set `receivedAt` yourself
 only if the message date is the wrong one to order by.
 
+Calendar events are ordered by their `DTSTAMP`. Leave it out of an
+`.event.ics` you build yourself and mailsift fills in the message date;
+pass an organiser's `DTSTAMP` through untouched.
+
 ### Optional `_manifest.json`
 
 An extractor may drop a `_manifest.json` in cwd with `notes` and
