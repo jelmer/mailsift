@@ -13,9 +13,11 @@
 //!
 //! [RFC 2177]: https://tools.ietf.org/html/rfc2177
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use imap::Session;
 use imap::extensions::idle::WaitOutcome;
@@ -110,6 +112,20 @@ pub struct ImapScanConfig<'a> {
     pub before: Option<&'a str>,
     pub limit: Option<usize>,
     pub extractors: &'a [crate::extractor::Extractor],
+    /// Directories the extractors were loaded from. Non-empty under
+    /// `--watch` enables the extractor filesystem watcher: any change
+    /// under one of these directories triggers a reload; extractors
+    /// whose fingerprint changed (or that appeared) are re-run against
+    /// the same UID range as the initial scan, so a manifest edit or a
+    /// new extractor picks up historical mail without a restart.
+    ///
+    /// An empty slice means "the caller has fixed the extractor set,
+    /// don't watch." `main.rs` passes empty when `--only` was given,
+    /// so a mid-flight fs event can't silently broaden the set past
+    /// what the user asked for; the field is empty rather than
+    /// `Option<_>` because "no watching" is the natural degenerate
+    /// case of "these dirs."
+    pub extractor_dirs: &'a [PathBuf],
     pub targets: PipelineTargets<'a>,
     pub dry_run: bool,
     /// After the initial scan, stay connected and use IMAP `IDLE`
@@ -157,41 +173,8 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
     );
 
     let base_query = build_search_query(config.since, config.before);
-    // When every selected extractor names the senders it cares about,
-    // let the server drop everything else: no UID for a message we'd
-    // only discard in the prefilter. Correctness never rests on this,
-    // so a server that rejects the query just costs us the speedup.
-    let mut from_restriction = build_from_restriction(config.extractors);
-    let query = match &from_restriction {
-        Some(r) => format!("{base_query} {r}"),
-        None => base_query.clone(),
-    };
-    let mut uids: Vec<u32> = match session.uid_search(&query) {
-        Ok(found) => found.into_iter().collect(),
-        // Only a NO/BAD tagged response means the server disliked the
-        // query itself. Anything else is a transport failure, which
-        // retrying with a different query wouldn't fix and shouldn't
-        // hide.
-        Err(imap::Error::No(_) | imap::Error::Bad(_)) if from_restriction.is_some() => {
-            warn!(
-                query,
-                "narrowed UID SEARCH rejected by the server; falling back to the unnarrowed query"
-            );
-            // Don't narrow the watch loop's searches either: a failure
-            // there is treated as a transport error and triggers a
-            // reconnect, so a query this server dislikes would spin.
-            from_restriction = None;
-            session
-                .uid_search(&base_query)
-                .with_context(|| format!("UID SEARCH {base_query}"))?
-                .into_iter()
-                .collect()
-        }
-        Err(e) => {
-            return Err(anyhow::Error::new(e).context(format!("UID SEARCH {query}")));
-        }
-    };
-    uids.sort_unstable();
+    let (uids, from_restriction) =
+        narrowed_uid_search(&mut session, &base_query, config.extractors)?;
     info!(matched = uids.len(), "UIDs returned by search");
 
     let take = match config.limit {
@@ -221,12 +204,13 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
             &mut session,
             initial_uids,
             &config,
+            config.extractors,
             &pb,
             uid_validity,
             &interrupted,
         )?
     } else {
-        process_uid_set(&mut session, initial_uids, &config, &pb)?
+        process_uid_set(&mut session, initial_uids, &config, config.extractors, &pb)?
     };
     pb.finish_and_clear();
     if stats.prefilter_skipped > 0 {
@@ -257,6 +241,7 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
         uid_validity,
         &config,
         from_restriction.as_deref(),
+        base_query.as_str(),
         &interrupted,
     )
 }
@@ -274,6 +259,7 @@ fn process_uids_with_resume(
     session_slot: &mut Session<imap::Connection>,
     uids: &[u32],
     config: &ImapScanConfig<'_>,
+    extractors: &[crate::extractor::Extractor],
     pb: &ProgressBar,
     initial_uid_validity: Option<u32>,
     interrupted: &Arc<AtomicBool>,
@@ -288,8 +274,14 @@ fn process_uids_with_resume(
             return Ok(total);
         }
         let before = done;
-        let result =
-            process_uid_set_with_progress(session_slot, &uids[done..], config, pb, &mut done);
+        let result = process_uid_set_with_progress(
+            session_slot,
+            &uids[done..],
+            config,
+            extractors,
+            pb,
+            &mut done,
+        );
         match result {
             Ok(stats) => {
                 total.processed += stats.processed;
@@ -422,10 +414,11 @@ fn process_uid_set(
     session: &mut Session<imap::Connection>,
     uids: &[u32],
     config: &ImapScanConfig<'_>,
+    extractors: &[crate::extractor::Extractor],
     pb: &ProgressBar,
 ) -> Result<ScanStats> {
     let mut done = 0usize;
-    process_uid_set_with_progress(session, uids, config, pb, &mut done)
+    process_uid_set_with_progress(session, uids, config, extractors, pb, &mut done)
 }
 
 /// Body of [`process_uid_set`] with an out parameter for how many UIDs
@@ -436,6 +429,7 @@ fn process_uid_set_with_progress(
     session: &mut Session<imap::Connection>,
     uids: &[u32],
     config: &ImapScanConfig<'_>,
+    extractors: &[crate::extractor::Extractor],
     pb: &ProgressBar,
     done: &mut usize,
 ) -> Result<ScanStats> {
@@ -470,7 +464,7 @@ fn process_uid_set_with_progress(
             // fatal; we'd rather fetch the body and have the extractor
             // decide than silently skip a real message.
             let parts = message.bodystructure().map(body_parts_from_structure);
-            let any_match = config.extractors.iter().any(|e| {
+            let any_match = extractors.iter().any(|e| {
                 if !e.matches_headers(from_domain.as_deref(), subject.as_deref()) {
                     return false;
                 }
@@ -525,7 +519,7 @@ fn process_uid_set_with_progress(
             let result = pipeline::run(
                 body,
                 &source,
-                config.extractors,
+                extractors,
                 config.targets,
                 pipeline::DkimPolicy::Enforce,
                 config.dry_run,
@@ -571,6 +565,14 @@ fn grow_backoff(current: Duration, max: Duration) -> Duration {
 /// safety net rescan on every wakeup costs little).
 const IDLE_KEEPALIVE: Duration = Duration::from_secs(5 * 60);
 
+/// Cap on IDLE wait when the extractor filesystem watcher is armed.
+/// A workaround, not a knob: the blocking IDLE API can't be woken by
+/// a `notify` event, so the shortest we ever park in IDLE is also the
+/// worst-case latency between an extractor edit and its retrigger.
+/// Ten seconds is a soft compromise between IMAP round-trip cost and
+/// perceived responsiveness.
+const EXTRACTOR_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Watch loop: IDLE → check for new UIDs → process → repeat.
 ///
 /// On transport errors we drop the session and rebuild with exponential
@@ -585,8 +587,13 @@ fn watch_loop(
     // when the selected extractors don't allow narrowing (or the
     // server rejected it during the initial scan).
     from_restriction: Option<&str>,
+    // The `--since`/`--before` window from the initial scan. Reused
+    // when an extractor change triggers a scoped rescan.
+    base_query: &str,
     interrupted: &Arc<AtomicBool>,
 ) -> Result<()> {
+    let mut extractor_watch = ExtractorWatch::start(config)?;
+
     let mut backoff = Duration::from_secs(1);
     // Tracked separately from `backoff`: a throttled server still
     // accepts connections, so only a successful fetch clears this.
@@ -598,11 +605,37 @@ fn watch_loop(
             return Ok(());
         }
 
+        // Poll the extractor filesystem watcher between IDLE calls.
+        // `poll` returns `Some(changed)` only when the debounce quiet
+        // period has elapsed since the last event, so an editor's
+        // multi-event save reloads once. Errors during the rescan
+        // don't stop the loop -- the next real edit will retry.
+        if let Some(watch) = extractor_watch.as_mut()
+            && let Some(changed) = watch.poll()
+            && let Err(e) = run_scoped_rescan(
+                &mut session,
+                config,
+                &changed,
+                base_query,
+                uid_validity,
+                interrupted,
+            )
+        {
+            warn!(error = %e, "extractor retrigger failed; will retry on next change");
+        }
+
         // IDLE until the server tells us something changed, our
-        // keepalive fires, or the underlying socket dies.
+        // keepalive fires, or the underlying socket dies. With the
+        // extractor watcher armed, shorten the wait so a manifest edit
+        // is picked up within seconds rather than waiting for the
+        // full 5-minute keepalive; the fs watcher itself has no way
+        // to break IDLE, so we poll it on wake.
+        let idle_timeout = extractor_watch
+            .as_ref()
+            .map_or(IDLE_KEEPALIVE, |_| EXTRACTOR_WATCH_POLL_INTERVAL);
         let wait_result = {
             let mut handle = session.idle();
-            handle.timeout(IDLE_KEEPALIVE).keepalive(false);
+            handle.timeout(idle_timeout).keepalive(false);
             handle.wait_while(|response| {
                 // Any EXISTS / RECENT means new mail; bail out and
                 // re-search. Anything else (e.g. FETCH flag updates
@@ -654,7 +687,12 @@ fn watch_loop(
         }
         info!(count = new_uids.len(), "new messages while watching");
         let pb = make_progress_bar(new_uids.len() as u64);
-        let fetch_result = process_uid_set(&mut session, &new_uids, config, &pb);
+        // Re-borrow the working extractor set: the poll above may
+        // have swapped it out.
+        let extractors = extractor_watch
+            .as_ref()
+            .map_or(config.extractors, |w| w.current.as_slice());
+        let fetch_result = process_uid_set(&mut session, &new_uids, config, extractors, &pb);
         pb.finish_and_clear();
         let stats = match fetch_result {
             Ok(stats) => stats,
@@ -703,6 +741,254 @@ fn watch_loop(
             *cursor = max;
         }
     }
+}
+
+/// Length of the "quiet period" after the last filesystem event
+/// before we consider the storm over and reload. `notify` fires
+/// several events for a single "save" from many editors (write, rename,
+/// chmod, ...); coalescing them keeps us from reloading three times in
+/// a row.
+const EXTRACTOR_RELOAD_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Filesystem watch on the extractor directories, plus the current
+/// working set of loaded extractors and their fingerprints. Only set
+/// up under `--watch` when `extractor_dirs` is non-empty; when
+/// [`ExtractorWatch::start`] returns `None` the watch loop just uses
+/// `config.extractors` as it always did.
+struct ExtractorWatch {
+    /// Extractors currently in use by the watch loop. Reloaded from
+    /// disk when the notify watcher fires; a mutation here changes
+    /// which extractors the IDLE-mail path runs.
+    current: Vec<crate::extractor::Extractor>,
+    /// name -> fingerprint at last successful load. Compared against a
+    /// fresh discovery to identify which extractors are new or changed
+    /// and need to be re-run against the initial scan window.
+    fingerprints: std::collections::HashMap<String, [u8; 32]>,
+    /// Directories the extractors were discovered from. Passed back
+    /// into `extractor::discover` on reload.
+    dirs: Vec<PathBuf>,
+    /// Channel drained on each loop iteration. Notify's own thread
+    /// pushes events here; we don't care what the event is, only
+    /// whether at least one arrived.
+    events: mpsc::Receiver<notify::Result<notify::Event>>,
+    /// Deadline at which the debounce quiet period elapses. `Some`
+    /// only while events have arrived but the reload hasn't fired
+    /// yet; each new event pushes it back by
+    /// [`EXTRACTOR_RELOAD_DEBOUNCE`]. Read non-blockingly by
+    /// [`poll`](Self::poll); never involves a sleep.
+    reload_at: Option<Instant>,
+    /// Kept alive so the notify thread keeps running; dropping it
+    /// stops the watch.
+    _watcher: notify::RecommendedWatcher,
+}
+
+impl ExtractorWatch {
+    fn start(config: &ImapScanConfig<'_>) -> Result<Option<Self>> {
+        if config.extractor_dirs.is_empty() {
+            return Ok(None);
+        }
+        // The initial `current` set is a fresh load from disk rather
+        // than the caller's `config.extractors` because we need to own
+        // it (the caller's slice has an unrelated lifetime) and the
+        // caller has already logged which extractors it selected.
+        // Any mismatch between the two would show up as a spurious
+        // "changed" set on the very first reload, which we don't want.
+        let current = crate::extractor::discover(config.extractor_dirs)
+            .context("initial extractor discovery for watch")?;
+        let fingerprints = fingerprint_map(&current);
+        let (watcher, events) = spawn_fs_watcher(config.extractor_dirs)?;
+        info!(
+            dirs = ?config.extractor_dirs,
+            "watching extractor directories for changes"
+        );
+        Ok(Some(ExtractorWatch {
+            current,
+            fingerprints,
+            dirs: config.extractor_dirs.to_vec(),
+            events,
+            reload_at: None,
+            _watcher: watcher,
+        }))
+    }
+
+    /// Non-blocking check for a pending extractor reload. Drains any
+    /// filesystem events (bumping the debounce deadline forward for
+    /// each), and if the deadline has elapsed, reloads from disk and
+    /// returns the extractors whose fingerprint changed (or that are
+    /// new). `None` means "nothing to do right now" -- either no
+    /// events pending, the debounce hasn't elapsed yet, or reload
+    /// happened but nothing meaningfully changed.
+    ///
+    /// Callers are responsible for running the scoped rescan against
+    /// the returned subset; the watch's `current`/`fingerprints` have
+    /// already been updated by the time this returns.
+    fn poll(&mut self) -> Option<Vec<crate::extractor::Extractor>> {
+        if self.drain_events() {
+            self.reload_at = Some(Instant::now() + EXTRACTOR_RELOAD_DEBOUNCE);
+        }
+        if !should_reload(Instant::now(), self.reload_at) {
+            return None;
+        }
+        self.reload_at = None;
+
+        let reloaded = match crate::extractor::discover(&self.dirs) {
+            Ok(v) => v,
+            Err(e) => {
+                // A broken manifest during editing is expected; leave
+                // `current` as-is so the IDLE mail path keeps working
+                // and try again on the next fs event.
+                warn!(error = %e, "reload after extractor change failed; keeping previous set");
+                return None;
+            }
+        };
+
+        let changed = diff_reloaded(&mut self.fingerprints, &reloaded);
+        self.current = reloaded;
+
+        if changed.is_empty() {
+            info!("extractors reloaded; no fingerprint changes");
+            return None;
+        }
+        info!(
+            count = changed.len(),
+            names = %changed.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(","),
+            "extractor change detected; retriggering against initial scan window"
+        );
+        Some(changed)
+    }
+
+    /// Non-blockingly drain every pending fs event. Returns `true`
+    /// when at least one arrived (so the caller can extend the
+    /// debounce deadline). A disconnected channel is logged once and
+    /// then reported as "no events" -- the watch thread has died but
+    /// there's no way to recover it here.
+    fn drain_events(&mut self) -> bool {
+        let mut drained_any = false;
+        loop {
+            match self.events.try_recv() {
+                Ok(_) => drained_any = true,
+                Err(mpsc::TryRecvError::Empty) => return drained_any,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    warn!("extractor filesystem watcher disconnected");
+                    return drained_any;
+                }
+            }
+        }
+    }
+}
+
+/// Should [`ExtractorWatch::poll`] reload right now, given the debounce
+/// deadline? `None` means "no events pending"; `Some(t)` means
+/// "reload after `t`." Pure, so testable without wall-clock time.
+fn should_reload(now: Instant, reload_at: Option<Instant>) -> bool {
+    reload_at.is_some_and(|t| now >= t)
+}
+
+/// Compare the reloaded extractor set against `fingerprints`,
+/// returning the subset whose fingerprint changed (or that appeared
+/// for the first time). Updates `fingerprints` in place to match the
+/// reloaded set, so a subsequent call with the same input returns
+/// nothing.
+///
+/// A missing entry is either new or renamed; both count as changed
+/// because their manifest could match messages the previous set
+/// wouldn't have run against. Removed extractors just drop out of
+/// `fingerprints`; no rescan is needed.
+fn diff_reloaded(
+    fingerprints: &mut std::collections::HashMap<String, [u8; 32]>,
+    reloaded: &[crate::extractor::Extractor],
+) -> Vec<crate::extractor::Extractor> {
+    let changed: Vec<_> = reloaded
+        .iter()
+        .filter(|e| match fingerprints.get(&e.name) {
+            Some(prev) => *prev != e.fingerprint(),
+            None => true,
+        })
+        .cloned()
+        .collect();
+    *fingerprints = fingerprint_map(reloaded);
+    changed
+}
+
+/// name -> fingerprint index over an extractor set.
+fn fingerprint_map(
+    extractors: &[crate::extractor::Extractor],
+) -> std::collections::HashMap<String, [u8; 32]> {
+    extractors
+        .iter()
+        .map(|e| (e.name.clone(), e.fingerprint()))
+        .collect()
+}
+
+/// Set up a `notify` recursive watch across `dirs`, returning the
+/// watcher (kept alive by the caller so its background thread keeps
+/// running) and a receiver for its events. Contents of the events
+/// don't matter to us; only whether at least one arrived.
+fn spawn_fs_watcher(
+    dirs: &[PathBuf],
+) -> Result<(
+    notify::RecommendedWatcher,
+    mpsc::Receiver<notify::Result<notify::Event>>,
+)> {
+    use notify::Watcher;
+    let (tx, rx) = mpsc::channel();
+    let mut watcher: notify::RecommendedWatcher =
+        notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            // A send failure just means the watch loop has exited
+            // and dropped the receiver; nothing to log about.
+            let _ = tx.send(res);
+        })
+        .context("initialising extractor filesystem watcher")?;
+    for dir in dirs {
+        watcher
+            .watch(dir, notify::RecursiveMode::Recursive)
+            .with_context(|| format!("watching extractor dir {}", dir.display()))?;
+    }
+    Ok((watcher, rx))
+}
+
+/// Run one bounded rescan of the initial `--since`/`--before` window
+/// with `extractors` as the working set. Existing dedup skips
+/// artifacts that would be re-emitted identically, so a no-op change
+/// doesn't spam the sinks. Used by the extractor watcher after
+/// [`ExtractorWatch::poll`] reports a fingerprint change.
+fn run_scoped_rescan(
+    session: &mut Session<imap::Connection>,
+    config: &ImapScanConfig<'_>,
+    extractors: &[crate::extractor::Extractor],
+    base_query: &str,
+    uid_validity: Option<u32>,
+    interrupted: &Arc<AtomicBool>,
+) -> Result<()> {
+    let (uids, _) = narrowed_uid_search(session, base_query, extractors)?;
+    if uids.is_empty() {
+        info!("rescan window is empty; nothing to retrigger");
+        return Ok(());
+    }
+    info!(
+        matched = uids.len(),
+        "UIDs to re-process for changed extractors"
+    );
+
+    let pb = make_progress_bar(uids.len() as u64);
+    let stats = process_uids_with_resume(
+        session,
+        &uids,
+        config,
+        extractors,
+        &pb,
+        uid_validity,
+        interrupted,
+    )?;
+    pb.finish_and_clear();
+    if stats.prefilter_skipped > 0 {
+        info!(
+            skipped = stats.prefilter_skipped,
+            fetched = stats.processed,
+            "rescan prefilter skipped body fetches"
+        );
+    }
+    Ok(())
 }
 
 /// Return UIDs strictly greater than `cursor`. Uses IMAP's `UID N:*`
@@ -789,6 +1075,59 @@ fn reselect(
         );
     }
     Ok(mbox.uid_validity)
+}
+
+/// Run one `UID SEARCH` narrowed by the given extractors' sender
+/// hints, falling back to the unnarrowed `base_query` if the server
+/// disliked the narrowed form (some servers reject deeply-nested `OR`
+/// chains). Returns the sorted UIDs and the restriction that actually
+/// worked -- `None` when narrowing was skipped (no hints available) or
+/// dropped after fallback, so the caller doesn't retry it on later
+/// searches within the same session.
+///
+/// Used by both the initial scan and the extractor-change rescan;
+/// the shape of the narrow-then-fallback is the same, only the caller
+/// context differs.
+fn narrowed_uid_search(
+    session: &mut Session<imap::Connection>,
+    base_query: &str,
+    extractors: &[crate::extractor::Extractor],
+) -> Result<(Vec<u32>, Option<String>)> {
+    // When every selected extractor names the senders it cares about,
+    // let the server drop everything else: no UID for a message we'd
+    // only discard in the prefilter. Correctness never rests on this,
+    // so a server that rejects the query just costs us the speedup.
+    let from_restriction = build_from_restriction(extractors);
+    let query = match &from_restriction {
+        Some(r) => format!("{base_query} {r}"),
+        None => base_query.to_string(),
+    };
+    let (mut uids, effective_restriction): (Vec<u32>, Option<String>) = match session
+        .uid_search(&query)
+    {
+        Ok(found) => (found.into_iter().collect(), from_restriction),
+        // Only a NO/BAD tagged response means the server disliked the
+        // query itself. Anything else is a transport failure, which
+        // retrying with a different query wouldn't fix and shouldn't
+        // hide.
+        Err(imap::Error::No(_) | imap::Error::Bad(_)) if from_restriction.is_some() => {
+            warn!(
+                query,
+                "narrowed UID SEARCH rejected by the server; falling back to the unnarrowed query"
+            );
+            let v: Vec<u32> = session
+                .uid_search(base_query)
+                .with_context(|| format!("UID SEARCH {base_query}"))?
+                .into_iter()
+                .collect();
+            (v, None)
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("UID SEARCH {query}")));
+        }
+    };
+    uids.sort_unstable();
+    Ok((uids, effective_restriction))
 }
 
 fn build_search_query(since: Option<&str>, before: Option<&str>) -> String {
@@ -1230,5 +1569,147 @@ mod tests {
             d = grow_backoff(d, RECONNECT_BACKOFF_MAX);
         }
         assert_eq!(d, RECONNECT_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn should_reload_holds_off_until_deadline() {
+        let now = Instant::now();
+        let past = now.checked_sub(Duration::from_millis(1)).unwrap_or(now);
+        let future = now + Duration::from_secs(1);
+
+        assert!(!should_reload(now, None), "no pending deadline");
+        assert!(!should_reload(now, Some(future)), "deadline in the future");
+        assert!(should_reload(now, Some(now)), "deadline is now");
+        assert!(should_reload(now, Some(past)), "deadline in the past");
+    }
+
+    /// Build a temporary extractors directory with one manifest per
+    /// name in `manifests` (mapped `name -> body`) and an empty
+    /// executable script alongside each. Returned tempdir owns the
+    /// tree so tests must keep it alive across `discover` calls.
+    #[cfg(unix)]
+    fn tmp_extractor_dir(manifests: &[(&str, &str)]) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        for (name, body) in manifests {
+            std::fs::write(dir.path().join(format!("{name}.yaml")), body).unwrap();
+            let script = dir.path().join(format!("{name}.py"));
+            std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diff_reloaded_reports_new_extractor() {
+        let dir = tmp_extractor_dir(&[("a", "name: a\n"), ("b", "name: b\n")]);
+        let first = crate::extractor::discover(&[dir.path().to_path_buf()]).unwrap();
+        // Seed the fingerprint map with just `a`; `b` should look new.
+        let mut fingerprints = fingerprint_map(
+            &first
+                .iter()
+                .filter(|e| e.name == "a")
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let changed = diff_reloaded(&mut fingerprints, &first);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].name, "b");
+        // Map now covers both.
+        assert!(fingerprints.contains_key("a"));
+        assert!(fingerprints.contains_key("b"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diff_reloaded_reports_manifest_edit() {
+        let dir = tmp_extractor_dir(&[("a", "name: a\norder: 100\n")]);
+        let before = crate::extractor::discover(&[dir.path().to_path_buf()]).unwrap();
+        let mut fingerprints = fingerprint_map(&before);
+
+        std::fs::write(dir.path().join("a.yaml"), "name: a\norder: 42\n").unwrap();
+        let after = crate::extractor::discover(&[dir.path().to_path_buf()]).unwrap();
+
+        let changed = diff_reloaded(&mut fingerprints, &after);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].name, "a");
+        assert_eq!(changed[0].order, 42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diff_reloaded_ignores_unchanged() {
+        let dir = tmp_extractor_dir(&[("a", "name: a\n")]);
+        let loaded = crate::extractor::discover(&[dir.path().to_path_buf()]).unwrap();
+        let mut fingerprints = fingerprint_map(&loaded);
+
+        let changed = diff_reloaded(&mut fingerprints, &loaded);
+        assert!(changed.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diff_reloaded_drops_removed_extractor_from_state() {
+        let dir = tmp_extractor_dir(&[("a", "name: a\n"), ("b", "name: b\n")]);
+        let both = crate::extractor::discover(&[dir.path().to_path_buf()]).unwrap();
+        let mut fingerprints = fingerprint_map(&both);
+        // Rediscover with `b` gone.
+        std::fs::remove_file(dir.path().join("b.yaml")).unwrap();
+        let just_a = crate::extractor::discover(&[dir.path().to_path_buf()]).unwrap();
+
+        let changed = diff_reloaded(&mut fingerprints, &just_a);
+        assert!(changed.is_empty(), "removals don't retrigger anything");
+        assert!(fingerprints.contains_key("a"));
+        assert!(
+            !fingerprints.contains_key("b"),
+            "removed extractor drops from state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diff_reloaded_picks_up_manifest_written_between_reloads() {
+        // Exercise the exact "new extractor dropped into the dir
+        // while --watch is running" flow: seed state from the first
+        // discovery, drop a new manifest, rediscover, and expect
+        // just the new one back.
+        let dir = tmp_extractor_dir(&[("a", "name: a\n")]);
+        let before = crate::extractor::discover(&[dir.path().to_path_buf()]).unwrap();
+        let mut fingerprints = fingerprint_map(&before);
+
+        // Write a second manifest + script the way `tmp_extractor_dir`
+        // does; the notify watcher would fire on this in production
+        // but we short-circuit to the diff.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(dir.path().join("b.yaml"), "name: b\n").unwrap();
+        let script = dir.path().join("b.py");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let after = crate::extractor::discover(&[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(after.len(), 2);
+
+        let changed = diff_reloaded(&mut fingerprints, &after);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].name, "b");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diff_reloaded_reports_only_the_changed_subset() {
+        let dir = tmp_extractor_dir(&[
+            ("a", "name: a\norder: 100\n"),
+            ("b", "name: b\norder: 100\n"),
+        ]);
+        let before = crate::extractor::discover(&[dir.path().to_path_buf()]).unwrap();
+        let mut fingerprints = fingerprint_map(&before);
+        // Touch only `b`.
+        std::fs::write(dir.path().join("b.yaml"), "name: b\norder: 5\n").unwrap();
+        let after = crate::extractor::discover(&[dir.path().to_path_buf()]).unwrap();
+
+        let changed = diff_reloaded(&mut fingerprints, &after);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].name, "b");
     }
 }
