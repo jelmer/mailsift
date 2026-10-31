@@ -679,8 +679,12 @@ fn year_from_event_artifact(path: &Path) -> Option<i32> {
 struct ReservationDates {
     #[serde(default, rename = "checkinTime")]
     checkin_time: Option<String>,
+    #[serde(default, rename = "checkinDate")]
+    checkin_date: Option<String>,
     #[serde(default, rename = "startTime")]
     start_time: Option<String>,
+    #[serde(default, rename = "pickupTime")]
+    pickup_time: Option<String>,
     #[serde(default, rename = "reservationFor")]
     reservation_for: Option<NestedDates>,
 }
@@ -753,7 +757,9 @@ fn year_from_reservation_artifact(path: &Path) -> Option<i32> {
             });
             [
                 r.checkin_time,
+                r.checkin_date,
                 r.start_time,
+                r.pickup_time,
                 nested.departure_time,
                 nested.start_date,
                 nested.door_time,
@@ -893,6 +899,13 @@ END:VCALENDAR\r
         let json = r#"{"@type":"LodgingReservation","checkinTime":"2026-08-15T15:00:00"}"#;
         let (_d, path) = write_temp(json, ".reservation.json");
         assert_eq!(year_from_reservation_artifact(&path), Some(2026));
+    }
+
+    #[test]
+    fn reservation_artifact_year_from_checkin_date() {
+        let json = r#"{"@type":"LodgingReservation","checkinDate":"2015-08-01T15:00:00+09:00"}"#;
+        let (_d, path) = write_temp(json, ".reservation.json");
+        assert_eq!(year_from_reservation_artifact(&path), Some(2015));
     }
 
     #[test]

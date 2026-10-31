@@ -22,7 +22,9 @@ use serde::Deserialize;
 use tracing::warn;
 
 use super::FileOutcome;
-use super::json_target::{derive_year, first_non_empty, read_and_parse, write_unless_newer};
+use super::json_target::{
+    derive_year, first_non_empty, read_and_parse, write_unless_newer, year_from_iso_prefix,
+};
 use super::sink::slugify;
 
 /// Identifying fields we pull out of a `.reservation.json` artifact.
@@ -56,8 +58,13 @@ struct Reservation {
     reservation_for: ReservationFor,
     #[serde(default)]
     checkin_time: Option<Scalar>,
+    /// schema.org's spelling; booking.com's JSON-LD uses this one.
+    #[serde(default)]
+    checkin_date: Option<Scalar>,
     #[serde(default)]
     start_time: Option<Scalar>,
+    #[serde(default)]
+    pickup_time: Option<Scalar>,
 }
 
 /// The nested `reservationFor`: a flight, trip, lodging or event.
@@ -206,7 +213,9 @@ impl Reservation {
         [
             for_.departure_time.as_ref(),
             self.checkin_time.as_ref(),
+            self.checkin_date.as_ref(),
             self.start_time.as_ref(),
+            self.pickup_time.as_ref(),
             for_.start_date.as_ref(),
             for_.door_time.as_ref(),
         ]
@@ -219,6 +228,12 @@ impl Reservation {
     /// parseable date candidate; falls back to the current year.
     fn year(&self) -> i32 {
         let dates: Vec<String> = self.date_candidates().collect();
+        if !dates.iter().any(|d| year_from_iso_prefix(d).is_some()) {
+            warn!(
+                number = self.number().as_deref().unwrap_or("-"),
+                "reservation has no date we recognise; filing under the current year"
+            );
+        }
         derive_year(dates.iter().map(|s| Some(s.as_str())))
     }
 }
@@ -502,6 +517,28 @@ mod tests {
             "checkinTime": "2026-08-15T15:00:00",
         }));
         assert_eq!(year_of(&r), 2026);
+    }
+
+    /// schema.org's own spelling, used by booking.com's JSON-LD.
+    #[test]
+    fn year_from_lodging_checkin_date() {
+        let r = parse(serde_json::json!({
+            "reservationNumber": "H2",
+            "checkinDate": "2015-08-01T15:00:00+09:00",
+            "checkoutDate": "2015-08-02T10:00:00+09:00",
+        }));
+        assert_eq!(year_of(&r), 2015);
+    }
+
+    #[test]
+    fn year_from_rental_car_pickup() {
+        let r = parse(serde_json::json!({
+            "@type": "RentalCarReservation",
+            "reservationNumber": "C1",
+            "pickupTime": "2015-03-02T09:00:00",
+            "dropoffTime": "2015-03-05T09:00:00",
+        }));
+        assert_eq!(year_of(&r), 2015);
     }
 
     #[test]
