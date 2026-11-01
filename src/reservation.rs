@@ -15,7 +15,8 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
+use chrono_tz::Tz;
 use icalendar::{Calendar, Component, DatePerhapsTime, Event, EventLike};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -79,7 +80,9 @@ struct FlightReservation {
 struct Flight {
     #[serde(default)]
     flight_number: Option<String>,
-    #[serde(default)]
+    /// schema.org's `Flight` has both; some airlines (Alaska) send only
+    /// `provider`.
+    #[serde(default, alias = "provider")]
     airline: Option<Airline>,
     #[serde(default)]
     departure_airport: Option<Place>,
@@ -439,11 +442,15 @@ fn render(r: Reservation) -> Option<SingleEvent> {
             let leg = flight_leg_code(&f.reservation_for);
             let summary = flight_summary(&f.reservation_for);
             let dep_label = airport_label(f.reservation_for.departure_airport.as_ref());
+            let dep_tz = airport_time_zone(f.reservation_for.departure_airport.as_ref());
+            let arr_tz = airport_time_zone(f.reservation_for.arrival_airport.as_ref());
             (
                 "flight",
                 summary,
-                f.reservation_for.departure_time,
-                f.reservation_for.arrival_time,
+                in_airport_zone(f.reservation_for.departure_time, dep_tz),
+                f.reservation_for
+                    .arrival_time
+                    .map(|t| in_airport_zone(t, arr_tz)),
                 dep_label,
                 f.id,
                 leg,
@@ -560,12 +567,26 @@ fn render(r: Reservation) -> Option<SingleEvent> {
     };
 
     let uid = uid_for(prefix, &id, leg.as_deref(), &summary, &dtstart);
+    // The booking reference is what a traveller reads out at check-in, so
+    // flights show it. Other kinds are left out: a restaurant's
+    // "reservation number" can be an internal UUID (Tebi).
+    let description = (prefix == "flight")
+        .then(|| {
+            id.reservation_number
+                .as_deref()
+                .or(id.reservation_id.as_deref())
+        })
+        .flatten()
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .map(|code| format!("Confirmation: {code}"));
     let body = render_ics(
         &uid,
         &dtstart,
         dtend.as_ref(),
         &summary,
         location.as_deref(),
+        description.as_deref(),
     );
     Some(SingleEvent {
         uid,
@@ -660,6 +681,39 @@ fn line_event(
     )
 }
 
+/// The airport's time zone, from its IATA code.
+fn airport_time_zone(place: Option<&Place>) -> Option<Tz> {
+    crate::airports::time_zone(place?.iata_code.as_deref()?)
+}
+
+/// A flight time read in its airport's time zone.
+///
+/// Airlines print departure and arrival times in each airport's local
+/// time, and their markup copies those clock times but not always the
+/// offset: Alaska Airlines stamps a Hawaii departure with -07:00 and keeps
+/// summer offsets after the DST change. So when the offset given is not
+/// the airport's offset at that moment, the clock time is read in the
+/// airport's zone instead; a floating time gets the airport's zone too.
+/// A UTC offset is left alone, since that is how a sender states an
+/// exact instant, as is a clock time that does not exist in the zone
+/// (inside a spring-forward gap).
+fn in_airport_zone(t: DateTimeField, tz: Option<Tz>) -> DateTimeField {
+    let Some(tz) = tz else { return t };
+    let wall = match &t {
+        DateTimeField::Zoned(dt) if dt.offset().local_minus_utc() == 0 => return t,
+        DateTimeField::Zoned(dt) if dt.with_timezone(&tz).offset().fix() == *dt.offset() => {
+            return t;
+        }
+        DateTimeField::Zoned(dt) => dt.naive_local(),
+        DateTimeField::Floating(dt) => *dt,
+        DateTimeField::Date(_) => return t,
+    };
+    match tz.from_local_datetime(&wall).earliest() {
+        Some(local) => DateTimeField::Zoned(local.fixed_offset()),
+        None => t,
+    }
+}
+
 fn airport_label(place: Option<&Place>) -> Option<String> {
     let place = place?;
     let code = place
@@ -667,7 +721,11 @@ fn airport_label(place: Option<&Place>) -> Option<String> {
         .as_deref()
         .or(place.identifier.as_deref())
         .map(str::to_string);
-    let name = place.name.clone();
+    // Some senders repeat the code as the name ("HNL (HNL)").
+    let name = place.name.clone().filter(|n| {
+        code.as_deref()
+            .is_none_or(|c| !n.trim().eq_ignore_ascii_case(c))
+    });
     match (code, name) {
         (Some(c), Some(n)) => Some(format!("{c} ({n})")),
         (Some(c), None) => Some(c),
@@ -738,6 +796,7 @@ fn render_ics(
     dtend: Option<&DateTimeField>,
     summary: &str,
     location: Option<&str>,
+    description: Option<&str>,
 ) -> String {
     let mut event = Event::new();
     let start: DatePerhapsTime = dtstart.into();
@@ -752,6 +811,9 @@ fn render_ics(
     }
     if let Some(loc) = location {
         event.location(loc);
+    }
+    if let Some(text) = description {
+        event.description(text);
     }
     let mut calendar = Calendar::new();
     calendar.push(event.done());
@@ -853,6 +915,128 @@ mod tests {
              END:VEVENT\r\n\
              END:VCALENDAR\r\n",
         );
+    }
+
+    #[test]
+    fn flight_offsets_that_disagree_with_the_airport_are_read_in_its_zone() {
+        // Shaped like Alaska Airlines' markup: the clock times are the
+        // airports' local times, the offsets are not (a Honolulu departure
+        // stamped -07:00, a Los Angeles arrival stamped -10:00), and the
+        // airline is under `provider` with the code repeated as the name.
+        let v = json!({
+            "@type": "FlightReservation",
+            "reservationId": "ABC123",
+            "reservationFor": {
+                "@type": "Flight",
+                "flightNumber": "100",
+                "provider": {"@type": "Airline", "name": "Example Airlines", "iataCode": "XA"},
+                "departureAirport": {"@type": "Airport", "name": "HNL", "iataCode": "HNL"},
+                "arrivalAirport": {"@type": "Airport", "name": "LAX", "iataCode": "LAX"},
+                "departureTime": "2026-11-03T14:07:00-07:00",
+                "arrivalTime": "2026-11-03T21:56:00-10:00"
+            }
+        });
+        let ev = first(convert(&v).unwrap());
+        assert_eq!(ev.uid, "flight-ABC123-XA100@mailsift");
+        assert!(
+            ev.body.contains("SUMMARY:Flight XA100: HNL -> LAX"),
+            "{}",
+            ev.body
+        );
+        // 14:07 in Honolulu (-10:00), 21:56 in Los Angeles (-08:00 in November).
+        assert!(ev.body.contains("DTSTART:20261104T000700Z"), "{}", ev.body);
+        assert!(ev.body.contains("DTEND:20261104T055600Z"), "{}", ev.body);
+        assert!(
+            ev.body.contains("DESCRIPTION:Confirmation: ABC123"),
+            "{}",
+            ev.body
+        );
+    }
+
+    #[test]
+    fn flight_summer_offset_after_the_dst_change_is_corrected() {
+        let v = json!({
+            "@type": "FlightReservation",
+            "reservationNumber": "ABC123",
+            "reservationFor": {
+                "@type": "Flight",
+                "flightNumber": "200",
+                "airline": {"iataCode": "XA"},
+                "departureAirport": {"iataCode": "LAX"},
+                "arrivalAirport": {"iataCode": "HNL"},
+                // Los Angeles is on -08:00 by 8 November.
+                "departureTime": "2026-11-08T08:00:00-07:00",
+                "arrivalTime": "2026-11-08T11:54:00-10:00"
+            }
+        });
+        let ev = first(convert(&v).unwrap());
+        assert!(ev.body.contains("DTSTART:20261108T160000Z"), "{}", ev.body);
+        assert!(ev.body.contains("DTEND:20261108T215400Z"), "{}", ev.body);
+    }
+
+    #[test]
+    fn floating_flight_times_get_the_airport_zone_and_utc_is_left_alone() {
+        let v = json!([
+            {
+                "@type": "FlightReservation",
+                "reservationNumber": "AAA",
+                "reservationFor": {
+                    "@type": "Flight",
+                    "flightNumber": "1",
+                    "airline": {"iataCode": "XA"},
+                    "departureAirport": {"iataCode": "HNL"},
+                    "arrivalAirport": {"iataCode": "LAX"},
+                    "departureTime": "2026-07-20T10:00:00",
+                    "arrivalTime": "2026-07-20T18:30:00"
+                }
+            },
+            {
+                "@type": "FlightReservation",
+                "reservationNumber": "BBB",
+                "reservationFor": {
+                    "@type": "Flight",
+                    "flightNumber": "2",
+                    "airline": {"iataCode": "XA"},
+                    "departureAirport": {"iataCode": "HNL"},
+                    "arrivalAirport": {"iataCode": "LAX"},
+                    "departureTime": "2026-07-20T20:00:00Z"
+                }
+            }
+        ]);
+        let events = convert(&v).unwrap();
+        assert!(
+            events[0].body.contains("DTSTART:20260720T200000Z"),
+            "{}",
+            events[0].body
+        );
+        // 18:30 in Los Angeles is -07:00 in July.
+        assert!(
+            events[0].body.contains("DTEND:20260721T013000Z"),
+            "{}",
+            events[0].body
+        );
+        assert!(
+            events[1].body.contains("DTSTART:20260720T200000Z"),
+            "{}",
+            events[1].body
+        );
+    }
+
+    #[test]
+    fn flight_from_an_unknown_airport_keeps_its_offset() {
+        let v = json!({
+            "@type": "FlightReservation",
+            "reservationNumber": "ABC123",
+            "reservationFor": {
+                "@type": "Flight",
+                "flightNumber": "300",
+                "airline": {"iataCode": "XA"},
+                "departureAirport": {"name": "Somewhere"},
+                "departureTime": "2026-07-20T10:00:00-07:00"
+            }
+        });
+        let ev = first(convert(&v).unwrap());
+        assert!(ev.body.contains("DTSTART:20260720T170000Z"), "{}", ev.body);
     }
 
     #[test]
