@@ -196,6 +196,13 @@ Watch refuses to continue if the mailbox's `UIDVALIDITY` changes
 between reconnects (server restored from backup or renumbered the
 mailbox); restart manually in that case.
 
+Watch saves how far it got, per account and mailbox, under
+`$XDG_STATE_HOME/mailsift/imap/`, so a restart picks up after the last
+processed message instead of scanning the whole mailbox again. The
+saved position is dropped when `UIDVALIDITY` has changed, and is not
+used with `--since`, `--before`, `--limit` or `--dry-run`. Pass
+`--rescan` to start from the top regardless.
+
 ### `maildir-scan`: walk a Maildir on disk
 
 ```sh

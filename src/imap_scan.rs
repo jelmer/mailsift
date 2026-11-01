@@ -119,6 +119,13 @@ pub struct ImapScanConfig<'a> {
     /// interrupted (SIGINT/SIGTERM); on transport errors the connection
     /// is rebuilt with exponential backoff.
     pub watch: bool,
+    /// Where this mailbox's scan position is kept. When set, the scan
+    /// resumes after the saved UID instead of starting from the top,
+    /// and the position is saved as messages are processed.
+    pub cursor_file: Option<&'a crate::imap_state::CursorFile>,
+    /// Ignore the saved position and scan the whole mailbox; it is
+    /// still saved afterwards.
+    pub rescan: bool,
 }
 
 pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
@@ -156,7 +163,28 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
         "selected (read-only)"
     );
 
-    let base_query = build_search_query(config.since, config.before);
+    let uid_validity = mbox.uid_validity;
+    if config.cursor_file.is_some() && uid_validity.is_none() {
+        warn!("server reports no UIDVALIDITY; the scan position can't be saved");
+    }
+    let resume_after = match config.cursor_file {
+        Some(file) if !config.rescan => file.load()?.and_then(|saved| {
+            let after = saved.resume_after(uid_validity);
+            if after.is_none() {
+                warn!(
+                    saved = saved.uid_validity,
+                    now = ?uid_validity,
+                    "UIDVALIDITY changed since the scan position was saved; scanning the whole mailbox"
+                );
+            }
+            after
+        }),
+        _ => None,
+    };
+    if let Some(last) = resume_after {
+        info!(after_uid = last, "resuming from the saved scan position");
+    }
+    let base_query = initial_search_query(resume_after, config.since, config.before);
     // When every selected extractor names the senders it cares about,
     // let the server drop everything else: no UID for a message we'd
     // only discard in the prefilter. Correctness never rests on this,
@@ -191,6 +219,10 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
             return Err(anyhow::Error::new(e).context(format!("UID SEARCH {query}")));
         }
     };
+    // `UID n:*` always includes the highest UID, even below n.
+    if let Some(last) = resume_after {
+        uids.retain(|&uid| uid > last);
+    }
     uids.sort_unstable();
     info!(matched = uids.len(), "UIDs returned by search");
 
@@ -206,8 +238,13 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
     // from `cursor+1` on every wakeup, and uid_validity ensures the
     // cursor is meaningful (if it changes we bail rather than chase a
     // renumbered mailbox).
-    let mut cursor = initial_uids.iter().copied().max().unwrap_or(0);
-    let uid_validity = mbox.uid_validity;
+    let mut cursor = initial_uids
+        .iter()
+        .copied()
+        .max()
+        .max(resume_after)
+        .unwrap_or(0);
+    let checkpoint = |last_uid: u32| save_cursor(config.cursor_file, uid_validity, last_uid);
 
     let pb = make_progress_bar(initial_uids.len() as u64);
     let stats = if config.watch {
@@ -224,9 +261,10 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
             &pb,
             uid_validity,
             &interrupted,
+            &checkpoint,
         )?
     } else {
-        process_uid_set(&mut session, initial_uids, &config, &pb)?
+        process_uid_set(&mut session, initial_uids, &config, &pb, &checkpoint)?
     };
     pb.finish_and_clear();
     if stats.prefilter_skipped > 0 {
@@ -277,6 +315,7 @@ fn process_uids_with_resume(
     pb: &ProgressBar,
     initial_uid_validity: Option<u32>,
     interrupted: &Arc<AtomicBool>,
+    checkpoint: &dyn Fn(u32),
 ) -> Result<ScanStats> {
     let mut total = ScanStats::default();
     let mut done = 0usize;
@@ -288,8 +327,14 @@ fn process_uids_with_resume(
             return Ok(total);
         }
         let before = done;
-        let result =
-            process_uid_set_with_progress(session_slot, &uids[done..], config, pb, &mut done);
+        let result = process_uid_set_with_progress(
+            session_slot,
+            &uids[done..],
+            config,
+            pb,
+            &mut done,
+            checkpoint,
+        );
         match result {
             Ok(stats) => {
                 total.processed += stats.processed;
@@ -423,9 +468,30 @@ fn process_uid_set(
     uids: &[u32],
     config: &ImapScanConfig<'_>,
     pb: &ProgressBar,
+    checkpoint: &dyn Fn(u32),
 ) -> Result<ScanStats> {
     let mut done = 0usize;
-    process_uid_set_with_progress(session, uids, config, pb, &mut done)
+    process_uid_set_with_progress(session, uids, config, pb, &mut done, checkpoint)
+}
+
+/// Save the scan position, if this run keeps one. A failure is logged
+/// rather than fatal: the mail was processed, and the worst case is a
+/// restart redoing it from the previous position.
+fn save_cursor(
+    file: Option<&crate::imap_state::CursorFile>,
+    uid_validity: Option<u32>,
+    last_uid: u32,
+) {
+    let (Some(file), Some(uid_validity)) = (file, uid_validity) else {
+        return;
+    };
+    if let Err(e) = file.save(uid_validity, last_uid) {
+        warn!(
+            error = format!("{e:#}"),
+            path = %file.path().display(),
+            "could not save the scan position"
+        );
+    }
 }
 
 /// Body of [`process_uid_set`] with an out parameter for how many UIDs
@@ -438,6 +504,7 @@ fn process_uid_set_with_progress(
     config: &ImapScanConfig<'_>,
     pb: &ProgressBar,
     done: &mut usize,
+    checkpoint: &dyn Fn(u32),
 ) -> Result<ScanStats> {
     let mut stats = ScanStats::default();
     for chunk in uids.chunks(FETCH_BATCH) {
@@ -489,6 +556,10 @@ fn process_uid_set_with_progress(
         body_set.sort_unstable();
 
         if body_set.is_empty() {
+            *done += chunk.len();
+            if let Some(&last) = chunk.last() {
+                checkpoint(last);
+            }
             continue;
         }
 
@@ -547,6 +618,9 @@ fn process_uid_set_with_progress(
         // still points at the first UID of the failing chunk, so a
         // resuming caller retries that chunk on the fresh connection.
         *done += chunk.len();
+        if let Some(&last) = chunk.last() {
+            checkpoint(last);
+        }
     }
     Ok(stats)
 }
@@ -659,7 +733,8 @@ fn watch_loop(
         }
         info!(count = new_uids.len(), "new messages while watching");
         let pb = make_progress_bar(new_uids.len() as u64);
-        let fetch_result = process_uid_set(&mut session, &new_uids, config, &pb);
+        let checkpoint = |last_uid: u32| save_cursor(config.cursor_file, uid_validity, last_uid);
+        let fetch_result = process_uid_set(&mut session, &new_uids, config, &pb, &checkpoint);
         pb.finish_and_clear();
         let stats = match fetch_result {
             Ok(stats) => stats,
@@ -794,6 +869,19 @@ fn reselect(
         );
     }
     Ok(mbox.uid_validity)
+}
+
+/// The first `UID SEARCH`: everything after the saved position when
+/// resuming, otherwise the requested date window.
+fn initial_search_query(
+    resume_after: Option<u32>,
+    since: Option<&str>,
+    before: Option<&str>,
+) -> String {
+    match resume_after {
+        Some(last) => format!("UID {}:*", last.saturating_add(1)),
+        None => build_search_query(since, before),
+    }
 }
 
 fn build_search_query(since: Option<&str>, before: Option<&str>) -> String {
@@ -1085,6 +1173,19 @@ mod tests {
             search_after_query(42, Some(r#"HEADER FROM "x.example""#)),
             r#"UID 43:* HEADER FROM "x.example""#
         );
+    }
+
+    #[test]
+    fn initial_search_resumes_after_the_saved_position() {
+        assert_eq!(
+            initial_search_query(Some(41), Some("1-Jan-2020"), None),
+            "UID 42:*"
+        );
+        assert_eq!(
+            initial_search_query(None, Some("1-Jan-2020"), None),
+            "SINCE 1-Jan-2020"
+        );
+        assert_eq!(initial_search_query(None, None, None), "ALL");
     }
 
     #[test]
