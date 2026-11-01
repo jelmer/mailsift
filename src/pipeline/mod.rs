@@ -327,7 +327,7 @@ pub fn run(
                     // still run the extractor.
                 }
                 DkimPolicy::Enforce { received_at } => {
-                    if !dkim::satisfies(&ex.require_dkim, &dkim_domains)
+                    if !dkim::satisfies(&ex.require_dkim, &dkim_domains, from_domain.as_deref())
                         && !received_before(received_at, ex.unsigned_before)
                     {
                         debug!(

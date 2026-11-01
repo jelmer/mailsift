@@ -126,11 +126,27 @@ fn first_auth_results(headers: &[MailHeader<'_>]) -> Option<String> {
 /// by the generic Shopify-template extractor, which doesn't want to
 /// hard-code a list of shop domains.
 ///
+/// The entry [`FROM_DOMAIN`] (`@from`) is satisfied by a signature
+/// from the message's own `From:` domain, a subdomain of it, or a
+/// parent of it (DMARC's relaxed alignment, without a public suffix
+/// list: nobody can pass DKIM for a domain they don't control). It is
+/// for templates that many senders share under their own domains, such
+/// as Shopify shops on custom domains (`d=shop.example` or
+/// `d=mail.shop.example` for `From: ...@shop.example`): the extractor
+/// still has to recognise the template, but a forger can only ever
+/// speak for their own domain.
+///
 /// Both sides are expected to be lowercased: extractor manifests
 /// normalise `require_dkim` at load time, and `passing_dkim_domains`
-/// lowercases on insert.
-pub fn satisfies(wanted: &[String], passing: &HashSet<String>) -> bool {
+/// lowercases on insert. `from_domain` is lowercased here.
+pub fn satisfies(wanted: &[String], passing: &HashSet<String>, from_domain: Option<&str>) -> bool {
     wanted.iter().any(|w| {
+        if w == FROM_DOMAIN {
+            let Some(from) = from_domain.map(str::to_ascii_lowercase) else {
+                return false;
+            };
+            return passing.iter().any(|p| aligned(p, &from));
+        }
         if let Some(suffix) = w.strip_prefix('.') {
             passing.iter().any(|p| {
                 p.len() > suffix.len() + 1
@@ -143,6 +159,19 @@ pub fn satisfies(wanted: &[String], passing: &HashSet<String>) -> bool {
     })
 }
 
+/// The `require_dkim` entry that means "signed by the sender's own domain".
+pub const FROM_DOMAIN: &str = "@from";
+
+/// `a` and `b` are the same domain, or one is a subdomain of the other.
+fn aligned(a: &str, b: &str) -> bool {
+    fn under(child: &str, parent: &str) -> bool {
+        child.len() > parent.len() + 1
+            && child.ends_with(parent)
+            && child.as_bytes()[child.len() - parent.len() - 1] == b'.'
+    }
+    !a.is_empty() && (a == b || under(a, b) || under(b, a))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +179,45 @@ mod tests {
 
     /// Parse `raw` and run the helper on the resulting headers. Keeps
     /// the tests terse without bringing back the old `&[u8]` wrapper.
+    fn satisfies_t(wanted: &[String], passing: &HashSet<String>) -> bool {
+        satisfies(wanted, passing, None)
+    }
+
+    #[test]
+    fn from_entry_accepts_the_sender_domain_and_its_relatives() {
+        let wanted = [FROM_DOMAIN.to_string()];
+        let set = |d: &str| HashSet::from([d.to_string()]);
+        // The From domain itself, a subdomain signing for it, a parent.
+        assert!(satisfies(
+            &wanted,
+            &set("shop.example"),
+            Some("shop.example")
+        ));
+        assert!(satisfies(
+            &wanted,
+            &set("mail.shop.example"),
+            Some("Shop.Example")
+        ));
+        assert!(satisfies(
+            &wanted,
+            &set("shop.example"),
+            Some("news.shop.example")
+        ));
+        // Someone else's domain, a lookalike suffix, or no From domain.
+        assert!(!satisfies(
+            &wanted,
+            &set("other.example"),
+            Some("shop.example")
+        ));
+        assert!(!satisfies(
+            &wanted,
+            &set("evilshop.example"),
+            Some("shop.example")
+        ));
+        assert!(!satisfies(&wanted, &set("shop.example"), None));
+        assert!(!satisfies(&wanted, &HashSet::new(), Some("shop.example")));
+    }
+
     fn domains(raw: &[u8]) -> HashSet<String> {
         let (headers, _) = parse_headers(raw).expect("test inputs are well-formed");
         passing_dkim_domains(&headers)
@@ -233,12 +301,12 @@ body";
     fn satisfies_helper() {
         let mut p = HashSet::new();
         p.insert("vendor.com".to_string());
-        assert!(satisfies(&["vendor.com".to_string()], &p));
-        assert!(satisfies(
+        assert!(satisfies_t(&["vendor.com".to_string()], &p));
+        assert!(satisfies_t(
             &["other.example".to_string(), "vendor.com".to_string()],
             &p
         ));
-        assert!(!satisfies(&["other.example".to_string()], &p));
+        assert!(!satisfies_t(&["other.example".to_string()], &p));
     }
 
     #[test]
@@ -246,17 +314,17 @@ body";
         let mut p = HashSet::new();
         p.insert("xyz.myshopify.com".to_string());
         // Suffix matches a subdomain.
-        assert!(satisfies(&[".myshopify.com".to_string()], &p));
+        assert!(satisfies_t(&[".myshopify.com".to_string()], &p));
         // Bare parent zone does NOT match the suffix form; the leading
         // dot specifically requires a subdomain.
         let mut bare = HashSet::new();
         bare.insert("myshopify.com".to_string());
-        assert!(!satisfies(&[".myshopify.com".to_string()], &bare));
+        assert!(!satisfies_t(&[".myshopify.com".to_string()], &bare));
         // Spoofed lookalike (`evil-myshopify.com`) doesn't match;
         // the suffix check insists on a dot before it.
         let mut evil = HashSet::new();
         evil.insert("evil-myshopify.com".to_string());
-        assert!(!satisfies(&[".myshopify.com".to_string()], &evil));
+        assert!(!satisfies_t(&[".myshopify.com".to_string()], &evil));
         // A passing domain that's literally the wanted entry (leading
         // dot included) must NOT match. The length guard insists on at
         // least one byte of subdomain before the suffix; without that
@@ -264,7 +332,7 @@ body";
         // any `.myshopify.com` requirement.
         let mut dotted = HashSet::new();
         dotted.insert(".myshopify.com".to_string());
-        assert!(!satisfies(&[".myshopify.com".to_string()], &dotted));
+        assert!(!satisfies_t(&[".myshopify.com".to_string()], &dotted));
     }
 
     #[test]
