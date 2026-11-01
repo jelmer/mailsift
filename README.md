@@ -203,6 +203,14 @@ saved position is dropped when `UIDVALIDITY` has changed, and is not
 used with `--since`, `--before`, `--limit` or `--dry-run`. Pass
 `--rescan` to start from the top regardless.
 
+The saved position also records a fingerprint of each extractor's
+manifest and script. When an extractor is added or changed, a restart
+first runs just that extractor over the earlier mail, searching only
+its `from_domains` when it has them, and then carries on. A changed
+catch-all extractor such as `schema-ld` still means a full pass, but
+only for that extractor. Shared helpers under `_lib/` aren't
+fingerprinted; use `--rescan` after changing those.
+
 ### `maildir-scan`: walk a Maildir on disk
 
 ```sh

@@ -7,6 +7,7 @@
 //! recorded under; when the server reports a different one the mailbox
 //! was renumbered and the cursor is ignored.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,11 @@ pub struct Cursor {
     pub uid_validity: u32,
     /// Every message up to and including this UID has been processed.
     pub last_uid: u32,
+    /// The extractors that processed them: name to fingerprint. One
+    /// that is missing here, or has a different fingerprint now, still
+    /// has to see the messages up to `last_uid`.
+    #[serde(default)]
+    pub extractors: BTreeMap<String, String>,
 }
 
 impl Cursor {
@@ -88,11 +94,17 @@ impl CursorFile {
         Ok(Some(cursor))
     }
 
-    pub fn save(&self, uid_validity: u32, last_uid: u32) -> Result<()> {
+    pub fn save(
+        &self,
+        uid_validity: u32,
+        last_uid: u32,
+        extractors: &BTreeMap<String, String>,
+    ) -> Result<()> {
         let cursor = Cursor {
             mailbox: self.mailbox.clone(),
             uid_validity,
             last_uid,
+            extractors: extractors.clone(),
         };
         let dir = self
             .path
@@ -118,6 +130,7 @@ mod tests {
             mailbox: "me@imap.example.org:993/INBOX".to_string(),
             uid_validity: 7,
             last_uid,
+            extractors: BTreeMap::from([("klm".to_string(), "abc".to_string())]),
         }
     }
 
@@ -129,8 +142,9 @@ mod tests {
             "me@imap.example.org:993/INBOX",
         );
         assert_eq!(file.load().unwrap(), None);
-        file.save(7, 41).unwrap();
-        file.save(7, 42).unwrap();
+        let extractors = BTreeMap::from([("klm".to_string(), "abc".to_string())]);
+        file.save(7, 41, &extractors).unwrap();
+        file.save(7, 42, &extractors).unwrap();
         assert_eq!(file.load().unwrap(), Some(cursor(42)));
     }
 

@@ -52,6 +52,7 @@ impl std::fmt::Display for MailboxNotFound {
 impl std::error::Error for MailboxNotFound {}
 
 /// How to authenticate to the IMAP server.
+#[derive(Clone, Copy)]
 pub enum AuthMethod<'a> {
     /// IMAP `LOGIN` with user + password.
     Login { user: &'a str, password: &'a str },
@@ -97,6 +98,7 @@ impl imap::Authenticator for XOAuth2Authenticator<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct ImapScanConfig<'a> {
     pub host: &'a str,
     pub port: u16,
@@ -167,22 +169,39 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
     if config.cursor_file.is_some() && uid_validity.is_none() {
         warn!("server reports no UIDVALIDITY; the scan position can't be saved");
     }
-    let resume_after = match config.cursor_file {
-        Some(file) if !config.rescan => file.load()?.and_then(|saved| {
-            let after = saved.resume_after(uid_validity);
-            if after.is_none() {
-                warn!(
-                    saved = saved.uid_validity,
-                    now = ?uid_validity,
-                    "UIDVALIDITY changed since the scan position was saved; scanning the whole mailbox"
-                );
-            }
-            after
-        }),
+    let saved = match config.cursor_file {
+        Some(file) if !config.rescan => file.load()?,
         _ => None,
     };
-    if let Some(last) = resume_after {
+    let resume_after = saved.as_ref().and_then(|saved| {
+        let after = saved.resume_after(uid_validity);
+        if after.is_none() {
+            warn!(
+                saved = saved.uid_validity,
+                now = ?uid_validity,
+                "UIDVALIDITY changed since the scan position was saved; scanning the whole mailbox"
+            );
+        }
+        after
+    });
+    if let (Some(last), Some(saved)) = (resume_after, &saved) {
         info!(after_uid = last, "resuming from the saved scan position");
+        let changed = changed_since(saved, config.extractors);
+        if !changed.is_empty() {
+            backfill(
+                &mut session,
+                &config,
+                &changed,
+                last,
+                uid_validity,
+                &interrupted,
+            )?;
+            if interrupted.load(Ordering::SeqCst) {
+                let _ = session.logout();
+                return Ok(());
+            }
+            save_cursor(config.cursor_file, uid_validity, last, config.extractors);
+        }
     }
     let base_query = initial_search_query(resume_after, config.since, config.before);
     // When every selected extractor names the senders it cares about,
@@ -244,7 +263,14 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
         .max()
         .max(resume_after)
         .unwrap_or(0);
-    let checkpoint = |last_uid: u32| save_cursor(config.cursor_file, uid_validity, last_uid);
+    let checkpoint = |last_uid: u32| {
+        save_cursor(
+            config.cursor_file,
+            uid_validity,
+            last_uid,
+            config.extractors,
+        )
+    };
 
     let pb = make_progress_bar(initial_uids.len() as u64);
     let stats = if config.watch {
@@ -374,6 +400,84 @@ fn process_uids_with_resume(
     Ok(total)
 }
 
+/// The extractors that haven't seen the mail up to the saved position:
+/// new ones, and ones whose manifest or script changed since.
+fn changed_since(
+    saved: &crate::imap_state::Cursor,
+    extractors: &[crate::extractor::Extractor],
+) -> Vec<crate::extractor::Extractor> {
+    extractors
+        .iter()
+        .filter(|e| saved.extractors.get(&e.name) != Some(&e.fingerprint))
+        .cloned()
+        .collect()
+}
+
+/// Run extractors that are new or changed since the saved position over
+/// the messages up to it, which every other extractor has already seen.
+/// The search is narrowed by their `from_domains` when they all have
+/// one, so adding or fixing a vendor extractor costs a few hundred
+/// messages rather than the whole mailbox.
+fn backfill(
+    session: &mut Session<imap::Connection>,
+    config: &ImapScanConfig<'_>,
+    changed: &[crate::extractor::Extractor],
+    through_uid: u32,
+    uid_validity: Option<u32>,
+    interrupted: &Arc<AtomicBool>,
+) -> Result<()> {
+    let names: Vec<&str> = changed.iter().map(|e| e.name.as_str()).collect();
+    let range = format!("UID 1:{through_uid}");
+    let restriction = build_from_restriction(changed);
+    info!(
+        extractors = ?names,
+        through_uid,
+        narrowed = restriction.is_some(),
+        "running new or changed extractors over earlier mail"
+    );
+    let found = match &restriction {
+        Some(r) => match session.uid_search(format!("{range} {r}")) {
+            Ok(found) => found,
+            Err(imap::Error::No(_) | imap::Error::Bad(_)) => {
+                warn!("narrowed UID SEARCH rejected by the server; backfilling unnarrowed");
+                session
+                    .uid_search(&range)
+                    .with_context(|| format!("UID SEARCH {range}"))?
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("UID SEARCH {range}"))),
+        },
+        None => session
+            .uid_search(&range)
+            .with_context(|| format!("UID SEARCH {range}"))?,
+    };
+    let mut uids: Vec<u32> = found.into_iter().filter(|&u| u <= through_uid).collect();
+    uids.sort_unstable();
+    info!(matched = uids.len(), "UIDs to backfill");
+
+    let subset = ImapScanConfig {
+        extractors: changed,
+        cursor_file: None,
+        ..*config
+    };
+    let pb = make_progress_bar(uids.len() as u64);
+    let stats = process_uids_with_resume(
+        session,
+        &uids,
+        &subset,
+        &pb,
+        uid_validity,
+        interrupted,
+        &|_| {},
+    )?;
+    pb.finish_and_clear();
+    info!(
+        fetched = stats.processed,
+        skipped = stats.prefilter_skipped,
+        "backfill done"
+    );
+    Ok(())
+}
+
 /// Open a fresh connection and authenticate. Used by both the initial
 /// call and the post-disconnect reconnect path in [`watch_loop`].
 fn connect_and_authenticate(config: &ImapScanConfig<'_>) -> Result<Session<imap::Connection>> {
@@ -481,11 +585,16 @@ fn save_cursor(
     file: Option<&crate::imap_state::CursorFile>,
     uid_validity: Option<u32>,
     last_uid: u32,
+    extractors: &[crate::extractor::Extractor],
 ) {
     let (Some(file), Some(uid_validity)) = (file, uid_validity) else {
         return;
     };
-    if let Err(e) = file.save(uid_validity, last_uid) {
+    let fingerprints = extractors
+        .iter()
+        .map(|e| (e.name.clone(), e.fingerprint.clone()))
+        .collect();
+    if let Err(e) = file.save(uid_validity, last_uid, &fingerprints) {
         warn!(
             error = format!("{e:#}"),
             path = %file.path().display(),
@@ -733,7 +842,14 @@ fn watch_loop(
         }
         info!(count = new_uids.len(), "new messages while watching");
         let pb = make_progress_bar(new_uids.len() as u64);
-        let checkpoint = |last_uid: u32| save_cursor(config.cursor_file, uid_validity, last_uid);
+        let checkpoint = |last_uid: u32| {
+            save_cursor(
+                config.cursor_file,
+                uid_validity,
+                last_uid,
+                config.extractors,
+            )
+        };
         let fetch_result = process_uid_set(&mut session, &new_uids, config, &pb, &checkpoint);
         pb.finish_and_clear();
         let stats = match fetch_result {
@@ -1173,6 +1289,42 @@ mod tests {
             search_after_query(42, Some(r#"HEADER FROM "x.example""#)),
             r#"UID 43:* HEADER FROM "x.example""#
         );
+    }
+
+    fn extractor(name: &str, fingerprint: &str) -> crate::extractor::Extractor {
+        crate::extractor::Extractor::for_tests(name, fingerprint)
+    }
+
+    #[test]
+    fn changed_since_picks_new_and_edited_extractors() {
+        let saved = crate::imap_state::Cursor {
+            mailbox: "m".to_string(),
+            uid_validity: 1,
+            last_uid: 10,
+            extractors: [("klm", "aaa"), ("ctrip", "bbb"), ("gone", "ccc")]
+                .into_iter()
+                .map(|(n, f)| (n.to_string(), f.to_string()))
+                .collect(),
+        };
+        let now = [
+            extractor("klm", "aaa"),
+            extractor("ctrip", "changed"),
+            extractor("amadeus", "new"),
+        ];
+        let names: Vec<String> = changed_since(&saved, &now)
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["ctrip", "amadeus"]);
+    }
+
+    /// A position saved before fingerprints were recorded says nothing
+    /// about which extractors saw the mail, so all of them have to.
+    #[test]
+    fn a_position_without_fingerprints_backfills_everything() {
+        let saved: crate::imap_state::Cursor =
+            serde_json::from_str(r#"{"mailbox":"m","uid_validity":1,"last_uid":10}"#).unwrap();
+        assert_eq!(changed_since(&saved, &[extractor("klm", "aaa")]).len(), 1);
     }
 
     #[test]
