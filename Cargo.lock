@@ -1212,7 +1212,7 @@ dependencies = [
 [[package]]
 name = "imap"
 version = "3.0.0-alpha.15"
-source = "git+https://github.com/jelmer/rust-imap?branch=gssapi#3d6be8930b385016e727e3b781915427603deb6f"
+source = "git+https://github.com/jelmer/rust-imap?branch=parse-error-variant#857bd0eb60751d26f6868eb313984ab2769611d1"
 dependencies = [
  "base64",
  "bufstream",
@@ -1229,8 +1229,7 @@ dependencies = [
 [[package]]
 name = "imap-proto"
 version = "0.16.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25f6af35c6a517aea5c72314abe90134980d2ae6a763809b50c208b3e429d71f"
+source = "git+https://github.com/jelmer/imap-proto?branch=empty-multipart#b2f06600b448127095a801b9b907243aa9879b42"
 dependencies = [
  "nom 7.1.3",
 ]

@@ -32,7 +32,7 @@ ctrlc = "3"
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["server", "http1", "tokio"], optional = true }
 icalendar = "0.16"
-imap = { git = "https://github.com/jelmer/rust-imap", branch = "gssapi", default-features = false, features = ["rustls-tls"] }
+imap = { git = "https://github.com/jelmer/rust-imap", branch = "parse-error-variant", default-features = false, features = ["rustls-tls"] }
 imap-proto = "0.16"
 indicatif = "0.18"
 indymilter = "0.3"
@@ -66,3 +66,8 @@ iso_currency = "0.7.1"
 assert_cmd = "2"
 indymilter-test = "0.2.0"
 tower = { version = "0.5", features = ["util"] }
+
+[patch.crates-io]
+# Accepts the multiparts without body parts that Gmail sends for some
+# attachments.
+imap-proto = { git = "https://github.com/jelmer/imap-proto", branch = "empty-multipart" }

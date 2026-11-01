@@ -29,11 +29,15 @@ use tracing::{debug, info, warn};
 use crate::extractor::BodyParts;
 use crate::pipeline::{self, PipelineTargets};
 
-/// How many UIDs we group into a single `UID FETCH` round trip. Bigger
-/// is fewer round trips but more memory pressure (each message's
-/// RFC822 body is buffered in full before we start processing). 50 is
-/// a comfortable midpoint for typical mail sizes.
-const FETCH_BATCH: usize = 50;
+/// How many UIDs go into one prefilter `UID FETCH` (headers and
+/// BODYSTRUCTURE only). Gmail delays every command by a fixed amount
+/// when it throttles an account, so fewer, larger commands matter more
+/// than response size here.
+const PREFILTER_BATCH: usize = 500;
+
+/// How many full messages go into one `UID FETCH RFC822`. Each body is
+/// buffered in full before processing starts, so this stays small.
+const BODY_BATCH: usize = 50;
 
 /// The mailbox named on the command line does not exist on the server. A
 /// caller mistake rather than an internal failure, so the CLI reports it
@@ -348,15 +352,18 @@ fn process_uids_with_resume(
     let mut fetch_backoff = Duration::from_secs(1);
     let mut reconnect_backoff = Duration::from_secs(1);
     let mut uid_validity = initial_uid_validity;
+    let mut quarantine = Quarantine::default();
     while done < uids.len() {
         if interrupted.load(Ordering::SeqCst) {
             return Ok(total);
         }
         let before = done;
+        let end = quarantine.slice_end(done, uids.len());
         let result = process_uid_set_with_progress(
             session_slot,
-            &uids[done..],
+            &uids[done..end],
             config,
+            quarantine.with_structure(uids[done]),
             pb,
             &mut done,
             checkpoint,
@@ -365,7 +372,39 @@ fn process_uids_with_resume(
             Ok(stats) => {
                 total.processed += stats.processed;
                 total.prefilter_skipped += stats.prefilter_skipped;
-                return Ok(total);
+            }
+            Err(e) if is_unparseable(&e) => {
+                // The server sent something we can't decode, so the
+                // session is out of step with it. Narrow down which
+                // message it was, on a fresh connection each time.
+                match quarantine.on_unparseable(uids, done) {
+                    Step::Isolate => warn!(
+                        error = format!("{e:#}"),
+                        "unparseable FETCH response; retrying these messages one at a time"
+                    ),
+                    Step::DropStructure(uid) => warn!(
+                        uid,
+                        error = format!("{e:#}"),
+                        "unparseable FETCH response; retrying without BODYSTRUCTURE"
+                    ),
+                    Step::Skip(uid) => {
+                        warn!(
+                            uid,
+                            error = format!("{e:#}"),
+                            "unparseable FETCH response even without BODYSTRUCTURE; skipping message"
+                        );
+                        done += 1;
+                        pb.inc(1);
+                        checkpoint(uid);
+                    }
+                }
+                *session_slot = match reconnect(config, &mut reconnect_backoff, interrupted) {
+                    Some(s) => s,
+                    None => return Ok(total),
+                };
+                if let Some(new_validity) = reselect(session_slot, config, uid_validity)? {
+                    uid_validity = Some(new_validity);
+                }
             }
             Err(e) => {
                 // Any forward progress means the connection was healthy
@@ -376,7 +415,7 @@ fn process_uids_with_resume(
                     fetch_backoff = Duration::from_secs(1);
                 }
                 warn!(
-                    error = %e,
+                    error = format!("{e:#}"),
                     done,
                     total = uids.len(),
                     ?fetch_backoff,
@@ -398,6 +437,65 @@ fn process_uids_with_resume(
         }
     }
     Ok(total)
+}
+
+/// Whether `e` came from a server response the IMAP parser couldn't
+/// decode, as opposed to a dead connection or a refusal.
+fn is_unparseable(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| matches!(c.downcast_ref::<imap::Error>(), Some(imap::Error::Parse(_))))
+}
+
+/// What to do about a fetch whose response couldn't be parsed.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Fetch the chunk again one message at a time to find the culprit.
+    Isolate,
+    /// This message fails on its own; fetch its prefilter headers
+    /// without BODYSTRUCTURE, which is where servers tend to go wrong.
+    DropStructure(u32),
+    /// It fails even then; give up on it.
+    Skip(u32),
+}
+
+/// Tracks the fallbacks for messages whose FETCH responses we can't
+/// parse, so that one of them can't stall a scan indefinitely.
+#[derive(Debug, Default)]
+struct Quarantine {
+    /// Fetch one UID at a time while the position is below this.
+    isolate_until: usize,
+    /// The UID to prefilter without BODYSTRUCTURE.
+    without_structure: Option<u32>,
+}
+
+impl Quarantine {
+    /// Where the next fetch from position `done` should stop.
+    fn slice_end(&self, done: usize, len: usize) -> usize {
+        if done < self.isolate_until {
+            done + 1
+        } else {
+            len
+        }
+    }
+
+    fn with_structure(&self, uid: u32) -> bool {
+        self.without_structure != Some(uid)
+    }
+
+    /// The fetch starting at position `done` of `uids` failed to parse.
+    fn on_unparseable(&mut self, uids: &[u32], done: usize) -> Step {
+        let uid = uids[done];
+        if done >= self.isolate_until {
+            // The chunk that failed is the one starting at `done`.
+            self.isolate_until = (done + PREFILTER_BATCH).min(uids.len());
+            Step::Isolate
+        } else if self.with_structure(uid) {
+            self.without_structure = Some(uid);
+            Step::DropStructure(uid)
+        } else {
+            Step::Skip(uid)
+        }
+    }
 }
 
 /// The extractors that haven't seen the mail up to the saved position:
@@ -553,14 +651,12 @@ struct ScanStats {
     prefilter_skipped: usize,
 }
 
-/// Walk `uids` in `FETCH_BATCH`-sized chunks, prefilter via
-/// `BODYSTRUCTURE` + headers, fetch RFC822 for survivors, run the
-/// pipeline over each body in parallel.
+/// Walk `uids` in `PREFILTER_BATCH`-sized chunks, prefilter via
+/// `BODYSTRUCTURE` + headers, fetch RFC822 for survivors in
+/// `BODY_BATCH`-sized batches, run the pipeline over each body in
+/// parallel.
 ///
-/// Batches the FETCH round trips: one network round trip per
-/// `FETCH_BATCH` messages instead of one per message. We still process
-/// each returned message serially; parallelising extraction is a
-/// separate change. Each batch starts with a cheap pre-pass that asks
+/// Each chunk starts with a cheap pre-pass that asks
 /// IMAP for the `From`/`Subject` headers plus `BODYSTRUCTURE`, so we
 /// can decide whether any extractor's `from_domains`, `subject_regex`,
 /// and `requires:` hints could match without paying for the full
@@ -575,7 +671,7 @@ fn process_uid_set(
     checkpoint: &dyn Fn(u32),
 ) -> Result<ScanStats> {
     let mut done = 0usize;
-    process_uid_set_with_progress(session, uids, config, pb, &mut done, checkpoint)
+    process_uid_set_with_progress(session, uids, config, true, pb, &mut done, checkpoint)
 }
 
 /// Save the scan position, if this run keeps one. A failure is logged
@@ -606,17 +702,24 @@ fn save_cursor(
 /// Body of [`process_uid_set`] with an out parameter for how many UIDs
 /// have been fully consumed. The callers in one-shot mode discard it;
 /// [`process_uids_with_resume`] reads it after a failure so it can resume
-/// from the next chunk on the next connection.
+/// from the next chunk on the next connection. Without `with_structure`
+/// the prefilter goes by headers alone.
 fn process_uid_set_with_progress(
     session: &mut Session<imap::Connection>,
     uids: &[u32],
     config: &ImapScanConfig<'_>,
+    with_structure: bool,
     pb: &ProgressBar,
     done: &mut usize,
     checkpoint: &dyn Fn(u32),
 ) -> Result<ScanStats> {
     let mut stats = ScanStats::default();
-    for chunk in uids.chunks(FETCH_BATCH) {
+    let prefilter_items = if with_structure {
+        "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)] BODYSTRUCTURE)"
+    } else {
+        "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])"
+    };
+    for chunk in uids.chunks(PREFILTER_BATCH) {
         pb.set_message(format!(
             "UIDs {}..={}",
             chunk.first().copied().unwrap_or(0),
@@ -625,10 +728,7 @@ fn process_uid_set_with_progress(
 
         let prefilter_set = uid_set(chunk);
         let prefilter_fetched = session
-            .uid_fetch(
-                &prefilter_set,
-                "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)] BODYSTRUCTURE)",
-            )
+            .uid_fetch(&prefilter_set, prefilter_items)
             .with_context(|| format!("UID FETCH {prefilter_set} prefilter"))?;
 
         let mut body_set: Vec<u32> = Vec::with_capacity(chunk.len());
@@ -672,55 +772,9 @@ fn process_uid_set_with_progress(
             continue;
         }
 
-        let set = uid_set(&body_set);
-        let fetched = session
-            .uid_fetch(&set, "(RFC822 INTERNALDATE)")
-            .with_context(|| format!("UID FETCH {set}"))?;
-
-        // Copy each message's body out of the IMAP buffer so we can
-        // drop the borrow on `fetched` (and the session) and feed the
-        // bodies to a worker pool. Each extractor run forks a Python
-        // subprocess, so the bottleneck is the OS scheduler, not Rust
-        // CPU; `rayon`'s default thread count works well here.
-        // INTERNALDATE is when the server took the message in, which
-        // the sender can't set; it gates `unsigned_before`.
-        let mut messages: Vec<(u32, Option<i64>, Vec<u8>)> = Vec::with_capacity(body_set.len());
-        for message in fetched.iter() {
-            let Some(uid) = message.uid else {
-                warn!("FETCH response without UID");
-                continue;
-            };
-            let Some(body) = message.body() else {
-                warn!(uid, "message has no RFC822 body");
-                pb.inc(1);
-                continue;
-            };
-            let received_at = message.internal_date().map(|d| d.timestamp());
-            messages.push((uid, received_at, body.to_vec()));
+        for batch in body_set.chunks(BODY_BATCH) {
+            stats.processed += fetch_and_process(session, batch, config, pb)?;
         }
-        drop(fetched);
-
-        stats.processed += messages.len();
-
-        messages.par_iter().for_each(|(uid, received_at, body)| {
-            debug!(uid, size = body.len(), "processing");
-            let source = format!("UID {uid}");
-            let result = pipeline::run(
-                body,
-                &source,
-                config.extractors,
-                config.targets,
-                pipeline::DkimPolicy::Enforce {
-                    received_at: *received_at,
-                },
-                config.dry_run,
-                None,
-            );
-            if let Err(e) = result {
-                warn!(uid = *uid, error = %e, "pipeline failed");
-            }
-            pb.inc(1);
-        });
         // A chunk is only counted as done once every UID in it has been
         // fully processed (either prefiltered out or fetched and pushed
         // through the pipeline). If we return with an error, `*done`
@@ -732,6 +786,66 @@ fn process_uid_set_with_progress(
         }
     }
     Ok(stats)
+}
+
+/// Fetch the full messages for `uids` and run the pipeline over them.
+/// Returns how many messages were processed.
+fn fetch_and_process(
+    session: &mut Session<imap::Connection>,
+    uids: &[u32],
+    config: &ImapScanConfig<'_>,
+    pb: &ProgressBar,
+) -> Result<usize> {
+    let set = uid_set(uids);
+    let fetched = session
+        .uid_fetch(&set, "(RFC822 INTERNALDATE)")
+        .with_context(|| format!("UID FETCH {set}"))?;
+
+    // Copy each message's body out of the IMAP buffer so we can
+    // drop the borrow on `fetched` (and the session) and feed the
+    // bodies to a worker pool. Each extractor run forks a Python
+    // subprocess, so the bottleneck is the OS scheduler, not Rust
+    // CPU; `rayon`'s default thread count works well here.
+    // INTERNALDATE is when the server took the message in, which
+    // the sender can't set; it gates `unsigned_before`.
+    let mut messages: Vec<(u32, Option<i64>, Vec<u8>)> = Vec::with_capacity(uids.len());
+    for message in fetched.iter() {
+        let Some(uid) = message.uid else {
+            warn!("FETCH response without UID");
+            continue;
+        };
+        let Some(body) = message.body() else {
+            warn!(uid, "message has no RFC822 body");
+            pb.inc(1);
+            continue;
+        };
+        let received_at = message.internal_date().map(|d| d.timestamp());
+        messages.push((uid, received_at, body.to_vec()));
+    }
+    drop(fetched);
+
+    let processed = messages.len();
+
+    messages.par_iter().for_each(|(uid, received_at, body)| {
+        debug!(uid, size = body.len(), "processing");
+        let source = format!("UID {uid}");
+        let result = pipeline::run(
+            body,
+            &source,
+            config.extractors,
+            config.targets,
+            pipeline::DkimPolicy::Enforce {
+                received_at: *received_at,
+            },
+            config.dry_run,
+            None,
+        );
+        if let Err(e) = result {
+            warn!(uid = *uid, error = format!("{e:#}"), "pipeline failed");
+        }
+        pb.inc(1);
+    });
+    Ok(processed)
 }
 
 /// Maximum backoff between failed reconnect attempts. Capped so a
@@ -776,9 +890,6 @@ fn watch_loop(
     interrupted: &Arc<AtomicBool>,
 ) -> Result<()> {
     let mut backoff = Duration::from_secs(1);
-    // Tracked separately from `backoff`: a throttled server still
-    // accepts connections, so only a successful fetch clears this.
-    let mut fetch_backoff = Duration::from_secs(1);
     loop {
         if interrupted.load(Ordering::SeqCst) {
             info!("interrupted, leaving watch mode");
@@ -802,7 +913,7 @@ fn watch_loop(
         match wait_result {
             Ok(WaitOutcome::MailboxChanged) | Ok(WaitOutcome::TimedOut) => {}
             Err(e) => {
-                warn!(error = %e, "IDLE failed; reconnecting");
+                warn!(error = format!("{e:#}"), "IDLE failed; reconnecting");
                 session = match reconnect(config, &mut backoff, interrupted) {
                     Some(s) => s,
                     None => return Ok(()),
@@ -821,7 +932,10 @@ fn watch_loop(
         let new_uids = match search_after(&mut session, *cursor, from_restriction) {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "UID SEARCH after cursor failed; reconnecting");
+                warn!(
+                    error = format!("{e:#}"),
+                    "UID SEARCH after cursor failed; reconnecting"
+                );
                 session = match reconnect(config, &mut backoff, interrupted) {
                     Some(s) => s,
                     None => return Ok(()),
@@ -850,44 +964,24 @@ fn watch_loop(
                 config.extractors,
             )
         };
-        let fetch_result = process_uid_set(&mut session, &new_uids, config, &pb, &checkpoint);
+        // Failed fetches back off and reconnect inside, the same as
+        // during the initial scan, rather than exiting and leaving
+        // systemd to restart us at a flat rate.
+        let stats = process_uids_with_resume(
+            &mut session,
+            &new_uids,
+            config,
+            &pb,
+            uid_validity,
+            interrupted,
+            &checkpoint,
+        )?;
         pb.finish_and_clear();
-        let stats = match fetch_result {
-            Ok(stats) => stats,
-            // A fetch can die mid-batch when the server throttles us or
-            // drops the connection. Treat it like the IDLE and SEARCH
-            // failures above: back off and rebuild the session rather
-            // than exiting, which would leave systemd restarting us at
-            // a flat rate and burning its start limit. The cursor is
-            // left alone so the same UIDs are retried after reconnect.
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    ?fetch_backoff,
-                    "fetching new messages failed; backing off and reconnecting"
-                );
-                // Reconnecting usually succeeds even while the server
-                // is throttling fetches, so `reconnect`'s own backoff
-                // never grows. Sleep here instead, and keep growing it
-                // until a fetch actually works.
-                std::thread::sleep(fetch_backoff);
-                if interrupted.load(Ordering::SeqCst) {
-                    let _ = session.logout();
-                    return Ok(());
-                }
-                fetch_backoff = grow_backoff(fetch_backoff, FETCH_BACKOFF_MAX);
-                session = match reconnect(config, &mut backoff, interrupted) {
-                    Some(s) => s,
-                    None => return Ok(()),
-                };
-                if let Some(new_validity) = reselect(&mut session, config, uid_validity)? {
-                    uid_validity = Some(new_validity);
-                }
-                continue;
-            }
-        };
-        // Fetches are working again, so start over from 1 s.
-        fetch_backoff = Duration::from_secs(1);
+        if interrupted.load(Ordering::SeqCst) {
+            info!("interrupted, leaving watch mode");
+            let _ = session.logout();
+            return Ok(());
+        }
         if stats.prefilter_skipped > 0 {
             info!(
                 skipped = stats.prefilter_skipped,
@@ -957,7 +1051,7 @@ fn reconnect(
                 return Some(s);
             }
             Err(e) => {
-                warn!(error = %e, "reconnect failed");
+                warn!(error = format!("{e:#}"), "reconnect failed");
                 *backoff = grow_backoff(*backoff, RECONNECT_BACKOFF_MAX);
             }
         }
@@ -1461,6 +1555,62 @@ mod tests {
         .into();
         assert!(err.is::<MailboxNotFound>());
         assert_eq!(err.to_string(), "no such mailbox: archive");
+    }
+
+    #[test]
+    fn quarantine_narrows_down_to_one_message() {
+        let uids: Vec<u32> = (1..=PREFILTER_BATCH as u32 + 10).collect();
+        let mut q = Quarantine::default();
+        assert_eq!(q.slice_end(0, uids.len()), uids.len());
+        assert!(q.with_structure(1));
+
+        // A chunk fails: its messages are retried one at a time, up to
+        // the end of that chunk.
+        assert_eq!(q.on_unparseable(&uids, 0), Step::Isolate);
+        assert_eq!(q.slice_end(0, uids.len()), 1);
+        assert_eq!(q.slice_end(6, uids.len()), 7);
+        assert_eq!(
+            q.slice_end(PREFILTER_BATCH, uids.len()),
+            uids.len(),
+            "batching resumes after the failing chunk"
+        );
+
+        // The seventh message fails on its own.
+        assert_eq!(q.on_unparseable(&uids, 6), Step::DropStructure(7));
+        assert!(!q.with_structure(7));
+        assert!(q.with_structure(8));
+
+        // And again without BODYSTRUCTURE.
+        assert_eq!(q.on_unparseable(&uids, 6), Step::Skip(7));
+    }
+
+    #[test]
+    fn quarantine_isolates_a_short_last_chunk() {
+        let uids = [10, 20, 30];
+        let mut q = Quarantine::default();
+        assert_eq!(q.on_unparseable(&uids, 1), Step::Isolate);
+        assert_eq!(q.slice_end(1, uids.len()), 2);
+        assert_eq!(q.slice_end(2, uids.len()), 3);
+    }
+
+    #[test]
+    fn quarantine_starts_over_for_a_later_chunk() {
+        let uids: Vec<u32> = (1..=2 * PREFILTER_BATCH as u32).collect();
+        let mut q = Quarantine::default();
+        assert_eq!(q.on_unparseable(&uids, 0), Step::Isolate);
+        assert_eq!(q.on_unparseable(&uids, 3), Step::DropStructure(4));
+        assert_eq!(q.on_unparseable(&uids, PREFILTER_BATCH + 1), Step::Isolate);
+    }
+
+    #[test]
+    fn only_parse_errors_are_unparseable() {
+        let parse = anyhow::Error::new(imap::Error::Parse(imap::error::ParseError::Invalid(
+            b"* 1 FETCH (".to_vec(),
+        )))
+        .context("UID FETCH 1 prefilter");
+        assert!(is_unparseable(&parse));
+        let bye = anyhow::Error::new(imap::Error::ConnectionLost).context("UID FETCH 1 prefilter");
+        assert!(!is_unparseable(&bye));
     }
 
     #[test]
