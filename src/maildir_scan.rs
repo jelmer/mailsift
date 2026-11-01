@@ -258,7 +258,9 @@ pub fn run(config: MaildirScanConfig<'_>) -> Result<()> {
             &source,
             config.extractors,
             config.targets,
-            pipeline::DkimPolicy::Enforce,
+            pipeline::DkimPolicy::Enforce {
+                received_at: delivered_at(path),
+            },
             config.dry_run,
             None,
         );
@@ -281,9 +283,30 @@ fn make_progress_bar(len: u64) -> ProgressBar {
     pb
 }
 
+/// When the message was delivered, from the leading `<seconds>.` of
+/// its Maildir filename. The delivery agent picks that name, not the
+/// sender. A tool that synced the mail in later names it after the
+/// sync, which only errs late.
+fn delivered_at(path: &Path) -> Option<i64> {
+    let name = path.file_name()?.to_str()?;
+    let (secs, _) = name.split_once('.')?;
+    if secs.is_empty() || !secs.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    secs.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivered_at_reads_the_maildir_timestamp() {
+        let path = Path::new("/m/cur/1793486670.M160185P376498.rhonwyn,S=209878:2,a");
+        assert_eq!(delivered_at(path), Some(1793486670));
+        assert_eq!(delivered_at(Path::new("/m/cur/notes.txt")), None);
+        assert_eq!(delivered_at(Path::new("/m/cur/msg")), None);
+    }
     use std::fs;
 
     fn make_maildir(root: &Path) {

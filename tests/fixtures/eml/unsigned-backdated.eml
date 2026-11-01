@@ -1,0 +1,11 @@
+From: shop@legacy.fixture.test
+To: jelmer@example.org
+Subject: Order #ORD-42 confirmed
+Date: Mon, 3 Mar 2014 12:00:00 +0000
+Message-ID: <fixture-unsigned-backdated@legacy.fixture.test>
+Authentication-Results: example.org; spf=pass smtp.mailfrom=legacy.fixture.test
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Unsigned mail claiming to be from 2014. Only when we received it
+should decide whether the unsigned_before allowance applies.
