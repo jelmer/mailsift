@@ -32,7 +32,7 @@ ctrlc = "3"
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["server", "http1", "tokio"], optional = true }
 icalendar = "0.16"
-imap = { git = "https://github.com/jelmer/rust-imap", branch = "gssapi", default-features = false, features = ["rustls-tls"] }
+imap = { git = "https://github.com/jelmer/rust-imap", branch = "parse-error-variant", default-features = false, features = ["rustls-tls"] }
 imap-proto = "0.16"
 indicatif = "0.18"
 indymilter = "0.3"
