@@ -66,6 +66,7 @@ fn default_order() -> i32 {
     100
 }
 
+#[derive(Clone)]
 pub struct Extractor {
     pub name: String,
     pub script: PathBuf,
@@ -73,6 +74,9 @@ pub struct Extractor {
     pub require_dkim: Vec<String>,
     /// `unsigned_before`, as a unix timestamp (midnight UTC).
     pub unsigned_before: Option<i64>,
+    /// Hash of the manifest and script, so a scan can tell which
+    /// extractors changed since it last ran.
+    pub fingerprint: String,
     /// Compiled `from_domains` patterns (lowercased). Empty means
     /// "match any sender".
     from_domains: Vec<FromDomainPattern>,
@@ -88,6 +92,7 @@ pub struct Extractor {
 /// IMAP prefilter to decide, from a `BODYSTRUCTURE` response alone
 /// (without fetching the body), whether the extractor could possibly
 /// match the message.
+#[derive(Clone)]
 pub enum BodyRequirement {
     /// `requires: html`: needs a `text/html` part anywhere in the tree.
     Html,
@@ -108,6 +113,7 @@ pub enum BodyRequirement {
 /// Deliberately minimal; only the wildcard forms actually used in
 /// extractor manifests are supported, so we don't drag in a
 /// general-purpose glob crate.
+#[derive(Clone)]
 pub enum FilenamePattern {
     /// Exact (case-insensitive) match.
     Exact(String),
@@ -178,6 +184,7 @@ fn parse_body_requirement(raw: &str) -> Result<BodyRequirement> {
 }
 
 /// Compiled form of a single `from_domains` entry.
+#[derive(Clone)]
 enum FromDomainPattern {
     /// Exact match against the (lowercased) sender domain.
     Exact(String),
@@ -210,6 +217,23 @@ fn parse_from_domain(raw: &str) -> FromDomainPattern {
 }
 
 impl Extractor {
+    /// A bare extractor with no dispatch hints, for tests elsewhere in
+    /// the crate that can't reach the private fields.
+    #[cfg(test)]
+    pub(crate) fn for_tests(name: &str, fingerprint: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            script: PathBuf::from(format!("/nonexistent/{name}.py")),
+            order: 100,
+            require_dkim: Vec::new(),
+            unsigned_before: None,
+            fingerprint: fingerprint.to_string(),
+            from_domains: Vec::new(),
+            subject_regex: None,
+            body_requirements: Vec::new(),
+        }
+    }
+
     /// Return `true` when the manifest's `from_domains` /
     /// `subject_regex` hints don't rule this extractor out for the
     /// given message.
@@ -637,6 +661,9 @@ fn discover_into(dir: &Path, out: &mut Vec<Extractor>) -> Result<()> {
             .transpose()?;
 
         let unsigned_before = parse_unsigned_before(&manifest)?;
+        let script_body =
+            fs::read(&script_path).with_context(|| format!("reading {}", script_path.display()))?;
+        let fingerprint = fingerprint(body.as_bytes(), &script_body);
 
         // Lowercase `require_dkim` once at load time so the hot-path
         // `dkim::satisfies` comparison doesn't have to.
@@ -671,12 +698,26 @@ fn discover_into(dir: &Path, out: &mut Vec<Extractor>) -> Result<()> {
             order: manifest.order,
             require_dkim,
             unsigned_before,
+            fingerprint,
             from_domains,
             subject_regex,
             body_requirements,
         });
     }
     Ok(())
+}
+
+/// Hex SHA-256 over the manifest and the script, length-prefixed so
+/// bytes can't move from one into the other unnoticed. Helpers the
+/// script imports aren't covered; `imap-scan --rescan` is for those.
+fn fingerprint(manifest: &[u8], script: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for part in [manifest, script] {
+        h.update((part.len() as u64).to_be_bytes());
+        h.update(part);
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Parse `unsigned_before` into a timestamp. It only relaxes
@@ -849,6 +890,7 @@ mod tests {
             order: 100,
             require_dkim: Vec::new(),
             unsigned_before: None,
+            fingerprint: String::new(),
             from_domains: from_domains.into_iter().map(parse_from_domain).collect(),
             subject_regex: subject_regex.map(|s| regex::Regex::new(s).unwrap()),
             body_requirements,
@@ -1085,6 +1127,7 @@ mod tests {
             order: 100,
             require_dkim: Vec::new(),
             unsigned_before: None,
+            fingerprint: String::new(),
             from_domains: Vec::new(),
             subject_regex: None,
             body_requirements: Vec::new(),
@@ -1104,6 +1147,24 @@ mod tests {
         let mode = if executable { 0o755 } else { 0o644 };
         fs::set_permissions(&script, fs::Permissions::from_mode(mode)).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_follows_the_script() {
+        let dir = fixture("a", "name: a\n", true);
+        let before = discover(&[dir.path().to_path_buf()]).unwrap()[0]
+            .fingerprint
+            .clone();
+        assert_eq!(
+            discover(&[dir.path().to_path_buf()]).unwrap()[0].fingerprint,
+            before
+        );
+        fs::write(dir.path().join("a.py"), "#!/bin/sh\nexit 1\n").unwrap();
+        assert_ne!(
+            discover(&[dir.path().to_path_buf()]).unwrap()[0].fingerprint,
+            before
+        );
     }
 
     #[cfg(unix)]

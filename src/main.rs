@@ -410,8 +410,18 @@ struct ImapScanArgs {
     /// messages as they arrive (IMAP IDLE, RFC 2177). Runs until
     /// interrupted (Ctrl-C). On transport errors the connection is
     /// rebuilt with exponential backoff.
+    ///
+    /// The scan position is saved (under
+    /// `$XDG_STATE_HOME/mailsift/imap/`), so a restart carries on from
+    /// where the last run got to instead of rescanning the mailbox.
+    /// Not with `--since`, `--before`, `--limit` or `--dry-run`, which
+    /// describe a one-off window.
     #[arg(long)]
     watch: bool,
+    /// With `--watch`, ignore the saved scan position and start again
+    /// from the top of the mailbox.
+    #[arg(long, requires = "watch")]
+    rescan: bool,
 }
 
 /// Arguments for the `imap-auth` subcommand.
@@ -1498,6 +1508,7 @@ fn run() -> Result<()> {
                 no_stats,
                 no_dedup,
                 watch,
+                rescan,
             } = *args;
             let sink = target.build_sink(&config, runtime.handle())?;
             let seen = scan_seen_store(&sink, no_dedup, dry_run);
@@ -1576,6 +1587,26 @@ fn run() -> Result<()> {
             } else {
                 mailsift::stats::Recorder::default_file()
             };
+            let keeps_position =
+                watch && !dry_run && since.is_none() && before.is_none() && limit.is_none();
+            let cursor_file = if keeps_position {
+                let mailbox = format!(
+                    "{}@{}:{}/{}",
+                    resolved_user.as_deref().unwrap_or(""),
+                    target_imap.host,
+                    target_imap.port,
+                    target_imap.mailbox
+                );
+                let file = mailsift::imap_state::CursorFile::for_mailbox(&mailbox);
+                if file.is_none() {
+                    tracing::warn!(
+                        "neither XDG_STATE_HOME nor HOME is set; the scan position won't be saved"
+                    );
+                }
+                file
+            } else {
+                None
+            };
             imap_scan::run(imap_scan::ImapScanConfig {
                 host: &target_imap.host,
                 port: target_imap.port,
@@ -1601,6 +1632,8 @@ fn run() -> Result<()> {
                 },
                 dry_run,
                 watch,
+                cursor_file: cursor_file.as_ref(),
+                rescan,
             })
         }
         Command::ImapAuth(args) => run_imap_auth(args, runtime.handle()),
