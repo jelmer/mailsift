@@ -1,0 +1,7 @@
+name: fixture-legacy-shop
+order: 50
+from_domains:
+  - legacy.fixture.test
+require_dkim:
+  - legacy.fixture.test
+unsigned_before: "2019-01-01"

@@ -53,6 +53,13 @@ pub struct Manifest {
     /// notifications are DKIM-signed under a shared parent zone.
     #[serde(default)]
     pub require_dkim: Vec<String>,
+    /// Date (`YYYY-MM-DD`, UTC) the vendor started signing. Mail that
+    /// fails `require_dkim` is still accepted if we received it before
+    /// this date. "Received" is taken from the mail source (IMAP
+    /// INTERNALDATE, the Maildir delivery timestamp), never from
+    /// headers the sender wrote; without one, unsigned mail is refused.
+    #[serde(default)]
+    pub unsigned_before: Option<String>,
 }
 
 fn default_order() -> i32 {
@@ -64,6 +71,8 @@ pub struct Extractor {
     pub script: PathBuf,
     pub order: i32,
     pub require_dkim: Vec<String>,
+    /// `unsigned_before`, as a unix timestamp (midnight UTC).
+    pub unsigned_before: Option<i64>,
     /// Compiled `from_domains` patterns (lowercased). Empty means
     /// "match any sender".
     from_domains: Vec<FromDomainPattern>,
@@ -508,6 +517,13 @@ fn lint_one(
         }
     }
 
+    if let Err(e) = parse_unsigned_before(&manifest) {
+        issues.push(LintIssue {
+            source: manifest_path.to_path_buf(),
+            message: format!("{e:#}"),
+        });
+    }
+
     if let Some(re) = manifest.subject_regex.as_deref()
         && let Err(e) = regex::Regex::new(re)
     {
@@ -620,6 +636,8 @@ fn discover_into(dir: &Path, out: &mut Vec<Extractor>) -> Result<()> {
             })
             .transpose()?;
 
+        let unsigned_before = parse_unsigned_before(&manifest)?;
+
         // Lowercase `require_dkim` once at load time so the hot-path
         // `dkim::satisfies` comparison doesn't have to.
         let require_dkim = manifest
@@ -652,12 +670,37 @@ fn discover_into(dir: &Path, out: &mut Vec<Extractor>) -> Result<()> {
             script: script_path,
             order: manifest.order,
             require_dkim,
+            unsigned_before,
             from_domains,
             subject_regex,
             body_requirements,
         });
     }
     Ok(())
+}
+
+/// Parse `unsigned_before` into a timestamp. It only relaxes
+/// `require_dkim`, so declaring it without one is an error rather than
+/// a no-op.
+fn parse_unsigned_before(manifest: &Manifest) -> Result<Option<i64>> {
+    let Some(raw) = manifest.unsigned_before.as_deref() else {
+        return Ok(None);
+    };
+    if manifest.require_dkim.is_empty() {
+        return Err(anyhow!(
+            "extractor {}: unsigned_before needs require_dkim",
+            manifest.name
+        ));
+    }
+    let date = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").with_context(|| {
+        format!(
+            "extractor {}: unsigned_before {raw:?} is not a YYYY-MM-DD date",
+            manifest.name
+        )
+    })?;
+    Ok(Some(
+        date.and_time(chrono::NaiveTime::MIN).and_utc().timestamp(),
+    ))
 }
 
 /// Truncate `line` so the emitted log record can't be flooded by a huge
@@ -805,6 +848,7 @@ mod tests {
             script: PathBuf::from("/bin/true"),
             order: 100,
             require_dkim: Vec::new(),
+            unsigned_before: None,
             from_domains: from_domains.into_iter().map(parse_from_domain).collect(),
             subject_regex: subject_regex.map(|s| regex::Regex::new(s).unwrap()),
             body_requirements,
@@ -1040,6 +1084,7 @@ mod tests {
             script,
             order: 100,
             require_dkim: Vec::new(),
+            unsigned_before: None,
             from_domains: Vec::new(),
             subject_regex: None,
             body_requirements: Vec::new(),
@@ -1159,6 +1204,39 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert!(
             issues[0].message.contains("subject_regex"),
+            "got: {:?}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn lint_reports_unsigned_before_without_require_dkim() {
+        let dir = fixture(
+            "no-dkim",
+            "name: no-dkim\nunsigned_before: \"2019-01-01\"\n",
+            true,
+        );
+        let issues = lint(&[dir.path().to_path_buf()]);
+        let messages: Vec<&str> = issues.iter().map(|i| i.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            ["extractor no-dkim: unsigned_before needs require_dkim"]
+        );
+    }
+
+    #[test]
+    fn lint_reports_unsigned_before_that_is_not_a_date() {
+        let dir = fixture(
+            "bad-date",
+            "name: bad-date\nrequire_dkim: [example.com]\nunsigned_before: \"Jan 2019\"\n",
+            true,
+        );
+        let issues = lint(&[dir.path().to_path_buf()]);
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].message.starts_with(
+                "extractor bad-date: unsigned_before \"Jan 2019\" is not a YYYY-MM-DD date"
+            ),
             "got: {:?}",
             issues[0].message
         );

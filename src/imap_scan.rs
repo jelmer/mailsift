@@ -494,7 +494,7 @@ fn process_uid_set_with_progress(
 
         let set = uid_set(&body_set);
         let fetched = session
-            .uid_fetch(&set, "RFC822")
+            .uid_fetch(&set, "(RFC822 INTERNALDATE)")
             .with_context(|| format!("UID FETCH {set}"))?;
 
         // Copy each message's body out of the IMAP buffer so we can
@@ -502,7 +502,9 @@ fn process_uid_set_with_progress(
         // bodies to a worker pool. Each extractor run forks a Python
         // subprocess, so the bottleneck is the OS scheduler, not Rust
         // CPU; `rayon`'s default thread count works well here.
-        let mut messages: Vec<(u32, Vec<u8>)> = Vec::with_capacity(body_set.len());
+        // INTERNALDATE is when the server took the message in, which
+        // the sender can't set; it gates `unsigned_before`.
+        let mut messages: Vec<(u32, Option<i64>, Vec<u8>)> = Vec::with_capacity(body_set.len());
         for message in fetched.iter() {
             let Some(uid) = message.uid else {
                 warn!("FETCH response without UID");
@@ -513,13 +515,14 @@ fn process_uid_set_with_progress(
                 pb.inc(1);
                 continue;
             };
-            messages.push((uid, body.to_vec()));
+            let received_at = message.internal_date().map(|d| d.timestamp());
+            messages.push((uid, received_at, body.to_vec()));
         }
         drop(fetched);
 
         stats.processed += messages.len();
 
-        messages.par_iter().for_each(|(uid, body)| {
+        messages.par_iter().for_each(|(uid, received_at, body)| {
             debug!(uid, size = body.len(), "processing");
             let source = format!("UID {uid}");
             let result = pipeline::run(
@@ -527,7 +530,9 @@ fn process_uid_set_with_progress(
                 &source,
                 config.extractors,
                 config.targets,
-                pipeline::DkimPolicy::Enforce,
+                pipeline::DkimPolicy::Enforce {
+                    received_at: *received_at,
+                },
                 config.dry_run,
                 None,
             );

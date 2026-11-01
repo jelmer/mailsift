@@ -468,6 +468,12 @@ enum Command {
         /// what artifacts each producing extractor emitted.
         #[arg(long)]
         explain: bool,
+        /// When the message reached you (RFC 3339, or YYYY-MM-DD for
+        /// midnight UTC). Lets an extractor's `unsigned_before` accept
+        /// old unsigned mail; nothing in the message itself is trusted
+        /// for that, so without this flag unsigned mail is refused.
+        #[arg(long, value_parser = parse_received_at)]
+        received_at: Option<i64>,
     },
     /// Walk an IMAP mailbox and run the pipeline over each message.
     // Boxed: this variant's args dwarf the others, so an unboxed
@@ -1173,6 +1179,16 @@ fn render_paths(paths: &[PathBuf]) -> String {
         .join(", ")
 }
 
+/// Parse `replay --received-at` into a unix timestamp.
+fn parse_received_at(s: &str) -> Result<i64, String> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.timestamp());
+    }
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .map(|d| d.and_time(chrono::NaiveTime::MIN).and_utc().timestamp())
+        .map_err(|_| format!("{s:?} is neither RFC 3339 nor YYYY-MM-DD"))
+}
+
 /// Open the dedup store at its default location, best-effort: if it
 /// can't be opened we warn and run without it. The sinks stay correct
 /// either way; we just pay the network cost.
@@ -1399,6 +1415,7 @@ fn run() -> Result<()> {
             firefly,
             dry_run,
             explain,
+            received_at,
         } => {
             let sink = target.build_sink(&config, runtime.handle())?;
             let extractors_dir = resolve_extractors(extractors, &config);
@@ -1446,7 +1463,7 @@ fn run() -> Result<()> {
                     // happen. Dedup belongs to the daemon.
                     seen: None,
                 },
-                DkimPolicy::Enforce,
+                DkimPolicy::Enforce { received_at },
                 dry_run,
                 explain.then_some(&mut explain_buf),
             );

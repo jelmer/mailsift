@@ -129,7 +129,13 @@ pub enum DkimPolicy {
     /// imap-scan, and maildir-watch; modes where the message has
     /// already passed through our MTA's DKIM check and the topmost
     /// `Authentication-Results` header is trustworthy.
-    Enforce,
+    ///
+    /// `received_at` is when the message reached us, as a unix
+    /// timestamp, taken from the mail source rather than from the
+    /// message itself. It decides whether an extractor's
+    /// `unsigned_before` lets unsigned mail through; `None` means
+    /// unknown, and unsigned mail is refused.
+    Enforce { received_at: Option<i64> },
     /// Skip DKIM checks entirely. Used by the milter front-end, which
     /// sees mail before our MTA has authenticated it.
     Skip,
@@ -246,7 +252,7 @@ pub fn run(
         .unwrap_or_default();
 
     let dkim_domains = match dkim_policy {
-        DkimPolicy::Enforce => dkim::passing_dkim_domains(&parsed_headers),
+        DkimPolicy::Enforce { .. } => dkim::passing_dkim_domains(&parsed_headers),
         DkimPolicy::Skip => Default::default(),
     };
 
@@ -320,8 +326,10 @@ pub fn run(
                     // No-op: caller has chosen to skip DKIM checks. We
                     // still run the extractor.
                 }
-                DkimPolicy::Enforce => {
-                    if !dkim::satisfies(&ex.require_dkim, &dkim_domains) {
+                DkimPolicy::Enforce { received_at } => {
+                    if !dkim::satisfies(&ex.require_dkim, &dkim_domains)
+                        && !received_before(received_at, ex.unsigned_before)
+                    {
                         debug!(
                             extractor = %ex.name,
                             required = ?ex.require_dkim,
@@ -772,6 +780,12 @@ fn message_received_epoch(headers: &[mailparse::MailHeader<'_>]) -> Option<i64> 
 /// When the message was sent (`Date:`), or failing that when it was
 /// received, as unix seconds. This is what orders two messages about
 /// the same thing.
+/// Whether the message reached us before the vendor started signing.
+/// Unknown on either side means no.
+fn received_before(received_at: Option<i64>, unsigned_before: Option<i64>) -> bool {
+    matches!((received_at, unsigned_before), (Some(r), Some(cutoff)) if r < cutoff)
+}
+
 pub(crate) fn message_epoch(headers: &[mailparse::MailHeader<'_>]) -> Option<i64> {
     message_date_epoch(headers).or_else(|| message_received_epoch(headers))
 }

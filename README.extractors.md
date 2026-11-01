@@ -47,6 +47,8 @@ requires:                    # optional: body-shape requirements (all must hold)
 require_dkim:                # optional: only run on a passing DKIM signature
   - vendor.example           #   from one of these domains (leading `.` = suffix
   - ".vendor.example"        #   match, subdomains only, not the bare domain)
+unsigned_before: "2019-01-01" # optional: also accept unsigned mail received
+                             #   before this date (needs require_dkim)
 ```
 
 ### Fields
@@ -60,6 +62,7 @@ require_dkim:                # optional: only run on a passing DKIM signature
 | `subject_regex` | string          | no       | A regex applied to the `Subject:` header. Use `(?i)` for case-insensitive matching. |
 | `requires`      | list of strings | no       | Body-shape requirements; every entry must be satisfied. Supported shapes: `html`, `text`, `attachment:<type>/<subtype>`, `attachment:filename:<pattern>`. Filename patterns accept a single leading or trailing `*` (e.g. `*.ics`, `boarding-*`). |
 | `require_dkim`  | list of strings | no       | DKIM signing domains that authorise the message. Plain entries are exact matches; entries with a leading `.` are suffix matches against the signing domain (`.myshopify.com` matches `shop42.myshopify.com` but not `myshopify.com`). |
+| `unsigned_before` | `YYYY-MM-DD` | no     | When the vendor started signing (midnight UTC). Mail that fails `require_dkim` still runs if it was received before this date. Requires `require_dkim`. |
 
 ### Dispatch semantics
 
@@ -78,6 +81,16 @@ messages that lack the header entirely are skipped. The milter
 front-end, which sees mail before the MTA has authenticated it, can't
 enforce `require_dkim` and opts out of that check at run time - use
 `replay` or `imap-scan` for retroactive runs that need DKIM enforcement.
+
+`unsigned_before` is for vendors that only started signing at some
+point: their older mail has no signature to check. Whether a message
+predates the cutoff is decided by when it reached you, never by its
+`Date:` or `Received:` headers, which a forger writes. `imap-scan`
+uses the server's INTERNALDATE, `maildir-scan` the delivery timestamp
+at the start of the Maildir filename, and `replay` takes
+`--received-at`. Live delivery always arrives after the cutoff, and a
+message with no known arrival time is treated the same way, so
+unsigned mail is refused.
 
 Getting the hints right matters for performance, but they never change
 correctness: if a message slips through the prefilter, your script still
