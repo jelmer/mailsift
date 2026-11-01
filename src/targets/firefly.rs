@@ -159,7 +159,7 @@ pub fn register_best_effort(sink: Option<&FireflySink>, bill: BillForFirefly<'_>
         warn!(
             sink = "firefly",
             name = %name,
-            error = %e,
+            error = format!("{e:#}"),
             "Firefly registration failed; on-disk bill record is unaffected"
         );
     }
