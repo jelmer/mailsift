@@ -17,9 +17,13 @@
 //!
 //! [`redb`]: pure-Rust, single-file, ACID. The whole API surface we
 //! use is `open`, `begin_read` / `begin_write`, and one table lookup
-//! per call. Concurrent milter tasks coordinate via redb's
-//! single-writer / many-reader model; a write transaction is
-//! microsecond-scale so contention is a non-issue at our message rate.
+//! per call.
+//!
+//! redb lets only one process have a database open, and the milter, an
+//! `imap-scan --watch` and a one-off scan can all be running. So the
+//! store is opened for one transaction at a time, with its directory
+//! locked meanwhile: whoever else wants it waits a moment instead of
+//! finding it taken for as long as the first process lives.
 //!
 //! Worst case if the store is corrupt or missing: we re-issue an
 //! upstream call. Each gated target is idempotent (CalDAV PUT
@@ -28,12 +32,13 @@
 //! network round-trips, never lost data.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTableMetadata, TableDefinition};
 use sha2::{Digest, Sha256};
 use tracing::warn;
+
+use crate::targets::sink::lock_dir;
 
 /// Single redb table holding every seen entry. The key is
 /// `"<kind>:<dedup_key>"` (e.g. `"event:flight-fr1234@ryanair.com"`)
@@ -84,13 +89,10 @@ pub fn hash(payload: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// The dedup store. Cloneable: wraps an `Arc<Database>` so the
-/// milter's per-message tasks share a single open file handle.
+/// The dedup store. Cloneable, and cheap to share: it is only the
+/// path, since the file is opened afresh for each transaction.
 #[derive(Clone)]
 pub struct Store {
-    db: Arc<Database>,
-    /// Kept for log lines so a failing read/write tells the user which
-    /// file is at fault.
     path: PathBuf,
 }
 
@@ -98,23 +100,32 @@ impl Store {
     /// Open or create the redb file at `path`. The parent directory
     /// must already exist or be createable.
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let db = Database::create(path)
-            .with_context(|| format!("opening seen.db at {}", path.display()))?;
+        let store = Self {
+            path: path.to_path_buf(),
+        };
         // Ensure the table exists by opening it in a write txn; this
-        // is a no-op after the first run.
-        {
+        // is a no-op after the first run. Doing it here also reports
+        // an unusable store up front rather than on first use.
+        store.with_db(|db| {
             let txn = db.begin_write().context("seen.db: begin_write")?;
             txn.open_table(TABLE).context("seen.db: open_table")?;
-            txn.commit().context("seen.db: commit init txn")?;
-        }
-        Ok(Self {
-            db: Arc::new(db),
-            path: path.to_path_buf(),
-        })
+            txn.commit().context("seen.db: commit init txn")
+        })?;
+        Ok(store)
+    }
+
+    /// Run `f` against the database, holding it open (and its
+    /// directory locked against other users of the store) only for as
+    /// long as `f` takes.
+    fn with_db<T>(&self, f: impl FnOnce(&Database) -> Result<T>) -> Result<T> {
+        let dir = match self.path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let _lock = lock_dir(dir)?;
+        let db = Database::create(&self.path)
+            .with_context(|| format!("opening seen.db at {}", self.path.display()))?;
+        f(&db)
     }
 
     /// Default location: `$XDG_STATE_HOME/mailsift/seen.db`, falling
@@ -154,12 +165,14 @@ impl Store {
     }
 
     fn lookup(&self, composite: &str) -> Result<Option<String>> {
-        let txn = self.db.begin_read().context("seen.db: begin_read")?;
-        let table = txn.open_table(TABLE).context("seen.db: open_table")?;
-        Ok(table
-            .get(composite)
-            .context("seen.db: lookup")?
-            .map(|v| v.value().to_string()))
+        self.with_db(|db| {
+            let txn = db.begin_read().context("seen.db: begin_read")?;
+            let table = txn.open_table(TABLE).context("seen.db: open_table")?;
+            Ok(table
+                .get(composite)
+                .context("seen.db: lookup")?
+                .map(|v| v.value().to_string()))
+        })
     }
 
     /// Record `(kind, dedup_key) → content_hash`. Called from the
@@ -179,15 +192,16 @@ impl Store {
     }
 
     fn insert(&self, composite: &str, content_hash: &str) -> Result<()> {
-        let txn = self.db.begin_write().context("seen.db: begin_write")?;
-        {
-            let mut table = txn.open_table(TABLE).context("seen.db: open_table")?;
-            table
-                .insert(composite, content_hash)
-                .context("seen.db: insert")?;
-        }
-        txn.commit().context("seen.db: commit")?;
-        Ok(())
+        self.with_db(|db| {
+            let txn = db.begin_write().context("seen.db: begin_write")?;
+            {
+                let mut table = txn.open_table(TABLE).context("seen.db: open_table")?;
+                table
+                    .insert(composite, content_hash)
+                    .context("seen.db: insert")?;
+            }
+            txn.commit().context("seen.db: commit")
+        })
     }
 
     /// Number of rows. Cheap because redb keeps a length counter per
@@ -195,9 +209,11 @@ impl Store {
     /// report `seen.db` size.
     #[allow(dead_code)] // used by upcoming `stats` integration
     pub fn len(&self) -> Result<u64> {
-        let txn = self.db.begin_read().context("seen.db: begin_read")?;
-        let table = txn.open_table(TABLE).context("seen.db: open_table")?;
-        table.len().context("seen.db: len")
+        self.with_db(|db| {
+            let txn = db.begin_read().context("seen.db: begin_read")?;
+            let table = txn.open_table(TABLE).context("seen.db: open_table")?;
+            table.len().context("seen.db: len")
+        })
     }
 
     /// `true` when the store has no entries. Mirrors [`Self::len`]
@@ -218,6 +234,37 @@ mod tests {
         let path = dir.path().join("seen.db");
         let s = Store::open(&path).unwrap();
         (dir, s)
+    }
+
+    /// The milter, a watcher and a one-off scan each hold a `Store`
+    /// on the same file. None of them may shut the others out.
+    #[test]
+    fn several_stores_share_one_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("seen.db");
+        let milter = Store::open(&path).unwrap();
+        let scan = Store::open(&path).unwrap();
+
+        milter.mark(Kind::Event, "uid-1", "abc");
+        assert!(scan.is_seen(Kind::Event, "uid-1", "abc"));
+        scan.mark(Kind::Event, "uid-2", "def");
+        assert!(milter.is_seen(Kind::Event, "uid-2", "def"));
+    }
+
+    #[test]
+    fn stores_can_be_used_from_several_threads_at_once() {
+        let (_d, s) = store();
+        std::thread::scope(|scope| {
+            for n in 0..8 {
+                let s = &s;
+                scope.spawn(move || {
+                    let uid = format!("uid-{n}");
+                    s.mark(Kind::Event, &uid, "abc");
+                    assert!(s.is_seen(Kind::Event, &uid, "abc"));
+                });
+            }
+        });
+        assert_eq!(s.len().unwrap(), 8);
     }
 
     #[test]

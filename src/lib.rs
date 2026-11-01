@@ -6,10 +6,15 @@ pub mod extractor;
 #[cfg(feature = "gssapi")]
 pub mod gss;
 pub mod imap_scan;
+pub mod imap_state;
+pub mod maildir_scan;
 pub mod milter;
+pub mod oauth2;
 pub mod pipeline;
 pub mod reservation;
 pub mod seen;
 pub mod stats;
 pub mod targets;
 pub mod unforward;
+#[cfg(feature = "web")]
+pub mod web;

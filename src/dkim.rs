@@ -10,6 +10,12 @@
 //! We parse the header's `dkim=pass` items and collect their `header.d`
 //! (the signing domain). A manifest's `require_dkim` list is satisfied
 //! when at least one of the listed domains matches one of those.
+//!
+//! When a verifier reports only `header.i` (the AUID identifier) without
+//! `header.d`, as Gmail's `mx.google.com` does, we fall back to the
+//! domain portion of `header.i`. RFC 6376 §3.5 says the `i=` tag's
+//! domain must equal `d=` or be a subdomain of it, so treating the
+//! `i=` domain as a passing signing domain is safe.
 
 use std::collections::HashSet;
 
@@ -34,23 +40,48 @@ pub fn passing_dkim_domains(headers: &[MailHeader<'_>]) -> HashSet<String> {
     //
     // Comments may themselves contain `;`, so strip comments before
     // splitting on `;`. Then for each item that starts with `dkim=pass`,
-    // pull out its `header.d=` value.
+    // pull out its `header.d=` value. Some verifiers (notably Gmail)
+    // emit `header.i=` without `header.d=`; fall back to the domain
+    // portion of the AUID for those.
     let header = strip_comments(&header);
     for item in header.split(';') {
         let item = item.trim();
         if !item.starts_with("dkim=pass") {
             continue;
         }
+        let mut d: Option<String> = None;
+        let mut i_domain: Option<String> = None;
         for token in item.split_whitespace() {
-            if let Some(domain) = token.strip_prefix("header.d=") {
-                let d = domain.trim_end_matches(',').trim_matches('"');
-                if !d.is_empty() {
-                    out.insert(d.to_ascii_lowercase());
+            if let Some(v) = token.strip_prefix("header.d=") {
+                let v = clean_value(v);
+                if !v.is_empty() {
+                    d = Some(v.to_ascii_lowercase());
+                }
+            } else if let Some(v) = token.strip_prefix("header.i=") {
+                let v = clean_value(v);
+                // AUID is `local-part@domain` or `@domain`; take what
+                // follows the last `@`.
+                if let Some((_, dom)) = v.rsplit_once('@')
+                    && !dom.is_empty()
+                {
+                    i_domain = Some(dom.to_ascii_lowercase());
                 }
             }
         }
+        if let Some(d) = d {
+            out.insert(d);
+        } else if let Some(i) = i_domain {
+            out.insert(i);
+        }
     }
     out
+}
+
+/// Trim the surrounding decoration a verifier might attach to a
+/// `header.d=` / `header.i=` value: a trailing `,` from list
+/// punctuation, or wrapping double quotes.
+fn clean_value(v: &str) -> &str {
+    v.trim_end_matches(',').trim_matches('"')
 }
 
 /// Remove RFC 5322-style `(comment)` runs, including nested ones.
@@ -262,6 +293,48 @@ body";
         // a proper comment and gets replaced with a single space.
         let got = strip_comments("a) (secret) b");
         assert!(!got.contains("secret"));
+    }
+
+    /// Gmail reports `dkim=pass` with only `header.i=@domain`, no
+    /// `header.d=`. Fall back to the domain portion of `header.i` so
+    /// extractors with `require_dkim` still fire for Gmail-processed
+    /// mail.
+    #[test]
+    fn header_i_fallback_when_d_absent() {
+        let raw = b"\
+Authentication-Results: mx.google.com;\r
+\tdkim=pass header.i=@amazon.co.uk header.s=abc header.b=xyz;\r
+\tdkim=pass header.i=@amazonses.com header.s=def header.b=uvw\r
+From: x\r
+\r
+body";
+        expect_domains(raw, ["amazon.co.uk", "amazonses.com"]);
+    }
+
+    /// `header.i` may carry a local-part (`i=noreply@vendor.com`); the
+    /// domain half is the signing domain per RFC 6376 §3.5.
+    #[test]
+    fn header_i_with_local_part() {
+        let raw = b"\
+Authentication-Results: mx.google.com;\r
+\tdkim=pass header.i=noreply@vendor.com header.s=s1\r
+From: x\r
+\r
+body";
+        expect_domains(raw, ["vendor.com"]);
+    }
+
+    /// When both `header.d` and `header.i` are present, prefer `header.d`
+    /// (the signing domain as reported directly by the verifier).
+    #[test]
+    fn header_d_wins_over_header_i() {
+        let raw = b"\
+Authentication-Results: my.mta;\r
+\tdkim=pass header.d=vendor.com header.i=noreply@subs.vendor.com\r
+From: x\r
+\r
+body";
+        expect_domains(raw, ["vendor.com"]);
     }
 
     /// Regression: a `(comment with ; semicolon)` inside the value can't

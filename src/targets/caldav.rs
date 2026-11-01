@@ -10,7 +10,11 @@
 //! - the default calendar to file plain events into
 //!   (`CALDAV:schedule-default-calendar-URL` on the schedule inbox).
 //!
-//! Events are then PUT to `<collection>/<UID>.ics`. iMIP scheduling
+//! Events are then PUT to `<collection>/<UID>.ics`, unless the event
+//! already there is a newer take on it (per `DTSTAMP`). The PUT is
+//! conditional on the event not having changed since we looked
+//! (`If-Match` on its ETag), so another writer, or the user's calendar
+//! client, can't slip a newer take in underneath it. iMIP scheduling
 //! requests (an enclosing `METHOD:REQUEST`) go to the schedule inbox;
 //! everything else goes to the default calendar; that way the user's
 //! calendar app sees plain events directly while invitations still flow
@@ -39,7 +43,8 @@ use tracing::{debug, info};
 
 use super::http_auth::{self, Auth};
 use super::http_client::{build_client, truncate};
-use super::{FileOutcome, SingleEvent};
+use super::sink::log_kept;
+use super::{FileOutcome, SingleEvent, event_is_newer};
 
 /// Everything except RFC 3986 "unreserved" characters
 /// (`ALPHA / DIGIT / "-" / "." / "_" / "~"`) gets percent-encoded.
@@ -119,39 +124,60 @@ impl CaldavSink {
             &collections.default_calendar
         };
         let url = event_url(collection, &event.uid);
-        let body = event.body.clone();
-        let response = http_auth::send_with_auth_retry(&self.client, &self.auth, |client| {
-            client
-                .put(&url)
-                .header(
-                    reqwest::header::CONTENT_TYPE,
-                    "text/calendar; charset=utf-8",
-                )
-                .body(body.clone())
-        })
-        .await
-        .with_context(|| format!("PUT {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "CalDAV PUT to {url} returned {status}: {}",
-                truncate(&body, 200)
-            ));
-        }
-
-        match status {
-            StatusCode::CREATED => {
-                info!(target = %url, "event created");
-                Ok(FileOutcome::Created(url))
+        for _ in 0..http_auth::MAX_UPDATE_ATTEMPTS {
+            // Without a date there is nothing to order by: spare the
+            // GET and replace whatever is there.
+            let found = match event.dtstamp {
+                Some(_) => http_auth::get_if_exists(&self.client, &self.auth, &url).await?,
+                None => None,
+            };
+            if let Some(found) = &found
+                && event_is_newer(&found.body, &url, event.dtstamp)
+            {
+                return Ok(log_kept(url, "event"));
             }
-            _ => {
-                // 200, 204 etc.: existing resource updated.
-                info!(target = %url, %status, "event updated");
-                Ok(FileOutcome::Updated(url))
+            let response = http_auth::send_with_auth_retry(&self.client, &self.auth, |client| {
+                let request = client
+                    .put(&url)
+                    .header(
+                        reqwest::header::CONTENT_TYPE,
+                        "text/calendar; charset=utf-8",
+                    )
+                    .body(event.body.clone());
+                match event.dtstamp {
+                    Some(_) => http_auth::unless_changed(request, found.as_ref()),
+                    None => request,
+                }
+            })
+            .await
+            .with_context(|| format!("PUT {url}"))?;
+
+            let status = response.status();
+            if status == StatusCode::PRECONDITION_FAILED {
+                debug!(url, "changed since it was read; starting over");
+                continue;
             }
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(anyhow!(
+                    "CalDAV PUT to {url} returned {status}: {}",
+                    truncate(&body, 200)
+                ));
+            }
+
+            return match status {
+                StatusCode::CREATED => {
+                    info!(target = %url, "event created");
+                    Ok(FileOutcome::Created(url))
+                }
+                _ => {
+                    // 200, 204 etc.: existing resource updated.
+                    info!(target = %url, %status, "event updated");
+                    Ok(FileOutcome::Updated(url))
+                }
+            };
         }
+        Err(anyhow!("{url} kept changing while being updated"))
     }
 
     async fn ensure_collections(&self) -> Result<&Collections> {
@@ -398,6 +424,206 @@ mod tests {
         use std::sync::OnceLock;
         static RT: OnceLock<Runtime> = OnceLock::new();
         RT.get_or_init(|| Runtime::new().unwrap()).handle().clone()
+    }
+
+    use crate::targets::fake_dav::FakeDav;
+    use crate::targets::split_calendar;
+
+    fn undated_ics(summary: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\nBEGIN:VEVENT\r\n\
+UID:train-1\r\nDTSTART:20260201T100000Z\r\n\
+SUMMARY:{summary}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    fn event(summary: &str, dtstamp: Option<&str>) -> SingleEvent {
+        let event = split_calendar(&undated_ics(summary)).unwrap().remove(0);
+        match dtstamp {
+            Some(dtstamp) => event.with_dtstamp(dtstamp.parse().unwrap()).unwrap(),
+            None => event,
+        }
+    }
+
+    fn sink(server: &FakeDav) -> CaldavSink {
+        CaldavSink::new(
+            server.base_url.clone(),
+            Some("u".into()),
+            Some("p".into()),
+            test_handle(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn older_take_does_not_replace_event() {
+        let server = FakeDav::start();
+        let sink = sink(&server);
+        let rebooked = event("Rebooked", Some("2026-01-28T10:00:00Z"));
+        let original = event("Original", Some("2026-01-20T10:00:00Z"));
+
+        let first = sink.file(&rebooked).unwrap();
+        assert!(matches!(first, FileOutcome::Created(_)));
+        let second = sink.file(&original).unwrap();
+        assert!(matches!(second, FileOutcome::Kept(_)));
+        assert_eq!(
+            server.resource("/calendar/train-1.ics").unwrap(),
+            rebooked.body.as_bytes()
+        );
+    }
+
+    #[test]
+    fn newer_take_replaces_event() {
+        let server = FakeDav::start();
+        let sink = sink(&server);
+        let original = event("Original", Some("2026-01-20T10:00:00Z"));
+        let rebooked = event("Rebooked", Some("2026-01-28T10:00:00Z"));
+
+        sink.file(&original).unwrap();
+        let second = sink.file(&rebooked).unwrap();
+        assert!(matches!(second, FileOutcome::Updated(_)));
+        assert_eq!(
+            server.resource("/calendar/train-1.ics").unwrap(),
+            rebooked.body.as_bytes()
+        );
+    }
+
+    /// Another writer files a newer take between our GET and our PUT.
+    /// Our PUT must not land on top of it.
+    #[test]
+    fn newer_take_that_overtakes_us_is_not_overwritten() {
+        let server = FakeDav::start();
+        let sink = sink(&server);
+        sink.file(&event("Original", Some("2026-01-20T10:00:00Z")))
+            .unwrap();
+        let rebooked = event("Rebooked", Some("2026-01-28T10:00:00Z"));
+        server.overtake_after_next_get("/calendar/train-1.ics", rebooked.body.as_bytes());
+
+        let outcome = sink
+            .file(&event("Amended", Some("2026-01-25T10:00:00Z")))
+            .unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        assert_eq!(
+            server.resource("/calendar/train-1.ics").unwrap(),
+            rebooked.body.as_bytes()
+        );
+    }
+
+    /// The same, where no event was there when we looked.
+    #[test]
+    fn newer_take_created_under_us_is_not_overwritten() {
+        let server = FakeDav::start();
+        let sink = sink(&server);
+        let rebooked = event("Rebooked", Some("2026-01-28T10:00:00Z"));
+        server.overtake_after_next_get("/calendar/train-1.ics", rebooked.body.as_bytes());
+
+        let outcome = sink
+            .file(&event("Amended", Some("2026-01-25T10:00:00Z")))
+            .unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        assert_eq!(
+            server.resource("/calendar/train-1.ics").unwrap(),
+            rebooked.body.as_bytes()
+        );
+    }
+
+    #[test]
+    fn event_that_keeps_changing_is_an_error() {
+        let server = FakeDav::start();
+        let sink = sink(&server);
+        let original = event("Original", Some("2026-01-20T10:00:00Z"));
+        sink.file(&original).unwrap();
+        server.keep_changing("/calendar/train-1.ics");
+
+        let err = sink
+            .file(&event("Amended", Some("2026-01-25T10:00:00Z")))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{}calendar/train-1.ics kept changing while being updated",
+                server.base_url
+            )
+        );
+        assert_eq!(
+            server.resource("/calendar/train-1.ics").unwrap(),
+            original.body.as_bytes()
+        );
+    }
+
+    /// A lookup that fails must not be taken for "no event there".
+    #[test]
+    fn failing_lookup_is_an_error_and_nothing_is_put() {
+        let server = FakeDav::start();
+        let sink = sink(&server);
+        server.fail_gets_with("403 Forbidden");
+
+        let err = sink
+            .file(&event("Amended", Some("2026-01-25T10:00:00Z")))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "GET {}calendar/train-1.ics returned 403 Forbidden: ",
+                server.base_url
+            )
+        );
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.starts_with("PUT"))
+                .count(),
+            0
+        );
+    }
+
+    /// With nothing to order it by, an undated event replaces what is
+    /// there, as every event used to.
+    #[test]
+    fn undated_event_replaces_a_dated_one() {
+        let server = FakeDav::start();
+        let sink = sink(&server);
+        sink.file(&event("Dated", Some("2026-01-28T10:00:00Z")))
+            .unwrap();
+        let undated = event("Undated", None);
+
+        let outcome = sink.file(&undated).unwrap();
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+        assert_eq!(
+            server.resource("/calendar/train-1.ics").unwrap(),
+            undated.body.as_bytes()
+        );
+    }
+
+    #[test]
+    fn event_without_dtstamp_on_the_server_is_replaced() {
+        let server = FakeDav::start();
+        let sink = sink(&server);
+        server.put("/calendar/train-1.ics", undated_ics("Legacy").as_bytes());
+        let original = event("Original", Some("2026-01-20T10:00:00Z"));
+
+        let outcome = sink.file(&original).unwrap();
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+        assert_eq!(
+            server.resource("/calendar/train-1.ics").unwrap(),
+            original.body.as_bytes()
+        );
+    }
+
+    #[test]
+    fn undated_event_is_put_without_a_lookup() {
+        let server = FakeDav::start();
+        let sink = sink(&server);
+        sink.file(&event("Undated", None)).unwrap();
+        let requests = server.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| !r.starts_with("PROPFIND"))
+                .collect::<Vec<_>>(),
+            vec!["PUT /calendar/train-1.ics"]
+        );
     }
 
     #[test]

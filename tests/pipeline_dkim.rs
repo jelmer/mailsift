@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use assert_cmd::Command;
+mod common;
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -23,8 +23,7 @@ fn spoofed_message_produces_no_artifacts() {
 
     let out = tempfile::tempdir().expect("tempdir");
 
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("replay")
         .arg(&eml)
         .arg("--extractors")
@@ -57,8 +56,7 @@ fn signed_message_produces_artifact() {
 
     let out = tempfile::tempdir().expect("tempdir");
 
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("replay")
         .arg(&eml)
         .arg("--extractors")

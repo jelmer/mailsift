@@ -3,7 +3,8 @@
 //! Recognises the same set of reservation types the schema-ld extractor
 //! emits: `FlightReservation`, `TrainReservation`, `BusReservation`,
 //! `BoatReservation`, `LodgingReservation`, `EventReservation`,
-//! `FoodEstablishmentReservation`. Unknown / unparseable inputs are
+//! `FoodEstablishmentReservation`, `RentalCarReservation`. Unknown /
+//! unparseable inputs are
 //! skipped silently so the caller can move on without aborting the batch.
 //!
 //! The UID is derived from the reservation identifier (typically
@@ -14,7 +15,7 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
 use icalendar::{Calendar, Component, DatePerhapsTime, Event, EventLike};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -46,6 +47,8 @@ enum Reservation {
     Event(EventReservation),
     #[serde(rename = "FoodEstablishmentReservation")]
     Food(FoodReservation),
+    #[serde(rename = "RentalCarReservation")]
+    RentalCar(RentalCarReservation),
     #[serde(other)]
     Unknown,
 }
@@ -154,6 +157,27 @@ struct LodgingReservation {
     checkin_time: Option<DateTimeField>,
     #[serde(default, alias = "checkoutDate")]
     checkout_time: Option<DateTimeField>,
+}
+
+/// Car hire. Schema.org models the pickup/dropoff as `pickupTime` /
+/// `dropoffTime` with their own locations, and the vehicle itself
+/// under `reservationFor`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RentalCarReservation {
+    #[serde(flatten)]
+    id: ReservationId,
+    /// The vehicle. Rental mail quotes a model "or similar", so this
+    /// is a class rather than a specific car.
+    #[serde(default)]
+    reservation_for: Option<Place>,
+    #[serde(default)]
+    pickup_location: Option<Place>,
+    #[serde(default)]
+    dropoff_location: Option<Place>,
+    pickup_time: DateTimeField,
+    #[serde(default)]
+    dropoff_time: Option<DateTimeField>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,6 +305,7 @@ impl Address {
 ///   trailing `Z` is also OK)
 /// - Naive ISO 8601 (`2024-07-12T18:45:00`), treated as floating
 ///   local time
+/// - Date only (`2024-07-12`), rendered as an all-day component
 /// - Tebi's `InstantLocalizable(instant YY-MM-DDTHH:MM:SS[.fff]Z,
 ///   timeZone=..., style=...)` wrapper; the year is two digits and
 ///   we treat it as `20YY` (Tebi appeared after the millennium and
@@ -289,6 +314,10 @@ impl Address {
 enum DateTimeField {
     Zoned(DateTime<FixedOffset>),
     Floating(NaiveDateTime),
+    /// Date without a time. Rendered as an all-day (DATE-valued)
+    /// component; lodging reservations in particular often carry only
+    /// `checkinDate` / `checkoutDate`.
+    Date(NaiveDate),
 }
 
 impl<'de> Deserialize<'de> for DateTimeField {
@@ -319,6 +348,15 @@ fn parse_date_time(raw: &str) -> Option<DateTimeField> {
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M") {
         return Some(DateTimeField::Floating(dt));
     }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(DateTimeField::Floating(dt));
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M") {
+        return Some(DateTimeField::Floating(dt));
+    }
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(DateTimeField::Date(d));
+    }
     parse_instant_localizable(s)
 }
 
@@ -348,6 +386,7 @@ impl From<&DateTimeField> for DatePerhapsTime {
         match p {
             DateTimeField::Zoned(dt) => dt.with_timezone(&Utc).into(),
             DateTimeField::Floating(dt) => (*dt).into(),
+            DateTimeField::Date(d) => (*d).into(),
         }
     }
 }
@@ -395,8 +434,9 @@ pub fn convert_file(path: &Path) -> Result<Vec<SingleEvent>> {
 /// `Unknown` types or for cases where the required date/time isn't
 /// parseable.
 fn render(r: Reservation) -> Option<SingleEvent> {
-    let (prefix, summary, dtstart, dtend, location, id) = match r {
+    let (prefix, summary, dtstart, dtend, location, id, leg) = match r {
         Reservation::Flight(f) => {
+            let leg = flight_leg_code(&f.reservation_for);
             let summary = flight_summary(&f.reservation_for);
             let dep_label = airport_label(f.reservation_for.departure_airport.as_ref());
             (
@@ -406,6 +446,7 @@ fn render(r: Reservation) -> Option<SingleEvent> {
                 f.reservation_for.arrival_time,
                 dep_label,
                 f.id,
+                leg,
             )
         }
         Reservation::Train(t) => line_event("Train", t),
@@ -430,6 +471,7 @@ fn render(r: Reservation) -> Option<SingleEvent> {
                 l.checkout_time,
                 location,
                 l.id,
+                None,
             )
         }
         Reservation::Event(e) => {
@@ -450,6 +492,7 @@ fn render(r: Reservation) -> Option<SingleEvent> {
                 e.reservation_for.end_date,
                 location,
                 e.id,
+                None,
             )
         }
         Reservation::Food(f) => {
@@ -467,12 +510,56 @@ fn render(r: Reservation) -> Option<SingleEvent> {
                 .as_ref()
                 .and_then(|p| p.address.as_ref())
                 .and_then(Address::render);
-            ("restaurant", summary, f.start_time, None, location, f.id)
+            (
+                "restaurant",
+                summary,
+                f.start_time,
+                None,
+                location,
+                f.id,
+                None,
+            )
+        }
+        Reservation::RentalCar(r) => {
+            // Prefer the pickup branch's name for the summary: "Hire
+            // car from Porto Airport" reads better on a calendar than
+            // the vehicle class, which the description covers.
+            let pickup = r
+                .pickup_location
+                .as_ref()
+                .and_then(|p| p.name.clone())
+                .unwrap_or_else(|| "rental".to_string());
+            let location = r
+                .pickup_location
+                .as_ref()
+                .and_then(|p| p.address.as_ref())
+                .and_then(Address::render);
+            let vehicle = r.reservation_for.as_ref().and_then(|p| p.name.clone());
+            // One-way hires return the car somewhere else, which is
+            // worth saying up front; same-location hires stay terse.
+            let dropoff = r.dropoff_location.as_ref().and_then(|p| p.name.clone());
+            let route = match dropoff {
+                Some(d) if d != pickup => format!("{pickup} to {d}"),
+                _ => pickup,
+            };
+            let summary = match vehicle {
+                Some(v) => format!("Hire car ({v}) from {route}"),
+                None => format!("Hire car from {route}"),
+            };
+            (
+                "car",
+                summary,
+                r.pickup_time,
+                r.dropoff_time,
+                location,
+                r.id,
+                None,
+            )
         }
         Reservation::Unknown => return None,
     };
 
-    let uid = uid_for(prefix, &id, &summary, &dtstart);
+    let uid = uid_for(prefix, &id, leg.as_deref(), &summary, &dtstart);
     let body = render_ics(
         &uid,
         &dtstart,
@@ -484,17 +571,12 @@ fn render(r: Reservation) -> Option<SingleEvent> {
         uid,
         body,
         method: None,
+        dtstamp: None,
     })
 }
 
 fn flight_summary(f: &Flight) -> String {
-    let flight_no = f.flight_number.as_deref().unwrap_or_default();
-    let airline_code = f
-        .airline
-        .as_ref()
-        .and_then(|a| a.iata_code.as_deref())
-        .unwrap_or("");
-    let code = format!("{airline_code}{flight_no}");
+    let code = flight_leg_code(f).unwrap_or_default();
     let dep = airport_label(f.departure_airport.as_ref());
     let arr = airport_label(f.arrival_airport.as_ref());
     if code.is_empty() {
@@ -512,6 +594,23 @@ fn flight_summary(f: &Flight) -> String {
     }
 }
 
+/// The airline + flight number pair (`KL1012`) used to keep the legs of
+/// one booking apart in both the summary line and the calendar UID. All
+/// four legs of a return trip share the booking reference, so without
+/// this the UID would collapse and each leg's `.ics` file would clobber
+/// the last one written.
+fn flight_leg_code(f: &Flight) -> Option<String> {
+    let flight_no = f.flight_number.as_deref().unwrap_or("").trim();
+    let airline_code = f
+        .airline
+        .as_ref()
+        .and_then(|a| a.iata_code.as_deref())
+        .unwrap_or("")
+        .trim();
+    let code = format!("{airline_code}{flight_no}");
+    (!code.is_empty()).then_some(code)
+}
+
 fn line_event(
     kind: &str,
     r: LineReservation,
@@ -522,6 +621,7 @@ fn line_event(
     Option<DateTimeField>,
     Option<String>,
     ReservationId,
+    Option<String>,
 ) {
     let prefix: &'static str = match kind {
         "Train" => "train",
@@ -548,6 +648,7 @@ fn line_event(
         dep_label.as_deref().unwrap_or("?"),
         arr_label.as_deref().unwrap_or("?")
     );
+    let leg = (!number.is_empty()).then(|| number.to_string());
     (
         prefix,
         summary,
@@ -555,6 +656,7 @@ fn line_event(
         r.reservation_for.arrival_time,
         dep_label,
         r.id,
+        leg,
     )
 }
 
@@ -591,7 +693,13 @@ fn event_location_string(loc: Option<&EventLocation>) -> Option<String> {
     }
 }
 
-fn uid_for(prefix: &str, id: &ReservationId, summary: &str, dtstart: &DateTimeField) -> String {
+fn uid_for(
+    prefix: &str,
+    id: &ReservationId,
+    leg: Option<&str>,
+    summary: &str,
+    dtstart: &DateTimeField,
+) -> String {
     if let Some(value) = id
         .reservation_number
         .as_deref()
@@ -600,7 +708,14 @@ fn uid_for(prefix: &str, id: &ReservationId, summary: &str, dtstart: &DateTimeFi
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return format!("{prefix}-{value}@mailsift");
+        // Legs of one booking (a return flight, a multi-hop train) all
+        // share the reservation reference; append the flight number,
+        // train number, ... so each leg gets its own UID and doesn't
+        // overwrite its sibling on disk.
+        return match leg {
+            Some(l) => format!("{prefix}-{value}-{l}@mailsift"),
+            None => format!("{prefix}-{value}@mailsift"),
+        };
     }
     // Fallback: stable hash of the rendered summary and dtstart. The
     // typed model has already discarded fields we don't read, so we
@@ -611,6 +726,7 @@ fn uid_for(prefix: &str, id: &ReservationId, summary: &str, dtstart: &DateTimeFi
     match dtstart {
         DateTimeField::Zoned(dt) => hasher.update(dt.to_rfc3339().as_bytes()),
         DateTimeField::Floating(dt) => hasher.update(dt.to_string().as_bytes()),
+        DateTimeField::Date(d) => hasher.update(d.to_string().as_bytes()),
     }
     let hex = format!("{:x}", hasher.finalize());
     format!("{prefix}-{}@mailsift", &hex[..16])
@@ -668,7 +784,7 @@ mod tests {
             }
         });
         let ev = first(convert(&v).unwrap());
-        assert_eq!(ev.uid, "flight-ABCDEFG@mailsift");
+        assert_eq!(ev.uid, "flight-ABCDEFG-FR1234@mailsift");
         assert!(
             ev.body
                 .contains("SUMMARY:Flight FR1234: DUB (Dublin) -> BCN (Barcelona)")
@@ -767,8 +883,92 @@ mod tests {
         ]);
         let events = convert(&v).unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].uid, "flight-AAA@mailsift");
-        assert_eq!(events[1].uid, "flight-BBB@mailsift");
+        assert_eq!(events[0].uid, "flight-AAA-BA100@mailsift");
+        assert_eq!(events[1].uid, "flight-BBB-BA200@mailsift");
+    }
+
+    /// A four-leg return itinerary: outbound LHR-AMS-TRD, return
+    /// TRD-AMS-LHR. All four legs share the booking reference, so the
+    /// UID has to include the flight number for each leg to end up in
+    /// its own `.ics` file.
+    #[test]
+    fn multi_leg_itinerary_gets_a_uid_per_leg() {
+        let v = json!([
+            {
+                "@type": "FlightReservation",
+                "reservationNumber": "Y9ZO6Z",
+                "reservationFor": {
+                    "flightNumber": "1012",
+                    "airline": {"iataCode": "KL"},
+                    "departureAirport": {"iataCode": "LHR"},
+                    "arrivalAirport": {"iataCode": "AMS"},
+                    "departureTime": "2026-09-21T17:10:00"
+                }
+            },
+            {
+                "@type": "FlightReservation",
+                "reservationNumber": "Y9ZO6Z",
+                "reservationFor": {
+                    "flightNumber": "1155",
+                    "airline": {"iataCode": "KL"},
+                    "departureAirport": {"iataCode": "AMS"},
+                    "arrivalAirport": {"iataCode": "TRD"},
+                    "departureTime": "2026-09-21T20:40:00"
+                }
+            },
+            {
+                "@type": "FlightReservation",
+                "reservationNumber": "Y9ZO6Z",
+                "reservationFor": {
+                    "flightNumber": "1154",
+                    "airline": {"iataCode": "KL"},
+                    "departureAirport": {"iataCode": "TRD"},
+                    "arrivalAirport": {"iataCode": "AMS"},
+                    "departureTime": "2026-09-28T17:10:00"
+                }
+            },
+            {
+                "@type": "FlightReservation",
+                "reservationNumber": "Y9ZO6Z",
+                "reservationFor": {
+                    "flightNumber": "1017",
+                    "airline": {"iataCode": "KL"},
+                    "departureAirport": {"iataCode": "AMS"},
+                    "arrivalAirport": {"iataCode": "LHR"},
+                    "departureTime": "2026-09-28T20:40:00"
+                }
+            }
+        ]);
+        let uids: Vec<String> = convert(&v).unwrap().into_iter().map(|e| e.uid).collect();
+        assert_eq!(
+            uids,
+            vec![
+                "flight-Y9ZO6Z-KL1012@mailsift",
+                "flight-Y9ZO6Z-KL1155@mailsift",
+                "flight-Y9ZO6Z-KL1154@mailsift",
+                "flight-Y9ZO6Z-KL1017@mailsift",
+            ]
+        );
+    }
+
+    /// Without a flight number the UID stays at the bare reference.
+    /// Some extractors (the older KLM ticket mail) don't carry a
+    /// flight number per leg; falling back to the reference-only UID
+    /// keeps them at the current behaviour rather than inventing a
+    /// discriminator from thin air.
+    #[test]
+    fn flight_without_number_keeps_bare_uid() {
+        let v = json!({
+            "@type": "FlightReservation",
+            "reservationNumber": "AAA",
+            "reservationFor": {
+                "departureAirport": {"iataCode": "LHR"},
+                "arrivalAirport": {"iataCode": "AMS"},
+                "departureTime": "2026-01-01T10:00:00Z"
+            }
+        });
+        let ev = first(convert(&v).unwrap());
+        assert_eq!(ev.uid, "flight-AAA@mailsift");
     }
 
     #[test]
@@ -792,5 +992,112 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\r\n")
             + "\r\n"
+    }
+
+    #[test]
+    fn lodging_with_date_only_checkin_is_converted() {
+        // Airbnb-style `checkinDate` / `checkoutDate` are date-only.
+        // A reservation carrying them must still produce an event.
+        let json = serde_json::json!({
+            "@type": "LodgingReservation",
+            "reservationNumber": "HMABCD",
+            "reservationFor": {"@type": "LodgingBusiness", "name": "Some Hotel"},
+            "checkinDate": "2026-07-12",
+            "checkoutDate": "2026-07-15"
+        });
+        let events = convert(&json).expect("convert should succeed");
+        assert_eq!(events.len(), 1);
+        // Date-only input must render as an all-day (DATE-valued)
+        // component, not a midnight timestamp.
+        assert!(
+            events[0].body.contains("DTSTART;VALUE=DATE:20260712"),
+            "got: {}",
+            events[0].body
+        );
+        assert!(
+            events[0].body.contains("DTEND;VALUE=DATE:20260715"),
+            "got: {}",
+            events[0].body
+        );
+    }
+
+    #[test]
+    fn parse_date_time_accepts_date_only() {
+        assert!(parse_date_time("2026-07-12").is_some());
+    }
+
+    #[test]
+    fn parse_date_time_accepts_space_separator() {
+        let parsed =
+            parse_date_time("2025-08-28 12:00:00").expect("space-separated timestamp parses");
+        match parsed {
+            DateTimeField::Floating(dt) => {
+                assert_eq!(dt.to_string(), "2025-08-28 12:00:00");
+            }
+            other => panic!("expected Floating, got {other:?}"),
+        }
+        assert!(parse_date_time("2025-08-28 12:00").is_some());
+    }
+
+    #[test]
+    fn rental_car_reservation_renders_pickup_to_dropoff() {
+        let v = serde_json::json!({
+            "@type": "RentalCarReservation",
+            "reservationNumber": "H2050421475",
+            "pickupTime": "2017-03-10T18:00:00",
+            "dropoffTime": "2017-03-19T18:00:00",
+            "reservationFor": {"name": "Kia Picanto or similar"},
+            "pickupLocation": {
+                "name": "Grand Cayman, Georgetown - Cayman Airport",
+                "address": "250 Owens Robert Drive, Grand Cayman"
+            }
+        });
+        let ev = first(convert(&v).unwrap());
+        assert_eq!(ev.uid, "car-H2050421475@mailsift");
+        assert!(ev.body.contains("DTSTART:20170310T180000"));
+        assert!(ev.body.contains("DTEND:20170319T180000"));
+        assert!(ev.body.contains("LOCATION:250 Owens Robert Drive"));
+        assert!(
+            ev.body
+                .contains("SUMMARY:Hire car (Kia Picanto or similar) from Grand Cayman"),
+            "got: {}",
+            ev.body
+        );
+    }
+
+    #[test]
+    fn rental_car_one_way_names_both_ends() {
+        let v = serde_json::json!({
+            "@type": "RentalCarReservation",
+            "reservationNumber": "ONEWAY1",
+            "pickupTime": "2026-08-09T12:00:00",
+            "pickupLocation": {"name": "Porto"},
+            "dropoffLocation": {"name": "Lisbon"}
+        });
+        let ev = first(convert(&v).unwrap());
+        assert!(
+            ev.body.contains("SUMMARY:Hire car from Porto to Lisbon"),
+            "got: {}",
+            ev.body
+        );
+    }
+
+    #[test]
+    fn rental_car_same_location_is_not_repeated() {
+        // Round trips list the same branch twice; saying "Porto to
+        // Porto" would be noise.
+        let v = serde_json::json!({
+            "@type": "RentalCarReservation",
+            "reservationNumber": "ROUND1",
+            "pickupTime": "2026-08-09T12:00:00",
+            "pickupLocation": {"name": "Porto"},
+            "dropoffLocation": {"name": "Porto"}
+        });
+        let ev = first(convert(&v).unwrap());
+        assert!(
+            ev.body.contains("SUMMARY:Hire car from Porto\r\n"),
+            "got: {}",
+            ev.body
+        );
     }
 }

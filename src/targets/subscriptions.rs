@@ -5,22 +5,25 @@
 //! don't carry a per-cycle invoice number; a subscription is a
 //! recurring relationship, and re-running mailsift over a fresh
 //! confirmation should refresh the existing record (renewal date,
-//! current price) rather than file a sibling.
+//! current price) rather than file a sibling. The record always
+//! reflects the newest message seen for it, whatever order messages
+//! are processed in.
 //!
 //! The artifact JSON is schema.org-ish, but loose: extractors that
 //! recognise an `Offer` with a `subscriptionDuration` field can emit
 //! whatever they want, and unknown fields pass through.
 
-use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(test)]
+use std::fs;
+
+use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
-use tracing::info;
 
 use super::FileOutcome;
-use super::json_target::first_non_empty;
-use super::sink::{slugify, write_atomic};
+use super::json_target::{first_non_empty, read_and_parse, write_unless_newer};
+use super::sink::slugify;
 
 /// Shape we read out of a `.subscription.json` artifact. Loosely
 /// schema.org-shaped (most fields mirror `Offer` / `Subscription`).
@@ -41,11 +44,12 @@ impl Subscription {
     }
 }
 
-pub fn file_subscription(src: &Path, dir: &Path) -> Result<FileOutcome> {
-    let body = fs::read_to_string(src)
-        .with_context(|| format!("reading subscription source {}", src.display()))?;
-    let parsed: Subscription = serde_json::from_str(&body)
-        .with_context(|| format!("parsing subscription JSON {}", src.display()))?;
+pub fn file_subscription(
+    src: &Path,
+    dir: &Path,
+    received_at_epoch: Option<i64>,
+) -> Result<FileOutcome> {
+    let (body, parsed) = read_and_parse::<Subscription>(src, "subscription")?;
 
     let ident = parsed
         .identifier()
@@ -60,17 +64,8 @@ pub fn file_subscription(src: &Path, dir: &Path) -> Result<FileOutcome> {
     }
 
     let target = dir.join(format!("{slug}.json"));
-    let existed = target.exists();
-    write_atomic(&target, body.as_bytes())?;
-
-    let label = target.display().to_string();
-    if existed {
-        info!(target = %label, "subscription updated");
-        Ok(FileOutcome::Updated(label))
-    } else {
-        info!(target = %label, "subscription created");
-        Ok(FileOutcome::Created(label))
-    }
+    let body_out = super::json_target::body_with_received_at(&body, received_at_epoch);
+    write_unless_newer(&target, &body_out, "subscription")
 }
 
 #[cfg(test)]
@@ -107,9 +102,53 @@ mod tests {
         .unwrap();
         let dir = tmp.path().join("subs");
         fs::create_dir_all(&dir).unwrap();
-        let outcome = file_subscription(&src, &dir).unwrap();
+        let outcome = file_subscription(&src, &dir, None).unwrap();
         assert!(matches!(outcome, FileOutcome::Created(_)));
         let body = fs::read_to_string(dir.join("netflix.json")).unwrap();
         assert!(body.contains("Netflix"));
+    }
+
+    /// Scans process messages on several threads at once; whichever
+    /// of them gets to the record first, the newest message must be
+    /// the one left on file.
+    #[test]
+    fn concurrent_filing_leaves_the_newest() {
+        for _ in 0..200 {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("subs");
+            std::thread::scope(|scope| {
+                for n in 0..8i64 {
+                    let dir = &dir;
+                    let src = tmp.path().join(format!("{n}.subscription.json"));
+                    scope.spawn(move || {
+                        fs::write(&src, format!(r#"{{"name":"Hinge","n":{n}}}"#)).unwrap();
+                        file_subscription(&src, dir, Some(1_700_000_000 + n)).unwrap();
+                    });
+                }
+            });
+            let v: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(dir.join("hinge.json")).unwrap()).unwrap();
+            assert_eq!(v["n"], 7);
+        }
+    }
+
+    #[test]
+    fn older_receipt_does_not_roll_back_subscription() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("subs");
+        let src = tmp.path().join("incoming.subscription.json");
+
+        // 2026-01-28 renewal, processed first.
+        fs::write(&src, r#"{"name":"Hinge","orderDate":"2026-01-28"}"#).unwrap();
+        file_subscription(&src, &dir, Some(1769594400)).unwrap();
+        // 2025-10-28 renewal, processed afterwards by a rescan.
+        fs::write(&src, r#"{"name":"Hinge","orderDate":"2025-10-28"}"#).unwrap();
+        let outcome = file_subscription(&src, &dir, Some(1761645600)).unwrap();
+
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("hinge.json")).unwrap()).unwrap();
+        assert_eq!(v["orderDate"], "2026-01-28");
+        assert_eq!(v["receivedAt"], "2026-01-28T10:00:00Z");
     }
 }

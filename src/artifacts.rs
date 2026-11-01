@@ -59,6 +59,11 @@ pub struct ScanResult {
 /// Scan a directory for artifacts written by an extractor.
 ///
 /// Recognises files of the form `<slug>.<kind>.<ext>` for the known kinds.
+/// For most kinds `<ext>` is fixed; `ticket`, `receipt`, and `bill` accept
+/// arbitrary extensions (`.pdf`, `.pkpass`, images, ...). For receipts and
+/// bills the `.json` form is the structured record; any other extension is
+/// a companion blob paired with a same-slug JSON sibling when present.
+///
 /// `_manifest.json` is parsed if present. Files starting with `.` or `_`
 /// (other than `_manifest.json`) are ignored silently; files that don't
 /// match a known suffix produce a warning via the returned `unknown` list.
@@ -118,9 +123,7 @@ fn classify(name: &str) -> Option<(Kind, String, String)> {
     for (suffix, kind, ext) in [
         (".event.ics", Kind::Event, "ics"),
         (".reservation.json", Kind::Reservation, "json"),
-        (".bill.json", Kind::Bill, "json"),
         (".parcel.json", Kind::Parcel, "json"),
-        (".receipt.json", Kind::Receipt, "json"),
         (".subscription.json", Kind::Subscription, "json"),
     ] {
         if let Some(stem) = name.strip_suffix(suffix) {
@@ -131,15 +134,23 @@ fn classify(name: &str) -> Option<(Kind, String, String)> {
         }
     }
 
-    // For tickets, anything after the `.ticket.` marker is the real
-    // extension (`.pdf`, `.pkpass`, image formats, etc.).
-    if let Some(idx) = name.find(".ticket.") {
-        let stem = &name[..idx];
-        let ext = &name[idx + ".ticket.".len()..];
-        if stem.is_empty() || ext.is_empty() || ext.contains('/') {
-            return None;
+    // Tickets, receipts, and bills allow arbitrary extensions after the
+    // kind marker. For receipts/bills the `.json` form is the structured
+    // record; any other extension is a companion blob (typically a PDF)
+    // that the pipeline pairs with a same-slug JSON sibling.
+    for (marker, kind) in [
+        (".ticket.", Kind::Ticket),
+        (".receipt.", Kind::Receipt),
+        (".bill.", Kind::Bill),
+    ] {
+        if let Some(idx) = name.find(marker) {
+            let stem = &name[..idx];
+            let ext = &name[idx + marker.len()..];
+            if stem.is_empty() || ext.is_empty() || ext.contains('/') {
+                return None;
+            }
+            return Some((kind, stem.to_string(), ext.to_string()));
         }
-        return Some((Kind::Ticket, stem.to_string(), ext.to_string()));
     }
 
     None
@@ -161,5 +172,43 @@ mod tests {
     fn classify_unknown() {
         assert!(classify("random.txt").is_none());
         assert!(classify(".event.ics").is_none()); // empty slug
+    }
+
+    #[test]
+    fn classify_receipt_json() {
+        let (kind, slug, ext) = classify("do-invoice-2026-08.receipt.json").unwrap();
+        assert_eq!(kind, Kind::Receipt);
+        assert_eq!(slug, "do-invoice-2026-08");
+        assert_eq!(ext, "json");
+    }
+
+    #[test]
+    fn classify_receipt_pdf() {
+        let (kind, slug, ext) = classify("do-invoice-2026-08.receipt.pdf").unwrap();
+        assert_eq!(kind, Kind::Receipt);
+        assert_eq!(slug, "do-invoice-2026-08");
+        assert_eq!(ext, "pdf");
+    }
+
+    #[test]
+    fn classify_bill_json() {
+        let (kind, slug, ext) = classify("acme-inv1.bill.json").unwrap();
+        assert_eq!(kind, Kind::Bill);
+        assert_eq!(slug, "acme-inv1");
+        assert_eq!(ext, "json");
+    }
+
+    #[test]
+    fn classify_bill_pdf() {
+        let (kind, slug, ext) = classify("acme-inv1.bill.pdf").unwrap();
+        assert_eq!(kind, Kind::Bill);
+        assert_eq!(slug, "acme-inv1");
+        assert_eq!(ext, "pdf");
+    }
+
+    #[test]
+    fn classify_rejects_empty_receipt_ext() {
+        assert!(classify("foo.receipt.").is_none());
+        assert!(classify(".receipt.pdf").is_none());
     }
 }

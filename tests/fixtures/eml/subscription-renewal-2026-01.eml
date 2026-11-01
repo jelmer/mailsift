@@ -1,0 +1,10 @@
+From: billing@subscription.fixture.test
+To: jelmer@example.org
+Subject: fixture-renewal: 12.99
+Date: Wed, 28 Jan 2026 10:00:00 +0000
+Message-ID: <fixture-renewal-2026-01@subscription.fixture.test>
+Authentication-Results: example.org; dkim=pass header.d=subscription.fixture.test header.i=@subscription.fixture.test
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Your subscription has renewed.

@@ -16,6 +16,13 @@ mod router;
 
 const DEFAULT_EXTRACTOR_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Upper bound on message size accepted by [`run`] and on HTML fragments
+/// pulled out of inline forwards. 25 MiB comfortably covers personal
+/// mail (including PDFs and photo attachments) while keeping a
+/// pathological message from ballooning extractor memory or blocking on
+/// stdin.
+pub const MAX_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
+
 /// Where the pipeline routes each artifact kind for a single message.
 ///
 /// Borrowed so that the milter / imap-scan paths can hold an owned
@@ -32,6 +39,11 @@ pub struct PipelineTargets<'a> {
     /// Directory under which to file `subscription` artifacts. When
     /// `None`, subscription artifacts are dropped with a warning.
     pub subscriptions_dir: Option<&'a Path>,
+    /// Directory under which to archive the raw `reservation` JSON.
+    /// Independent of the event sink: a reservation is always
+    /// converted to a calendar event, and additionally archived here
+    /// when set. When `None`, only the calendar conversion happens.
+    pub reservations_dir: Option<&'a Path>,
     /// Receipt target (local directory, WebDAV collection, or mail
     /// forwarder). When `None`, receipt artifacts are dropped with a
     /// warning.
@@ -76,6 +88,8 @@ pub struct OwnedTargets {
     pub bills_dir: Option<PathBuf>,
     pub parcels_dir: Option<PathBuf>,
     pub subscriptions_dir: Option<PathBuf>,
+    /// See [`PipelineTargets::reservations_dir`].
+    pub reservations_dir: Option<PathBuf>,
     pub receipts: Option<Arc<crate::targets::receipts::ReceiptSink>>,
     pub tickets: Option<Arc<crate::targets::tickets::TicketSink>>,
     pub firefly: Option<Arc<crate::targets::firefly::FireflySink>>,
@@ -95,6 +109,7 @@ impl OwnedTargets {
             bills_dir: self.bills_dir.as_deref(),
             parcels_dir: self.parcels_dir.as_deref(),
             subscriptions_dir: self.subscriptions_dir.as_deref(),
+            reservations_dir: self.reservations_dir.as_deref(),
             receipts: self.receipts.as_deref(),
             tickets: self.tickets.as_deref(),
             firefly: self.firefly.as_deref(),
@@ -114,7 +129,13 @@ pub enum DkimPolicy {
     /// imap-scan, and maildir-watch; modes where the message has
     /// already passed through our MTA's DKIM check and the topmost
     /// `Authentication-Results` header is trustworthy.
-    Enforce,
+    ///
+    /// `received_at` is when the message reached us, as a unix
+    /// timestamp, taken from the mail source rather than from the
+    /// message itself. It decides whether an extractor's
+    /// `unsigned_before` lets unsigned mail through; `None` means
+    /// unknown, and unsigned mail is refused.
+    Enforce { received_at: Option<i64> },
     /// Skip DKIM checks entirely. Used by the milter front-end, which
     /// sees mail before our MTA has authenticated it.
     Skip,
@@ -174,7 +195,7 @@ pub fn run(
     extractors: &[extractor::Extractor],
     targets: PipelineTargets<'_>,
     dkim_policy: DkimPolicy,
-    _dry_run: bool,
+    dry_run: bool,
     mut explain: Option<&mut Vec<ExplainRecord>>,
 ) -> Result<()> {
     let PipelineTargets {
@@ -182,6 +203,7 @@ pub fn run(
         bills_dir,
         parcels_dir,
         subscriptions_dir,
+        reservations_dir,
         receipts,
         tickets,
         firefly,
@@ -190,6 +212,16 @@ pub fn run(
         recorder,
         seen,
     } = targets;
+
+    if raw.len() > MAX_MESSAGE_BYTES {
+        warn!(
+            source,
+            bytes = raw.len(),
+            limit = MAX_MESSAGE_BYTES,
+            "skipping oversized message; exceeds MAX_MESSAGE_BYTES"
+        );
+        return Ok(());
+    }
 
     if extractors.is_empty() {
         warn!("no extractors configured; nothing to do");
@@ -200,11 +232,14 @@ pub fn run(
     // for the inner RFC822 bytes so DKIM checks, prefilter matching,
     // and extractor stdin all see the original vendor mail. The
     // `_unwrapped` binding keeps the inner bytes alive for the rest of
-    // `run`.
+    // `run`. When the unwrap was authorized purely by the outer
+    // sender's trust (attachment form has DKIM stripped, inline forwards
+    // have no signature at all), also bypass `require_dkim` below: the
+    // trust list is standing in for the vendor's signature.
     let _unwrapped = crate::unforward::try_unwrap_forwarded(raw, trusted_forwarders);
-    let raw: &[u8] = match _unwrapped.as_deref() {
-        Some(inner) => inner,
-        None => raw,
+    let (raw, dkim_via_forwarder): (&[u8], bool) = match &_unwrapped {
+        Some(u) => (u.inner.as_slice(), u.from_trusted_forwarder),
+        None => (raw, false),
     };
 
     // Parse headers once and reuse them for everything we need from
@@ -217,11 +252,17 @@ pub fn run(
         .unwrap_or_default();
 
     let dkim_domains = match dkim_policy {
-        DkimPolicy::Enforce => dkim::passing_dkim_domains(&parsed_headers),
+        DkimPolicy::Enforce { .. } => dkim::passing_dkim_domains(&parsed_headers),
         DkimPolicy::Skip => Default::default(),
     };
 
     let (from_domain, subject) = parse_match_headers_from_parsed(&parsed_headers);
+
+    // When the message was sent, or failing that received. Stamped on
+    // every filed artifact (`receivedAt` in the JSON ones) so the web
+    // UI can sort by it, and so the sinks can tell which of two
+    // messages about the same thing is the newer one.
+    let received_at_epoch = message_epoch(&parsed_headers);
 
     // Stamp every recorded event with the same `ts` so a single
     // message's per-extractor lines cluster in the log. SystemTime
@@ -240,7 +281,7 @@ pub fn run(
 
     debug!(count = extractors.len(), "running extractors");
 
-    let mut summary = router::Summary::default();
+    let mut summary = router::Summary::new(dry_run);
 
     for ex in extractors {
         if !ex.matches_headers(from_domain.as_deref(), subject.as_deref()) {
@@ -279,14 +320,16 @@ pub fn run(
             continue;
         }
 
-        if !ex.require_dkim.is_empty() {
+        if !ex.require_dkim.is_empty() && !dkim_via_forwarder {
             match dkim_policy {
                 DkimPolicy::Skip => {
                     // No-op: caller has chosen to skip DKIM checks. We
                     // still run the extractor.
                 }
-                DkimPolicy::Enforce => {
-                    if !dkim::satisfies(&ex.require_dkim, &dkim_domains) {
+                DkimPolicy::Enforce { received_at } => {
+                    if !dkim::satisfies(&ex.require_dkim, &dkim_domains)
+                        && !received_before(received_at, ex.unsigned_before)
+                    {
                         debug!(
                             extractor = %ex.name,
                             required = ?ex.require_dkim,
@@ -322,12 +365,17 @@ pub fn run(
                         },
                     });
                 }
+                let mut err_snippet = format!("{e:#}");
+                if err_snippet.len() > stats::MAX_ERROR_SNIPPET {
+                    err_snippet.truncate(stats::MAX_ERROR_SNIPPET);
+                }
                 recorder.record(&stats::Event {
                     ts: now_ts,
                     extractor: ex.name.clone(),
                     outcome: stats::Outcome::Failed,
                     duration_ms: Some(stats::duration_to_ms(elapsed)),
                     from_domain: from_domain.clone(),
+                    error: Some(err_snippet),
                 });
                 continue;
             }
@@ -343,17 +391,31 @@ pub fn run(
         let mut events: Vec<&Artifact> = Vec::new();
         let mut reservations: Vec<&Artifact> = Vec::new();
         let mut bill_arts: Vec<&Artifact> = Vec::new();
+        let mut bill_blob_arts: Vec<&Artifact> = Vec::new();
         let mut parcel_arts: Vec<&Artifact> = Vec::new();
         let mut receipt_arts: Vec<&Artifact> = Vec::new();
+        let mut receipt_blob_arts: Vec<&Artifact> = Vec::new();
         let mut ticket_arts: Vec<&Artifact> = Vec::new();
         let mut subscription_arts: Vec<&Artifact> = Vec::new();
         for artifact in &run.result.artifacts {
             match artifact.kind {
                 Kind::Event => events.push(artifact),
                 Kind::Reservation => reservations.push(artifact),
-                Kind::Bill => bill_arts.push(artifact),
+                Kind::Bill => {
+                    if artifact.ext == "json" {
+                        bill_arts.push(artifact);
+                    } else {
+                        bill_blob_arts.push(artifact);
+                    }
+                }
                 Kind::Parcel => parcel_arts.push(artifact),
-                Kind::Receipt => receipt_arts.push(artifact),
+                Kind::Receipt => {
+                    if artifact.ext == "json" {
+                        receipt_arts.push(artifact);
+                    } else {
+                        receipt_blob_arts.push(artifact);
+                    }
+                }
                 Kind::Ticket => ticket_arts.push(artifact),
                 Kind::Subscription => subscription_arts.push(artifact),
             }
@@ -362,8 +424,10 @@ pub fn run(
         let total_artifacts = events.len()
             + reservations.len()
             + bill_arts.len()
+            + bill_blob_arts.len()
             + parcel_arts.len()
             + receipt_arts.len()
+            + receipt_blob_arts.len()
             + ticket_arts.len()
             + subscription_arts.len();
         if let Some(buf) = explain.as_deref_mut() {
@@ -372,9 +436,9 @@ pub fn run(
                 outcome: ExplainOutcome::Produced {
                     events: events.len() as u32,
                     reservations: reservations.len() as u32,
-                    bills: bill_arts.len() as u32,
+                    bills: (bill_arts.len() + bill_blob_arts.len()) as u32,
                     parcels: parcel_arts.len() as u32,
-                    receipts: receipt_arts.len() as u32,
+                    receipts: (receipt_arts.len() + receipt_blob_arts.len()) as u32,
                     tickets: ticket_arts.len() as u32,
                     subscriptions: subscription_arts.len() as u32,
                 },
@@ -390,20 +454,44 @@ pub fn run(
             },
             duration_ms: Some(stats::duration_to_ms(elapsed)),
             from_domain: from_domain.clone(),
+            error: None,
         });
 
         for artifact in events {
-            router::file_event_artifact(&run.extractor, artifact, event_sink, seen, &mut summary);
+            router::file_event_artifact(
+                &run.extractor,
+                artifact,
+                event_sink,
+                seen,
+                received_at_epoch,
+                &mut summary,
+            );
         }
 
-        for artifact in reservations {
+        for artifact in &reservations {
             router::file_reservation_artifact(
                 &run.extractor,
                 artifact,
                 event_sink,
                 seen,
+                received_at_epoch,
                 &mut summary,
             );
+        }
+
+        // Archiving the raw JSON is additive: the calendar conversion
+        // above already ran, so an absent `reservations_dir` costs
+        // nothing beyond the fuller record.
+        if let Some(dir) = reservations_dir {
+            for artifact in &reservations {
+                router::file_reservation_json(
+                    &run.extractor,
+                    artifact,
+                    dir,
+                    received_at_epoch,
+                    &mut summary,
+                );
+            }
         }
 
         file_or_drop(
@@ -412,7 +500,35 @@ pub fn run(
             bill_arts,
             bills_dir,
             |artifact, dir| {
-                router::file_bill_artifact(&run.extractor, artifact, dir, firefly, &mut summary);
+                router::file_bill_artifact(
+                    &run.extractor,
+                    artifact,
+                    dir,
+                    firefly,
+                    received_at_epoch,
+                    &mut summary,
+                );
+            },
+        );
+
+        // Companion blobs (e.g. `<slug>.bill.pdf`) get filed next to
+        // their same-slug `.bill.json` sibling under a common
+        // `<payee>-<invoice>` name. Orphan blobs (no sibling) are
+        // dropped by the router with a warning.
+        file_or_drop(
+            "bill-blob",
+            &run.extractor,
+            bill_blob_arts,
+            bills_dir,
+            |artifact, dir| {
+                router::file_bill_blob_artifact(
+                    &run.extractor,
+                    artifact,
+                    &run.result.artifacts,
+                    dir,
+                    received_at_epoch,
+                    &mut summary,
+                );
             },
         );
 
@@ -422,7 +538,14 @@ pub fn run(
             parcel_arts,
             parcels_dir,
             |artifact, dir| {
-                router::file_parcel_artifact(&run.extractor, artifact, dir, trackers, &mut summary);
+                router::file_parcel_artifact(
+                    &run.extractor,
+                    artifact,
+                    dir,
+                    trackers,
+                    received_at_epoch,
+                    &mut summary,
+                );
             },
         );
 
@@ -432,7 +555,13 @@ pub fn run(
             subscription_arts,
             subscriptions_dir,
             |artifact, dir| {
-                router::file_subscription_artifact(&run.extractor, artifact, dir, &mut summary);
+                router::file_subscription_artifact(
+                    &run.extractor,
+                    artifact,
+                    dir,
+                    received_at_epoch,
+                    &mut summary,
+                );
             },
         );
 
@@ -442,7 +571,37 @@ pub fn run(
             receipt_arts,
             receipts,
             |artifact, sink| {
-                router::file_receipt_artifact(&run.extractor, artifact, raw, sink, &mut summary);
+                router::file_receipt_artifact(
+                    &run.extractor,
+                    artifact,
+                    raw,
+                    sink,
+                    received_at_epoch,
+                    &mut summary,
+                    recorder,
+                    now_ts,
+                );
+            },
+        );
+
+        // Companion blobs (e.g. `<slug>.receipt.pdf`) get filed next to
+        // their same-slug `.receipt.json` sibling under a common
+        // `<merchant>-<order>` name. Orphan blobs (no sibling) are
+        // dropped by the router with a warning.
+        file_or_drop(
+            "receipt-blob",
+            &run.extractor,
+            receipt_blob_arts,
+            receipts,
+            |artifact, sink| {
+                router::file_receipt_blob_artifact(
+                    &run.extractor,
+                    artifact,
+                    &run.result.artifacts,
+                    sink,
+                    received_at_epoch,
+                    &mut summary,
+                );
             },
         );
 
@@ -462,6 +621,13 @@ pub fn run(
                 message_date_year(&parsed_headers).unwrap_or_else(current_year)
             })
         });
+        // The same sibling reservation that dates the ticket also
+        // names the booking; a boarding pass carries neither itself.
+        let ticket_meta = if !ticket_arts.is_empty() && tickets.is_some() {
+            router::sibling_ticket_meta(&run.result.artifacts)
+        } else {
+            crate::targets::tickets::TicketMeta::default()
+        };
         file_or_drop(
             "ticket",
             &run.extractor,
@@ -473,6 +639,8 @@ pub fn run(
                     artifact,
                     ticket_year.expect("year computed when both tickets and sink exist"),
                     sink,
+                    &ticket_meta,
+                    received_at_epoch,
                     &mut summary,
                 );
             },
@@ -480,7 +648,14 @@ pub fn run(
     }
 
     if !summary.is_empty() {
-        info!("extracted from {source}: {}", summary.render());
+        if dry_run {
+            info!(
+                "[dry-run] would extract from {source}: {}",
+                summary.render()
+            );
+        } else {
+            info!("extracted from {source}: {}", summary.render());
+        }
     }
 
     Ok(())
@@ -579,16 +754,47 @@ fn collect_parts(mail: &mailparse::ParsedMail<'_>, out: &mut extractor::BodyPart
     }
 }
 
-/// Read a year from the message's `Date:` header. Best-effort; returns
-/// `None` if the header is missing or unparseable.
-fn message_date_year(headers: &[mailparse::MailHeader<'_>]) -> Option<i32> {
-    use chrono::Datelike;
+/// Read the message's `Date:` header as unix seconds. Best-effort;
+/// returns `None` if the header is missing or unparseable.
+fn message_date_epoch(headers: &[mailparse::MailHeader<'_>]) -> Option<i64> {
     let date_value = headers
         .iter()
         .find(|h| h.get_key_ref().eq_ignore_ascii_case("date"))?
         .get_value();
-    let dt = mailparse::dateparse(&date_value).ok()?;
-    let dt = chrono::DateTime::from_timestamp(dt, 0)?;
+    mailparse::dateparse(&date_value).ok()
+}
+
+/// When the newest `Received:` header says the message was handed
+/// over, as unix seconds. Each hop prepends its own header, so the
+/// first one is the final delivery. The timestamp follows the last
+/// `;` (RFC 5322 section 3.6.7).
+fn message_received_epoch(headers: &[mailparse::MailHeader<'_>]) -> Option<i64> {
+    let received = headers
+        .iter()
+        .find(|h| h.get_key_ref().eq_ignore_ascii_case("received"))?
+        .get_value();
+    let (_, stamp) = received.rsplit_once(';')?;
+    mailparse::dateparse(stamp.trim()).ok()
+}
+
+/// When the message was sent (`Date:`), or failing that when it was
+/// received, as unix seconds. This is what orders two messages about
+/// the same thing.
+/// Whether the message reached us before the vendor started signing.
+/// Unknown on either side means no.
+fn received_before(received_at: Option<i64>, unsigned_before: Option<i64>) -> bool {
+    matches!((received_at, unsigned_before), (Some(r), Some(cutoff)) if r < cutoff)
+}
+
+pub(crate) fn message_epoch(headers: &[mailparse::MailHeader<'_>]) -> Option<i64> {
+    message_date_epoch(headers).or_else(|| message_received_epoch(headers))
+}
+
+/// Read a year from the message's date. Best-effort; returns `None`
+/// if the message carries no usable date.
+fn message_date_year(headers: &[mailparse::MailHeader<'_>]) -> Option<i32> {
+    use chrono::Datelike;
+    let dt = chrono::DateTime::from_timestamp(message_epoch(headers)?, 0)?;
     Some(dt.year())
 }
 
@@ -616,12 +822,21 @@ fn record_skip(
             outcome: explain_outcome,
         });
     }
+    // A header prefilter rejects every extractor a message doesn't
+    // match, so recording those grows the log with (messages x
+    // extractors) rather than with work actually done -- in practice
+    // ~96% of all events. `--explain` still reports them above; only
+    // the on-disk log leaves them out.
+    if stats_outcome == stats::Outcome::SkippedHeaders {
+        return;
+    }
     recorder.record(&stats::Event {
         ts,
         extractor: ex.name.clone(),
         outcome: stats_outcome,
         duration_ms: None,
         from_domain: from_domain.map(str::to_string),
+        error: None,
     });
 }
 
@@ -735,6 +950,30 @@ mod tests {
     }
 
     #[test]
+    fn message_epoch_prefers_date_header() {
+        let raw = b"Received: by mx.example.org; Sun, 28 Jun 2026 08:00:00 +0000\r\n\
+Date: Sat, 27 Jun 2026 12:00:00 +0000\r\n\r\n";
+        // 2026-06-27T12:00:00Z
+        assert_eq!(message_epoch(&parsed_headers(raw)), Some(1782561600));
+    }
+
+    #[test]
+    fn message_epoch_falls_back_to_newest_received_header() {
+        let raw = b"Received: by 2002:a05:6402:1e8f with SMTP id f15csp123;\r\n\
+\x20       Sun, 28 Jun 2026 01:00:00 -0700 (PDT)\r\n\
+Received: from mail.example.org by mx.google.com; Sat, 27 Jun 2026 23:59:00 +0000\r\n\
+From: x\r\n\r\n";
+        // 2026-06-28T08:00:00Z
+        assert_eq!(message_epoch(&parsed_headers(raw)), Some(1782633600));
+    }
+
+    #[test]
+    fn message_epoch_is_none_without_any_date() {
+        let raw = b"Received: from somewhere without a timestamp\r\nFrom: x\r\n\r\n";
+        assert_eq!(message_epoch(&parsed_headers(raw)), None);
+    }
+
+    #[test]
     fn message_date_year_returns_none_when_missing() {
         let raw = b"From: x\r\n\r\n";
         let h = parsed_headers(raw);
@@ -811,5 +1050,149 @@ Content-Type: application/pdf; name=\"invoice.pdf\"\r\n\
 %PDF-1.4\r\n";
         let parts = parts_from(raw);
         assert_eq!(parts.attachment_filenames, vec!["invoice.pdf"]);
+    }
+
+    /// Header-prefilter skips dominate the event log (one per
+    /// non-matching extractor per message), so they're deliberately
+    /// left out of it while still showing up in `--explain`.
+    #[test]
+    fn record_skip_keeps_header_skips_out_of_the_log() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let extractors_dir = manifest_dir.join("tests/fixtures/extractors");
+        let extractors = extractor::discover(&[extractors_dir]).expect("discover extractors");
+        let ex = extractors.first().expect("at least one fixture extractor");
+
+        let stats_dir = tempfile::tempdir().expect("stats tempdir");
+        let stats_path = stats_dir.path().join("events.ndjson");
+        let recorder = stats::Recorder::File(stats_path.clone());
+
+        let mut explain: Vec<ExplainRecord> = Vec::new();
+        record_skip(
+            Some(&mut explain),
+            &recorder,
+            ex,
+            1,
+            Some("example.com"),
+            ExplainOutcome::SkippedHeaders,
+            stats::Outcome::SkippedHeaders,
+        );
+        assert_eq!(explain.len(), 1);
+        assert!(
+            !stats_path.exists(),
+            "header skip must not be written to the event log"
+        );
+
+        // The other two skip kinds are bounded by messages that got
+        // far enough to be worth reporting on, so they still record.
+        record_skip(
+            Some(&mut explain),
+            &recorder,
+            ex,
+            2,
+            Some("example.com"),
+            ExplainOutcome::SkippedBody,
+            stats::Outcome::SkippedBody,
+        );
+        assert_eq!(explain.len(), 2);
+        let logged = stats::aggregate(&stats_path).expect("aggregate");
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].skipped_body, 1);
+        assert_eq!(logged[0].skipped_headers, 0);
+    }
+
+    #[test]
+    fn run_short_circuits_oversized_message_without_invoking_extractors() {
+        use std::path::PathBuf;
+
+        // Load real fixture extractors so `run` has something it could
+        // otherwise dispatch to. The size check must fire first.
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let extractors_dir = manifest_dir.join("tests/fixtures/extractors");
+        let extractors = extractor::discover(&[extractors_dir]).expect("discover extractors");
+        assert!(!extractors.is_empty(), "fixture extractors present");
+
+        let events_dir = tempfile::tempdir().expect("events tempdir");
+        let sink = EventSinkKind::LocalDir(events_dir.path().to_path_buf());
+
+        // File-backed recorder that only creates its path on the first
+        // record(). If any extractor ran, this file would exist.
+        let stats_dir = tempfile::tempdir().expect("stats tempdir");
+        let stats_path = stats_dir.path().join("events.ndjson");
+        let recorder = stats::Recorder::File(stats_path.clone());
+
+        let raw = vec![b'x'; MAX_MESSAGE_BYTES + 1];
+        let mut explain: Vec<ExplainRecord> = Vec::new();
+
+        let result = run(
+            &raw,
+            "test oversized",
+            &extractors,
+            PipelineTargets {
+                event_sink: &sink,
+                bills_dir: None,
+                parcels_dir: None,
+                subscriptions_dir: None,
+                reservations_dir: None,
+                receipts: None,
+                tickets: None,
+                firefly: None,
+                trackers: None,
+                trusted_forwarders: &[],
+                recorder: &recorder,
+                seen: None,
+            },
+            DkimPolicy::Skip,
+            false,
+            Some(&mut explain),
+        );
+
+        assert!(result.is_ok(), "oversized input must not be an error");
+        assert!(
+            explain.is_empty(),
+            "no extractor should have produced an explain record"
+        );
+        assert!(
+            !stats_path.exists(),
+            "no extractor should have recorded a stats event"
+        );
+        let events: Vec<_> = std::fs::read_dir(events_dir.path())
+            .expect("read events dir")
+            .collect();
+        assert!(events.is_empty(), "no artifacts should have been filed");
+    }
+
+    #[test]
+    fn run_accepts_message_at_the_limit() {
+        // A message exactly at MAX_MESSAGE_BYTES must be accepted (the
+        // guard only rejects strictly greater). We don't need extractors
+        // to prove this; an empty list returns Ok after the size check.
+        let events_dir = tempfile::tempdir().expect("events tempdir");
+        let sink = EventSinkKind::LocalDir(events_dir.path().to_path_buf());
+        let raw = vec![b'x'; MAX_MESSAGE_BYTES];
+
+        let result = run(
+            &raw,
+            "test at-limit",
+            &[],
+            PipelineTargets {
+                event_sink: &sink,
+                bills_dir: None,
+                parcels_dir: None,
+                subscriptions_dir: None,
+                reservations_dir: None,
+                receipts: None,
+                tickets: None,
+                firefly: None,
+                trackers: None,
+                trusted_forwarders: &[],
+                recorder: &stats::Recorder::Disabled,
+                seen: None,
+            },
+            DkimPolicy::Skip,
+            false,
+            None,
+        );
+
+        assert!(result.is_ok(), "at-limit input must be accepted");
     }
 }

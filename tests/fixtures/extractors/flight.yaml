@@ -1,0 +1,5 @@
+name: fixture-flight
+order: 50
+from_domains:
+  - flight.fixture.test
+subject_regex: "(?i)^fixture-flight"

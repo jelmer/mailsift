@@ -185,7 +185,7 @@ async fn handle_eom(cx: &mut EomContext<MessageState>, config: Arc<MilterConfig>
 
     match tokio::time::timeout(deadline, work).await {
         Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(e))) => warn!(error = %e, "pipeline failed"),
+        Ok(Ok(Err(e))) => warn!(error = format!("{e:#}"), "pipeline failed"),
         Ok(Err(e)) => warn!(error = %e, "pipeline task panicked"),
         Err(_) => warn!(
             deadline_secs = deadline.as_secs(),

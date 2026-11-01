@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use assert_cmd::Command;
+mod common;
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -26,8 +26,7 @@ fn matching_dkim_suffix_runs_extractor() {
     let receipts = tempfile::tempdir().expect("tempdir");
     let events = tempfile::tempdir().expect("tempdir");
 
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("replay")
         .arg(&eml)
         .arg("--extractors")
@@ -56,8 +55,7 @@ fn lookalike_dkim_domain_does_not_match_suffix() {
     let receipts = tempfile::tempdir().expect("tempdir");
     let events = tempfile::tempdir().expect("tempdir");
 
-    Command::cargo_bin("mailsift")
-        .expect("binary built")
+    common::mailsift()
         .arg("replay")
         .arg(&eml)
         .arg("--extractors")

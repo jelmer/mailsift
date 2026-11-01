@@ -29,11 +29,31 @@ use tracing::{debug, info, warn};
 use crate::extractor::BodyParts;
 use crate::pipeline::{self, PipelineTargets};
 
-/// How many UIDs we group into a single `UID FETCH` round trip. Bigger
-/// is fewer round trips but more memory pressure (each message's
-/// RFC822 body is buffered in full before we start processing). 50 is
-/// a comfortable midpoint for typical mail sizes.
-const FETCH_BATCH: usize = 50;
+/// How many UIDs go into one prefilter `UID FETCH` (headers and
+/// BODYSTRUCTURE only). Gmail delays every command by a fixed amount
+/// when it throttles an account, so fewer, larger commands matter more
+/// than response size here.
+const PREFILTER_BATCH: usize = 500;
+
+/// How many full messages go into one `UID FETCH RFC822`. Each body is
+/// buffered in full before processing starts, so this stays small.
+const BODY_BATCH: usize = 50;
+
+/// The mailbox named on the command line does not exist on the server. A
+/// caller mistake rather than an internal failure, so the CLI reports it
+/// as a plain message without a backtrace.
+#[derive(Debug)]
+pub struct MailboxNotFound {
+    pub mailbox: String,
+}
+
+impl std::fmt::Display for MailboxNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no such mailbox: {}", self.mailbox)
+    }
+}
+
+impl std::error::Error for MailboxNotFound {}
 
 /// How to authenticate to the IMAP server.
 #[derive(Clone, Copy)]
@@ -47,12 +67,17 @@ pub enum AuthMethod<'a> {
     // release branch so the crate can build against the upstream imap crate.
     // #[cfg(feature = "gssapi")]
     // Gssapi { authzid: Option<&'a str> },
-    /// SASL `AUTHENTICATE XOAUTH2` with a Gmail (or other provider)
-    /// OAuth2 bearer token. The token is short-lived; obtain a fresh
-    /// one before each run (e.g. via `oauth2l` or `gcloud`).
+    /// SASL `AUTHENTICATE XOAUTH2`. A fresh access token is fetched from
+    /// `tokens` at every (re)connect. With a
+    /// [`StaticTokenProvider`](crate::oauth2::StaticTokenProvider) that
+    /// is a fixed pre-obtained token (fine for a run that finishes within
+    /// its lifetime); with a
+    /// [`TokenProvider`](crate::oauth2::TokenProvider) it is minted from a
+    /// refresh token, so it survives token expiry across a `--watch`
+    /// session's reconnects.
     XOAuth2 {
         user: &'a str,
-        access_token: &'a str,
+        tokens: &'a dyn crate::oauth2::TokenSource,
     },
 }
 
@@ -79,12 +104,18 @@ impl imap::Authenticator for XOAuth2Authenticator<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct ImapScanConfig<'a> {
     pub host: &'a str,
     pub port: u16,
     pub auth: AuthMethod<'a>,
     pub mailbox: &'a str,
     pub since: Option<&'a str>,
+    /// Upper bound on message internal date, exclusive, in IMAP date
+    /// format. Combined with `since` this bounds a scan to a specific
+    /// window so a single IMAP session doesn't outrun the server's
+    /// idle timeout on very large mailboxes.
+    pub before: Option<&'a str>,
     pub limit: Option<usize>,
     pub extractors: &'a [crate::extractor::Extractor],
     pub targets: PipelineTargets<'a>,
@@ -96,6 +127,13 @@ pub struct ImapScanConfig<'a> {
     /// interrupted (SIGINT/SIGTERM); on transport errors the connection
     /// is rebuilt with exponential backoff.
     pub watch: bool,
+    /// Where this mailbox's scan position is kept. When set, the scan
+    /// resumes after the saved UID instead of starting from the top,
+    /// and the position is saved as messages are processed.
+    pub cursor_file: Option<&'a crate::imap_state::CursorFile>,
+    /// Ignore the saved position and scan the whole mailbox; it is
+    /// still saved afterwards.
+    pub rescan: bool,
 }
 
 pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
@@ -112,21 +150,104 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
     }
 
     let mut session = connect_and_authenticate(&config)?;
-    let mbox = session
-        .examine(config.mailbox)
-        .with_context(|| format!("EXAMINE {}", config.mailbox))?;
+    let mbox = match session.examine(config.mailbox) {
+        Ok(mbox) => mbox,
+        // A NO response to EXAMINE means the server refused to select the
+        // mailbox; for a mailbox the user named, that is almost always
+        // "it doesn't exist". Surface it as such rather than a backtrace.
+        Err(imap::Error::No(_)) => {
+            return Err(MailboxNotFound {
+                mailbox: config.mailbox.to_string(),
+            }
+            .into());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("EXAMINE {}", config.mailbox)));
+        }
+    };
     info!(
         mailbox = config.mailbox,
         exists = mbox.exists,
         "selected (read-only)"
     );
 
-    let query = build_search_query(config.since);
-    let mut uids: Vec<u32> = session
-        .uid_search(&query)
-        .with_context(|| format!("UID SEARCH {query}"))?
-        .into_iter()
-        .collect();
+    let uid_validity = mbox.uid_validity;
+    if config.cursor_file.is_some() && uid_validity.is_none() {
+        warn!("server reports no UIDVALIDITY; the scan position can't be saved");
+    }
+    let saved = match config.cursor_file {
+        Some(file) if !config.rescan => file.load()?,
+        _ => None,
+    };
+    let resume_after = saved.as_ref().and_then(|saved| {
+        let after = saved.resume_after(uid_validity);
+        if after.is_none() {
+            warn!(
+                saved = saved.uid_validity,
+                now = ?uid_validity,
+                "UIDVALIDITY changed since the scan position was saved; scanning the whole mailbox"
+            );
+        }
+        after
+    });
+    if let (Some(last), Some(saved)) = (resume_after, &saved) {
+        info!(after_uid = last, "resuming from the saved scan position");
+        let changed = changed_since(saved, config.extractors);
+        if !changed.is_empty() {
+            backfill(
+                &mut session,
+                &config,
+                &changed,
+                last,
+                uid_validity,
+                &interrupted,
+            )?;
+            if interrupted.load(Ordering::SeqCst) {
+                let _ = session.logout();
+                return Ok(());
+            }
+            save_cursor(config.cursor_file, uid_validity, last, config.extractors);
+        }
+    }
+    let base_query = initial_search_query(resume_after, config.since, config.before);
+    // When every selected extractor names the senders it cares about,
+    // let the server drop everything else: no UID for a message we'd
+    // only discard in the prefilter. Correctness never rests on this,
+    // so a server that rejects the query just costs us the speedup.
+    let mut from_restriction = build_from_restriction(config.extractors);
+    let query = match &from_restriction {
+        Some(r) => format!("{base_query} {r}"),
+        None => base_query.clone(),
+    };
+    let mut uids: Vec<u32> = match session.uid_search(&query) {
+        Ok(found) => found.into_iter().collect(),
+        // Only a NO/BAD tagged response means the server disliked the
+        // query itself. Anything else is a transport failure, which
+        // retrying with a different query wouldn't fix and shouldn't
+        // hide.
+        Err(imap::Error::No(_) | imap::Error::Bad(_)) if from_restriction.is_some() => {
+            warn!(
+                query,
+                "narrowed UID SEARCH rejected by the server; falling back to the unnarrowed query"
+            );
+            // Don't narrow the watch loop's searches either: a failure
+            // there is treated as a transport error and triggers a
+            // reconnect, so a query this server dislikes would spin.
+            from_restriction = None;
+            session
+                .uid_search(&base_query)
+                .with_context(|| format!("UID SEARCH {base_query}"))?
+                .into_iter()
+                .collect()
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("UID SEARCH {query}")));
+        }
+    };
+    // `UID n:*` always includes the highest UID, even below n.
+    if let Some(last) = resume_after {
+        uids.retain(|&uid| uid > last);
+    }
     uids.sort_unstable();
     info!(matched = uids.len(), "UIDs returned by search");
 
@@ -142,11 +263,41 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
     // from `cursor+1` on every wakeup, and uid_validity ensures the
     // cursor is meaningful (if it changes we bail rather than chase a
     // renumbered mailbox).
-    let mut cursor = initial_uids.iter().copied().max().unwrap_or(0);
-    let uid_validity = mbox.uid_validity;
+    let mut cursor = initial_uids
+        .iter()
+        .copied()
+        .max()
+        .max(resume_after)
+        .unwrap_or(0);
+    let checkpoint = |last_uid: u32| {
+        save_cursor(
+            config.cursor_file,
+            uid_validity,
+            last_uid,
+            config.extractors,
+        )
+    };
 
     let pb = make_progress_bar(initial_uids.len() as u64);
-    let stats = process_uid_set(&mut session, initial_uids, &config, &pb)?;
+    let stats = if config.watch {
+        // Under --watch, a fetch failure mid-scan is treated the same as
+        // one inside the watch loop: back off, reconnect, resume from the
+        // next unprocessed chunk. Without this, a mid-scan disconnect
+        // (server drop, TLS close_notify race) would exit the process,
+        // and while systemd will restart us the next scan hits the same
+        // large initial backlog again.
+        process_uids_with_resume(
+            &mut session,
+            initial_uids,
+            &config,
+            &pb,
+            uid_validity,
+            &interrupted,
+            &checkpoint,
+        )?
+    } else {
+        process_uid_set(&mut session, initial_uids, &config, &pb, &checkpoint)?
+    };
     pb.finish_and_clear();
     if stats.prefilter_skipped > 0 {
         info!(
@@ -161,11 +312,270 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
         return Ok(());
     }
 
+    if interrupted.load(Ordering::SeqCst) {
+        let _ = session.logout();
+        return Ok(());
+    }
+
     info!(
         mailbox = config.mailbox,
         cursor, "entering watch mode (IDLE)"
     );
-    watch_loop(session, &mut cursor, uid_validity, &config, &interrupted)
+    watch_loop(
+        session,
+        &mut cursor,
+        uid_validity,
+        &config,
+        from_restriction.as_deref(),
+        &interrupted,
+    )
+}
+
+/// Wrap [`process_uid_set`] with the same fetch-backoff / reconnect /
+/// reselect story that [`watch_loop`] uses. Chunk-level errors during the
+/// initial scan drop the current session, sleep the current fetch backoff,
+/// reconnect, re-EXAMINE, and resume from the next unprocessed chunk.
+///
+/// Only used under `--watch`: a one-shot scan surfaces errors so the
+/// caller sees them. Under `--watch` we can't afford to exit here because
+/// systemd would then restart the process and repeat the same expensive
+/// initial SEARCH + prefilter over the whole backlog.
+fn process_uids_with_resume(
+    session_slot: &mut Session<imap::Connection>,
+    uids: &[u32],
+    config: &ImapScanConfig<'_>,
+    pb: &ProgressBar,
+    initial_uid_validity: Option<u32>,
+    interrupted: &Arc<AtomicBool>,
+    checkpoint: &dyn Fn(u32),
+) -> Result<ScanStats> {
+    let mut total = ScanStats::default();
+    let mut done = 0usize;
+    let mut fetch_backoff = Duration::from_secs(1);
+    let mut reconnect_backoff = Duration::from_secs(1);
+    let mut uid_validity = initial_uid_validity;
+    let mut quarantine = Quarantine::default();
+    while done < uids.len() {
+        if interrupted.load(Ordering::SeqCst) {
+            return Ok(total);
+        }
+        let before = done;
+        let end = quarantine.slice_end(done, uids.len());
+        let result = process_uid_set_with_progress(
+            session_slot,
+            &uids[done..end],
+            config,
+            quarantine.with_structure(uids[done]),
+            pb,
+            &mut done,
+            checkpoint,
+        );
+        match result {
+            Ok(stats) => {
+                total.processed += stats.processed;
+                total.prefilter_skipped += stats.prefilter_skipped;
+            }
+            Err(e) if is_unparseable(&e) => {
+                // The server sent something we can't decode, so the
+                // session is out of step with it. Narrow down which
+                // message it was, on a fresh connection each time.
+                match quarantine.on_unparseable(uids, done) {
+                    Step::Isolate => warn!(
+                        error = format!("{e:#}"),
+                        "unparseable FETCH response; retrying these messages one at a time"
+                    ),
+                    Step::DropStructure(uid) => warn!(
+                        uid,
+                        error = format!("{e:#}"),
+                        "unparseable FETCH response; retrying without BODYSTRUCTURE"
+                    ),
+                    Step::Skip(uid) => {
+                        warn!(
+                            uid,
+                            error = format!("{e:#}"),
+                            "unparseable FETCH response even without BODYSTRUCTURE; skipping message"
+                        );
+                        done += 1;
+                        pb.inc(1);
+                        checkpoint(uid);
+                    }
+                }
+                *session_slot = match reconnect(config, &mut reconnect_backoff, interrupted) {
+                    Some(s) => s,
+                    None => return Ok(total),
+                };
+                if let Some(new_validity) = reselect(session_slot, config, uid_validity)? {
+                    uid_validity = Some(new_validity);
+                }
+            }
+            Err(e) => {
+                // Any forward progress means the connection was healthy
+                // right up to the failing chunk; only a chunk that fails
+                // on the very first attempt after a reconnect charges
+                // against the backoff.
+                if done > before {
+                    fetch_backoff = Duration::from_secs(1);
+                }
+                warn!(
+                    error = format!("{e:#}"),
+                    done,
+                    total = uids.len(),
+                    ?fetch_backoff,
+                    "initial scan fetch failed; backing off and reconnecting"
+                );
+                std::thread::sleep(fetch_backoff);
+                if interrupted.load(Ordering::SeqCst) {
+                    return Ok(total);
+                }
+                fetch_backoff = grow_backoff(fetch_backoff, FETCH_BACKOFF_MAX);
+                *session_slot = match reconnect(config, &mut reconnect_backoff, interrupted) {
+                    Some(s) => s,
+                    None => return Ok(total),
+                };
+                if let Some(new_validity) = reselect(session_slot, config, uid_validity)? {
+                    uid_validity = Some(new_validity);
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Whether `e` came from a server response the IMAP parser couldn't
+/// decode, as opposed to a dead connection or a refusal.
+fn is_unparseable(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| matches!(c.downcast_ref::<imap::Error>(), Some(imap::Error::Parse(_))))
+}
+
+/// What to do about a fetch whose response couldn't be parsed.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Fetch the chunk again one message at a time to find the culprit.
+    Isolate,
+    /// This message fails on its own; fetch its prefilter headers
+    /// without BODYSTRUCTURE, which is where servers tend to go wrong.
+    DropStructure(u32),
+    /// It fails even then; give up on it.
+    Skip(u32),
+}
+
+/// Tracks the fallbacks for messages whose FETCH responses we can't
+/// parse, so that one of them can't stall a scan indefinitely.
+#[derive(Debug, Default)]
+struct Quarantine {
+    /// Fetch one UID at a time while the position is below this.
+    isolate_until: usize,
+    /// The UID to prefilter without BODYSTRUCTURE.
+    without_structure: Option<u32>,
+}
+
+impl Quarantine {
+    /// Where the next fetch from position `done` should stop.
+    fn slice_end(&self, done: usize, len: usize) -> usize {
+        if done < self.isolate_until {
+            done + 1
+        } else {
+            len
+        }
+    }
+
+    fn with_structure(&self, uid: u32) -> bool {
+        self.without_structure != Some(uid)
+    }
+
+    /// The fetch starting at position `done` of `uids` failed to parse.
+    fn on_unparseable(&mut self, uids: &[u32], done: usize) -> Step {
+        let uid = uids[done];
+        if done >= self.isolate_until {
+            // The chunk that failed is the one starting at `done`.
+            self.isolate_until = (done + PREFILTER_BATCH).min(uids.len());
+            Step::Isolate
+        } else if self.with_structure(uid) {
+            self.without_structure = Some(uid);
+            Step::DropStructure(uid)
+        } else {
+            Step::Skip(uid)
+        }
+    }
+}
+
+/// The extractors that haven't seen the mail up to the saved position:
+/// new ones, and ones whose manifest or script changed since.
+fn changed_since(
+    saved: &crate::imap_state::Cursor,
+    extractors: &[crate::extractor::Extractor],
+) -> Vec<crate::extractor::Extractor> {
+    extractors
+        .iter()
+        .filter(|e| saved.extractors.get(&e.name) != Some(&e.fingerprint))
+        .cloned()
+        .collect()
+}
+
+/// Run extractors that are new or changed since the saved position over
+/// the messages up to it, which every other extractor has already seen.
+/// The search is narrowed by their `from_domains` when they all have
+/// one, so adding or fixing a vendor extractor costs a few hundred
+/// messages rather than the whole mailbox.
+fn backfill(
+    session: &mut Session<imap::Connection>,
+    config: &ImapScanConfig<'_>,
+    changed: &[crate::extractor::Extractor],
+    through_uid: u32,
+    uid_validity: Option<u32>,
+    interrupted: &Arc<AtomicBool>,
+) -> Result<()> {
+    let names: Vec<&str> = changed.iter().map(|e| e.name.as_str()).collect();
+    let range = format!("UID 1:{through_uid}");
+    let restriction = build_from_restriction(changed);
+    info!(
+        extractors = ?names,
+        through_uid,
+        narrowed = restriction.is_some(),
+        "running new or changed extractors over earlier mail"
+    );
+    let found = match &restriction {
+        Some(r) => match session.uid_search(format!("{range} {r}")) {
+            Ok(found) => found,
+            Err(imap::Error::No(_) | imap::Error::Bad(_)) => {
+                warn!("narrowed UID SEARCH rejected by the server; backfilling unnarrowed");
+                session
+                    .uid_search(&range)
+                    .with_context(|| format!("UID SEARCH {range}"))?
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("UID SEARCH {range}"))),
+        },
+        None => session
+            .uid_search(&range)
+            .with_context(|| format!("UID SEARCH {range}"))?,
+    };
+    let mut uids: Vec<u32> = found.into_iter().filter(|&u| u <= through_uid).collect();
+    uids.sort_unstable();
+    info!(matched = uids.len(), "UIDs to backfill");
+
+    let subset = ImapScanConfig {
+        extractors: changed,
+        cursor_file: None,
+        ..*config
+    };
+    let pb = make_progress_bar(uids.len() as u64);
+    let stats = process_uids_with_resume(
+        session,
+        &uids,
+        &subset,
+        &pb,
+        uid_validity,
+        interrupted,
+        &|_| {},
+    )?;
+    pb.finish_and_clear();
+    info!(
+        fetched = stats.processed,
+        skipped = stats.prefilter_skipped,
+        "backfill done"
+    );
+    Ok(())
 }
 
 /// Open a fresh connection and authenticate. Used by both the initial
@@ -175,7 +585,7 @@ fn connect_and_authenticate(config: &ImapScanConfig<'_>) -> Result<Session<imap:
         .connect()
         .with_context(|| format!("connecting to {}:{}", config.host, config.port))?;
 
-    let session = match config.auth {
+    let session = match &config.auth {
         AuthMethod::Login { user, password } => client
             .login(user, password)
             .map_err(|(e, _)| e)
@@ -200,8 +610,14 @@ fn connect_and_authenticate(config: &ImapScanConfig<'_>) -> Result<Session<imap:
         //             }
         //         })?
         // }
-        AuthMethod::XOAuth2 { user, access_token } => {
-            let authenticator = XOAuth2Authenticator { user, access_token };
+        AuthMethod::XOAuth2 { user, tokens } => {
+            // Fetch (or reuse a cached) access token now, so a reconnect
+            // after the previous token expired picks up a fresh one.
+            let access_token = tokens.access_token()?;
+            let authenticator = XOAuth2Authenticator {
+                user,
+                access_token: &access_token,
+            };
             client
                 .authenticate("XOAUTH2", &authenticator)
                 .map_err(|(e, _)| anyhow::anyhow!("IMAP AUTHENTICATE XOAUTH2: {e}"))?
@@ -239,14 +655,12 @@ struct ScanStats {
     prefilter_skipped: usize,
 }
 
-/// Walk `uids` in `FETCH_BATCH`-sized chunks, prefilter via
-/// `BODYSTRUCTURE` + headers, fetch RFC822 for survivors, run the
-/// pipeline over each body in parallel.
+/// Walk `uids` in `PREFILTER_BATCH`-sized chunks, prefilter via
+/// `BODYSTRUCTURE` + headers, fetch RFC822 for survivors in
+/// `BODY_BATCH`-sized batches, run the pipeline over each body in
+/// parallel.
 ///
-/// Batches the FETCH round trips: one network round trip per
-/// `FETCH_BATCH` messages instead of one per message. We still process
-/// each returned message serially; parallelising extraction is a
-/// separate change. Each batch starts with a cheap pre-pass that asks
+/// Each chunk starts with a cheap pre-pass that asks
 /// IMAP for the `From`/`Subject` headers plus `BODYSTRUCTURE`, so we
 /// can decide whether any extractor's `from_domains`, `subject_regex`,
 /// and `requires:` hints could match without paying for the full
@@ -258,9 +672,58 @@ fn process_uid_set(
     uids: &[u32],
     config: &ImapScanConfig<'_>,
     pb: &ProgressBar,
+    checkpoint: &dyn Fn(u32),
+) -> Result<ScanStats> {
+    let mut done = 0usize;
+    process_uid_set_with_progress(session, uids, config, true, pb, &mut done, checkpoint)
+}
+
+/// Save the scan position, if this run keeps one. A failure is logged
+/// rather than fatal: the mail was processed, and the worst case is a
+/// restart redoing it from the previous position.
+fn save_cursor(
+    file: Option<&crate::imap_state::CursorFile>,
+    uid_validity: Option<u32>,
+    last_uid: u32,
+    extractors: &[crate::extractor::Extractor],
+) {
+    let (Some(file), Some(uid_validity)) = (file, uid_validity) else {
+        return;
+    };
+    let fingerprints = extractors
+        .iter()
+        .map(|e| (e.name.clone(), e.fingerprint.clone()))
+        .collect();
+    if let Err(e) = file.save(uid_validity, last_uid, &fingerprints) {
+        warn!(
+            error = format!("{e:#}"),
+            path = %file.path().display(),
+            "could not save the scan position"
+        );
+    }
+}
+
+/// Body of [`process_uid_set`] with an out parameter for how many UIDs
+/// have been fully consumed. The callers in one-shot mode discard it;
+/// [`process_uids_with_resume`] reads it after a failure so it can resume
+/// from the next chunk on the next connection. Without `with_structure`
+/// the prefilter goes by headers alone.
+fn process_uid_set_with_progress(
+    session: &mut Session<imap::Connection>,
+    uids: &[u32],
+    config: &ImapScanConfig<'_>,
+    with_structure: bool,
+    pb: &ProgressBar,
+    done: &mut usize,
+    checkpoint: &dyn Fn(u32),
 ) -> Result<ScanStats> {
     let mut stats = ScanStats::default();
-    for chunk in uids.chunks(FETCH_BATCH) {
+    let prefilter_items = if with_structure {
+        "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)] BODYSTRUCTURE)"
+    } else {
+        "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])"
+    };
+    for chunk in uids.chunks(PREFILTER_BATCH) {
         pb.set_message(format!(
             "UIDs {}..={}",
             chunk.first().copied().unwrap_or(0),
@@ -269,10 +732,7 @@ fn process_uid_set(
 
         let prefilter_set = uid_set(chunk);
         let prefilter_fetched = session
-            .uid_fetch(
-                &prefilter_set,
-                "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)] BODYSTRUCTURE)",
-            )
+            .uid_fetch(&prefilter_set, prefilter_items)
             .with_context(|| format!("UID FETCH {prefilter_set} prefilter"))?;
 
         let mut body_set: Vec<u32> = Vec::with_capacity(chunk.len());
@@ -309,61 +769,105 @@ fn process_uid_set(
         body_set.sort_unstable();
 
         if body_set.is_empty() {
+            *done += chunk.len();
+            if let Some(&last) = chunk.last() {
+                checkpoint(last);
+            }
             continue;
         }
 
-        let set = uid_set(&body_set);
-        let fetched = session
-            .uid_fetch(&set, "RFC822")
-            .with_context(|| format!("UID FETCH {set}"))?;
-
-        // Copy each message's body out of the IMAP buffer so we can
-        // drop the borrow on `fetched` (and the session) and feed the
-        // bodies to a worker pool. Each extractor run forks a Python
-        // subprocess, so the bottleneck is the OS scheduler, not Rust
-        // CPU; `rayon`'s default thread count works well here.
-        let mut messages: Vec<(u32, Vec<u8>)> = Vec::with_capacity(body_set.len());
-        for message in fetched.iter() {
-            let Some(uid) = message.uid else {
-                warn!("FETCH response without UID");
-                continue;
-            };
-            let Some(body) = message.body() else {
-                warn!(uid, "message has no RFC822 body");
-                pb.inc(1);
-                continue;
-            };
-            messages.push((uid, body.to_vec()));
+        for batch in body_set.chunks(BODY_BATCH) {
+            stats.processed += fetch_and_process(session, batch, config, pb)?;
         }
-        drop(fetched);
-
-        stats.processed += messages.len();
-
-        messages.par_iter().for_each(|(uid, body)| {
-            debug!(uid, size = body.len(), "processing");
-            let source = format!("UID {uid}");
-            let result = pipeline::run(
-                body,
-                &source,
-                config.extractors,
-                config.targets,
-                pipeline::DkimPolicy::Enforce,
-                config.dry_run,
-                None,
-            );
-            if let Err(e) = result {
-                warn!(uid = *uid, error = %e, "pipeline failed");
-            }
-            pb.inc(1);
-        });
+        // A chunk is only counted as done once every UID in it has been
+        // fully processed (either prefiltered out or fetched and pushed
+        // through the pipeline). If we return with an error, `*done`
+        // still points at the first UID of the failing chunk, so a
+        // resuming caller retries that chunk on the fresh connection.
+        *done += chunk.len();
+        if let Some(&last) = chunk.last() {
+            checkpoint(last);
+        }
     }
     Ok(stats)
+}
+
+/// Fetch the full messages for `uids` and run the pipeline over them.
+/// Returns how many messages were processed.
+fn fetch_and_process(
+    session: &mut Session<imap::Connection>,
+    uids: &[u32],
+    config: &ImapScanConfig<'_>,
+    pb: &ProgressBar,
+) -> Result<usize> {
+    let set = uid_set(uids);
+    let fetched = session
+        .uid_fetch(&set, "(RFC822 INTERNALDATE)")
+        .with_context(|| format!("UID FETCH {set}"))?;
+
+    // Copy each message's body out of the IMAP buffer so we can
+    // drop the borrow on `fetched` (and the session) and feed the
+    // bodies to a worker pool. Each extractor run forks a Python
+    // subprocess, so the bottleneck is the OS scheduler, not Rust
+    // CPU; `rayon`'s default thread count works well here.
+    // INTERNALDATE is when the server took the message in, which
+    // the sender can't set; it gates `unsigned_before`.
+    let mut messages: Vec<(u32, Option<i64>, Vec<u8>)> = Vec::with_capacity(uids.len());
+    for message in fetched.iter() {
+        let Some(uid) = message.uid else {
+            warn!("FETCH response without UID");
+            continue;
+        };
+        let Some(body) = message.body() else {
+            warn!(uid, "message has no RFC822 body");
+            pb.inc(1);
+            continue;
+        };
+        let received_at = message.internal_date().map(|d| d.timestamp());
+        messages.push((uid, received_at, body.to_vec()));
+    }
+    drop(fetched);
+
+    let processed = messages.len();
+
+    messages.par_iter().for_each(|(uid, received_at, body)| {
+        debug!(uid, size = body.len(), "processing");
+        let source = format!("UID {uid}");
+        let result = pipeline::run(
+            body,
+            &source,
+            config.extractors,
+            config.targets,
+            pipeline::DkimPolicy::Enforce {
+                received_at: *received_at,
+            },
+            config.dry_run,
+            None,
+        );
+        if let Err(e) = result {
+            warn!(uid = *uid, error = format!("{e:#}"), "pipeline failed");
+        }
+        pb.inc(1);
+    });
+    Ok(processed)
 }
 
 /// Maximum backoff between failed reconnect attempts. Capped so a
 /// long-running watch eventually retries every minute regardless of
 /// how many failures have accumulated, without DDoSing the server.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Maximum backoff after a failed fetch. Unlike a failed connect, this
+/// can mean the server is rate-limiting us, which on Gmail lasts hours
+/// rather than seconds; retrying every minute would keep us in the
+/// penalty box, so this backs off much further.
+const FETCH_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+
+/// Double a backoff, capped at `max`. Extracted so the progression is
+/// unit-testable without a live connection.
+fn grow_backoff(current: Duration, max: Duration) -> Duration {
+    (current * 2).min(max)
+}
 
 /// IDLE keepalive interval. RFC 2177 says servers may log out clients
 /// after 29 minutes; we DONE+IDLE more frequently so we (a) stay well
@@ -383,6 +887,10 @@ fn watch_loop(
     cursor: &mut u32,
     mut uid_validity: Option<u32>,
     config: &ImapScanConfig<'_>,
+    // Sender restriction to append to each cursor search, or `None`
+    // when the selected extractors don't allow narrowing (or the
+    // server rejected it during the initial scan).
+    from_restriction: Option<&str>,
     interrupted: &Arc<AtomicBool>,
 ) -> Result<()> {
     let mut backoff = Duration::from_secs(1);
@@ -409,7 +917,7 @@ fn watch_loop(
         match wait_result {
             Ok(WaitOutcome::MailboxChanged) | Ok(WaitOutcome::TimedOut) => {}
             Err(e) => {
-                warn!(error = %e, "IDLE failed; reconnecting");
+                warn!(error = format!("{e:#}"), "IDLE failed; reconnecting");
                 session = match reconnect(config, &mut backoff, interrupted) {
                     Some(s) => s,
                     None => return Ok(()),
@@ -425,10 +933,13 @@ fn watch_loop(
         // tick, ask the server for everything past the cursor. Doing
         // this on every wakeup also rescues us from servers that
         // occasionally swallow notifications.
-        let new_uids = match search_after(&mut session, *cursor) {
+        let new_uids = match search_after(&mut session, *cursor, from_restriction) {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "UID SEARCH after cursor failed; reconnecting");
+                warn!(
+                    error = format!("{e:#}"),
+                    "UID SEARCH after cursor failed; reconnecting"
+                );
                 session = match reconnect(config, &mut backoff, interrupted) {
                     Some(s) => s,
                     None => return Ok(()),
@@ -449,8 +960,32 @@ fn watch_loop(
         }
         info!(count = new_uids.len(), "new messages while watching");
         let pb = make_progress_bar(new_uids.len() as u64);
-        let stats = process_uid_set(&mut session, &new_uids, config, &pb)?;
+        let checkpoint = |last_uid: u32| {
+            save_cursor(
+                config.cursor_file,
+                uid_validity,
+                last_uid,
+                config.extractors,
+            )
+        };
+        // Failed fetches back off and reconnect inside, the same as
+        // during the initial scan, rather than exiting and leaving
+        // systemd to restart us at a flat rate.
+        let stats = process_uids_with_resume(
+            &mut session,
+            &new_uids,
+            config,
+            &pb,
+            uid_validity,
+            interrupted,
+            &checkpoint,
+        )?;
         pb.finish_and_clear();
+        if interrupted.load(Ordering::SeqCst) {
+            info!("interrupted, leaving watch mode");
+            let _ = session.logout();
+            return Ok(());
+        }
         if stats.prefilter_skipped > 0 {
             info!(
                 skipped = stats.prefilter_skipped,
@@ -471,8 +1006,12 @@ fn watch_loop(
 /// The set may briefly include `cursor` itself if the server's `*`
 /// quirk resolves to it; we strip that explicitly so the watch loop
 /// never re-processes the cursor message.
-fn search_after(session: &mut Session<imap::Connection>, cursor: u32) -> Result<Vec<u32>> {
-    let query = search_after_query(cursor);
+fn search_after(
+    session: &mut Session<imap::Connection>,
+    cursor: u32,
+    from_restriction: Option<&str>,
+) -> Result<Vec<u32>> {
+    let query = search_after_query(cursor, from_restriction);
     let mut v: Vec<u32> = session
         .uid_search(&query)
         .with_context(|| format!("UID SEARCH {query}"))?
@@ -485,8 +1024,12 @@ fn search_after(session: &mut Session<imap::Connection>, cursor: u32) -> Result<
 
 /// Build the `UID N:*` search query for [`search_after`]. Extracted so
 /// the format is unit-testable without a live IMAP connection.
-fn search_after_query(cursor: u32) -> String {
-    format!("UID {}:*", cursor.saturating_add(1))
+fn search_after_query(cursor: u32, from_restriction: Option<&str>) -> String {
+    let range = format!("UID {}:*", cursor.saturating_add(1));
+    match from_restriction {
+        Some(r) => format!("{range} {r}"),
+        None => range,
+    }
 }
 
 /// Reconnect with exponential backoff up to [`RECONNECT_BACKOFF_MAX`].
@@ -512,8 +1055,8 @@ fn reconnect(
                 return Some(s);
             }
             Err(e) => {
-                warn!(error = %e, "reconnect failed");
-                *backoff = (*backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                warn!(error = format!("{e:#}"), "reconnect failed");
+                *backoff = grow_backoff(*backoff, RECONNECT_BACKOFF_MAX);
             }
         }
     }
@@ -542,11 +1085,83 @@ fn reselect(
     Ok(mbox.uid_validity)
 }
 
-fn build_search_query(since: Option<&str>) -> String {
-    match since {
-        Some(s) => format!("SINCE {s}"),
-        None => "ALL".to_string(),
+/// The first `UID SEARCH`: everything after the saved position when
+/// resuming, otherwise the requested date window.
+fn initial_search_query(
+    resume_after: Option<u32>,
+    since: Option<&str>,
+    before: Option<&str>,
+) -> String {
+    match resume_after {
+        Some(last) => format!("UID {}:*", last.saturating_add(1)),
+        None => build_search_query(since, before),
     }
+}
+
+fn build_search_query(since: Option<&str>, before: Option<&str>) -> String {
+    match (since, before) {
+        (Some(s), Some(b)) => format!("SINCE {s} BEFORE {b}"),
+        (Some(s), None) => format!("SINCE {s}"),
+        (None, Some(b)) => format!("BEFORE {b}"),
+        (None, None) => "ALL".to_string(),
+    }
+}
+
+/// The sender restriction to append to a `UID SEARCH`, built from the
+/// selected extractors' `from_domains`.
+///
+/// `None` means "no restriction is safe": some extractor declares no
+/// `from_domains` at all and so could match a message from any sender.
+/// Otherwise the result is an `OR`-chain of `HEADER FROM` terms.
+///
+/// IMAP's `OR` is strictly binary (RFC 3501 s6.4.4), so N terms become
+/// N-1 prefix `OR`s: `OR OR a b c`. The terms are a deliberate
+/// superset of what [`Extractor::matches_headers`] accepts -- a
+/// substring test against the whole `From` header, so it also matches
+/// display names and lookalike domains -- which is fine because the
+/// per-message prefilter still applies the exact rule afterwards.
+///
+/// [`Extractor::matches_headers`]: crate::extractor::Extractor::matches_headers
+fn build_from_restriction(extractors: &[crate::extractor::Extractor]) -> Option<String> {
+    if extractors.is_empty() {
+        return None;
+    }
+    let mut domains: Vec<&str> = Vec::new();
+    for ex in extractors {
+        let roots = ex.from_domain_roots();
+        if roots.is_empty() {
+            // A hint-less extractor matches any sender; narrowing the
+            // search would hide messages it wants.
+            return None;
+        }
+        domains.extend(roots);
+    }
+    domains.sort_unstable();
+    domains.dedup();
+
+    let mut terms = domains
+        .iter()
+        .map(|d| format!("HEADER FROM {}", quote_imap_string(d)));
+    let mut query = terms.next()?;
+    for term in terms {
+        query = format!("OR {query} {term}");
+    }
+    Some(query)
+}
+
+/// Render `s` as an IMAP quoted string (RFC 3501 s4.3): wrapped in
+/// double quotes with `\` and `"` backslash-escaped.
+fn quote_imap_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '\\' || c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 /// Flatten an IMAP `BODYSTRUCTURE` response into the [`BodyParts`]
@@ -646,12 +1261,33 @@ mod tests {
 
     #[test]
     fn search_query_default() {
-        assert_eq!(build_search_query(None), "ALL");
+        assert_eq!(build_search_query(None, None), "ALL");
     }
 
     #[test]
     fn search_query_since() {
-        assert_eq!(build_search_query(Some("01-Jan-2026")), "SINCE 01-Jan-2026");
+        assert_eq!(
+            build_search_query(Some("01-Jan-2026"), None),
+            "SINCE 01-Jan-2026"
+        );
+    }
+
+    #[test]
+    fn search_query_before() {
+        assert_eq!(
+            build_search_query(None, Some("01-Feb-2026")),
+            "BEFORE 01-Feb-2026"
+        );
+    }
+
+    /// Bounded windows chunk very large mailbox walks so a single IMAP
+    /// session doesn't outlive the server's idle timeout.
+    #[test]
+    fn search_query_since_and_before() {
+        assert_eq!(
+            build_search_query(Some("01-Jan-2026"), Some("01-Feb-2026")),
+            "SINCE 01-Jan-2026 BEFORE 01-Feb-2026"
+        );
     }
 
     #[test]
@@ -679,17 +1315,140 @@ mod tests {
         assert_eq!(uid_set(&[1, 2, 3, 5, 7, 8, 10]), "1:3,5,7:8,10");
     }
 
+    fn fixture_extractors(names: &[&str]) -> Vec<crate::extractor::Extractor> {
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extractors");
+        crate::extractor::discover(&[dir])
+            .unwrap()
+            .into_iter()
+            .filter(|ex| names.contains(&ex.name.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn from_restriction_for_a_single_extractor() {
+        assert_eq!(
+            build_from_restriction(&fixture_extractors(&["fixture-flight"])).as_deref(),
+            Some(r#"HEADER FROM "flight.fixture.test""#)
+        );
+    }
+
+    #[test]
+    fn from_restriction_ors_several_domains() {
+        // Two extractors, one domain each: a single binary OR.
+        assert_eq!(
+            build_from_restriction(&fixture_extractors(&["fixture-flight", "fixture-lodging"]))
+                .as_deref(),
+            Some(r#"OR HEADER FROM "flight.fixture.test" HEADER FROM "lodging.fixture.test""#)
+        );
+    }
+
+    #[test]
+    fn from_restriction_nests_ors_for_three_domains() {
+        // N terms need N-1 prefix ORs; check the nesting shape.
+        assert_eq!(
+            build_from_restriction(&fixture_extractors(&[
+                "fixture-flight",
+                "fixture-lodging",
+                "fixture-parcel-status",
+            ]))
+            .as_deref(),
+            Some(
+                r#"OR OR HEADER FROM "flight.fixture.test" HEADER FROM "lodging.fixture.test" HEADER FROM "parcel.fixture.test""#
+            )
+        );
+    }
+
+    #[test]
+    fn from_restriction_is_none_when_an_extractor_names_no_senders() {
+        // `fixture-ics-pass` declares only `requires:`, so it could
+        // match a message from anyone; narrowing would hide those.
+        assert_eq!(
+            build_from_restriction(&fixture_extractors(&["fixture-flight", "fixture-ics-pass"])),
+            None
+        );
+    }
+
+    #[test]
+    fn from_restriction_is_none_without_extractors() {
+        assert_eq!(build_from_restriction(&[]), None);
+    }
+
+    #[test]
+    fn quote_imap_string_escapes_quotes_and_backslashes() {
+        assert_eq!(quote_imap_string("plain.example"), r#""plain.example""#);
+        assert_eq!(quote_imap_string(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(quote_imap_string(r"a\b"), r#""a\\b""#);
+    }
+
+    #[test]
+    fn search_after_query_appends_the_from_restriction() {
+        assert_eq!(
+            search_after_query(42, Some(r#"HEADER FROM "x.example""#)),
+            r#"UID 43:* HEADER FROM "x.example""#
+        );
+    }
+
+    fn extractor(name: &str, fingerprint: &str) -> crate::extractor::Extractor {
+        crate::extractor::Extractor::for_tests(name, fingerprint)
+    }
+
+    #[test]
+    fn changed_since_picks_new_and_edited_extractors() {
+        let saved = crate::imap_state::Cursor {
+            mailbox: "m".to_string(),
+            uid_validity: 1,
+            last_uid: 10,
+            extractors: [("klm", "aaa"), ("ctrip", "bbb"), ("gone", "ccc")]
+                .into_iter()
+                .map(|(n, f)| (n.to_string(), f.to_string()))
+                .collect(),
+        };
+        let now = [
+            extractor("klm", "aaa"),
+            extractor("ctrip", "changed"),
+            extractor("amadeus", "new"),
+        ];
+        let names: Vec<String> = changed_since(&saved, &now)
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["ctrip", "amadeus"]);
+    }
+
+    /// A position saved before fingerprints were recorded says nothing
+    /// about which extractors saw the mail, so all of them have to.
+    #[test]
+    fn a_position_without_fingerprints_backfills_everything() {
+        let saved: crate::imap_state::Cursor =
+            serde_json::from_str(r#"{"mailbox":"m","uid_validity":1,"last_uid":10}"#).unwrap();
+        assert_eq!(changed_since(&saved, &[extractor("klm", "aaa")]).len(), 1);
+    }
+
+    #[test]
+    fn initial_search_resumes_after_the_saved_position() {
+        assert_eq!(
+            initial_search_query(Some(41), Some("1-Jan-2020"), None),
+            "UID 42:*"
+        );
+        assert_eq!(
+            initial_search_query(None, Some("1-Jan-2020"), None),
+            "SINCE 1-Jan-2020"
+        );
+        assert_eq!(initial_search_query(None, None, None), "ALL");
+    }
+
     #[test]
     fn search_after_query_from_zero() {
         // Initial watch on an empty (or not-yet-scanned) mailbox.
         // `UID 1:*` is the standard "everything that exists" form.
-        assert_eq!(search_after_query(0), "UID 1:*");
+        assert_eq!(search_after_query(0, None), "UID 1:*");
     }
 
     #[test]
     fn search_after_query_from_nonzero_cursor() {
         // Typical watch tick after some UIDs are already processed.
-        assert_eq!(search_after_query(42), "UID 43:*");
+        assert_eq!(search_after_query(42, None), "UID 43:*");
     }
 
     #[test]
@@ -697,7 +1456,10 @@ mod tests {
         // Defensive: u32::MAX as cursor would overflow naively. The
         // resulting query is silly (UID MAX:*) but the function must
         // not panic; the server will return an empty set.
-        assert_eq!(search_after_query(u32::MAX), format!("UID {}:*", u32::MAX));
+        assert_eq!(
+            search_after_query(u32::MAX, None),
+            format!("UID {}:*", u32::MAX)
+        );
     }
 
     #[test]
@@ -785,5 +1547,100 @@ mod tests {
                 .any(|(t, s)| t == "text" && s == "calendar")
         );
         assert!(parts.attachment_filenames.iter().any(|f| f == "invite.ics"));
+    }
+
+    #[test]
+    fn mailbox_not_found_survives_anyhow_downcast() {
+        // The CLI recognises this via `err.is::<MailboxNotFound>()` to
+        // print a plain message instead of a backtrace.
+        let err: anyhow::Error = MailboxNotFound {
+            mailbox: "archive".to_string(),
+        }
+        .into();
+        assert!(err.is::<MailboxNotFound>());
+        assert_eq!(err.to_string(), "no such mailbox: archive");
+    }
+
+    #[test]
+    fn quarantine_narrows_down_to_one_message() {
+        let uids: Vec<u32> = (1..=PREFILTER_BATCH as u32 + 10).collect();
+        let mut q = Quarantine::default();
+        assert_eq!(q.slice_end(0, uids.len()), uids.len());
+        assert!(q.with_structure(1));
+
+        // A chunk fails: its messages are retried one at a time, up to
+        // the end of that chunk.
+        assert_eq!(q.on_unparseable(&uids, 0), Step::Isolate);
+        assert_eq!(q.slice_end(0, uids.len()), 1);
+        assert_eq!(q.slice_end(6, uids.len()), 7);
+        assert_eq!(
+            q.slice_end(PREFILTER_BATCH, uids.len()),
+            uids.len(),
+            "batching resumes after the failing chunk"
+        );
+
+        // The seventh message fails on its own.
+        assert_eq!(q.on_unparseable(&uids, 6), Step::DropStructure(7));
+        assert!(!q.with_structure(7));
+        assert!(q.with_structure(8));
+
+        // And again without BODYSTRUCTURE.
+        assert_eq!(q.on_unparseable(&uids, 6), Step::Skip(7));
+    }
+
+    #[test]
+    fn quarantine_isolates_a_short_last_chunk() {
+        let uids = [10, 20, 30];
+        let mut q = Quarantine::default();
+        assert_eq!(q.on_unparseable(&uids, 1), Step::Isolate);
+        assert_eq!(q.slice_end(1, uids.len()), 2);
+        assert_eq!(q.slice_end(2, uids.len()), 3);
+    }
+
+    #[test]
+    fn quarantine_starts_over_for_a_later_chunk() {
+        let uids: Vec<u32> = (1..=2 * PREFILTER_BATCH as u32).collect();
+        let mut q = Quarantine::default();
+        assert_eq!(q.on_unparseable(&uids, 0), Step::Isolate);
+        assert_eq!(q.on_unparseable(&uids, 3), Step::DropStructure(4));
+        assert_eq!(q.on_unparseable(&uids, PREFILTER_BATCH + 1), Step::Isolate);
+    }
+
+    #[test]
+    fn only_parse_errors_are_unparseable() {
+        let parse = anyhow::Error::new(imap::Error::Parse(imap::error::ParseError::Invalid(
+            b"* 1 FETCH (".to_vec(),
+        )))
+        .context("UID FETCH 1 prefilter");
+        assert!(is_unparseable(&parse));
+        let bye = anyhow::Error::new(imap::Error::ConnectionLost).context("UID FETCH 1 prefilter");
+        assert!(!is_unparseable(&bye));
+    }
+
+    #[test]
+    fn fetch_backoff_grows_to_half_an_hour() {
+        // A throttled Gmail session stays throttled for hours, so the
+        // fetch backoff has to climb well past the reconnect cap.
+        let mut d = Duration::from_secs(1);
+        let mut seen = vec![d];
+        for _ in 0..12 {
+            d = grow_backoff(d, FETCH_BACKOFF_MAX);
+            seen.push(d);
+        }
+        assert_eq!(seen[0], Duration::from_secs(1));
+        assert_eq!(seen[1], Duration::from_secs(2));
+        assert_eq!(seen[10], Duration::from_secs(1024));
+        // Capped, not unbounded.
+        assert_eq!(d, FETCH_BACKOFF_MAX);
+        assert_eq!(grow_backoff(d, FETCH_BACKOFF_MAX), FETCH_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn reconnect_backoff_still_caps_at_a_minute() {
+        let mut d = Duration::from_secs(1);
+        for _ in 0..10 {
+            d = grow_backoff(d, RECONNECT_BACKOFF_MAX);
+        }
+        assert_eq!(d, RECONNECT_BACKOFF_MAX);
     }
 }

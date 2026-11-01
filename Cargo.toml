@@ -14,20 +14,27 @@ default = ["gssapi", "smtp"]
 # NOTE: IMAP GSSAPI (`imap/gssapi`) needs the jelmer/rust-imap fork and is
 # commented out on this release branch so the crate can be published to
 # crates.io with the upstream `imap` crate.
-gssapi = ["dep:base64", "dep:libgssapi"]
+gssapi = ["dep:libgssapi"]
 # SMTP submission for the receipts forwarder. Without it the sendmail
 # pipe transport still works. Pulls in `lettre`'s MIME / encoding /
 # TLS dep tree.
 smtp = ["lettre/smtp-transport", "lettre/tokio1-rustls-tls"]
+# Read-only HTTP dashboard for the artifact directories (`mailsift web`).
+web = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-service"]
 
 [dependencies]
 anyhow = "1"
-base64 = { version = "0.22", optional = true }
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "query", "json"], optional = true }
+base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 clap = { version = "4", features = ["derive"] }
+# Randomness for OAuth2 PKCE verifier + CSRF state.
+getrandom = "0.2"
 # Cross-platform SIGINT/SIGTERM handler for the long-running daemons.
 ctrlc = "3"
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio"], optional = true }
 icalendar = "0.16"
 imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
 imap-proto = "0.16"
@@ -51,11 +58,15 @@ sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.8"
+tower = { version = "0.5", features = ["util"], optional = true }
+tower-service = { version = "0.3", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 wait-timeout = "0.2"
+iso_currency = "0.7.1"
 
 [dev-dependencies]
 assert_cmd = "2"
 indymilter-test = "0.2.0"
+tower = { version = "0.5", features = ["util"] }

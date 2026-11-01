@@ -14,19 +14,29 @@
 //! Year derivation falls through `orderDate`, then `date`; failing
 //! both, the current year. Slug rules match the bills/tickets targets
 //! (lowercase ASCII alphanumerics plus `_`, `.`, `+`).
+//!
+//! Extractors may also emit companion blobs (`<slug>.receipt.pdf` etc.).
+//! Those go through [`ReceiptSink::file_receipt_blob`], which requires
+//! a same-slug `.receipt.json` sibling in the same run and files the
+//! pair under a common `<merchant>-<order>` name. Blobs without a
+//! sibling are dropped with a warning by the pipeline: the extractor
+//! should have emitted the structured record too. The
+//! [`ReceiptSink::Forward`] variant is a no-op for companion blobs:
+//! the original RFC822 was already forwarded on the JSON side.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use tracing::info;
 
 use super::FileOutcome;
-use super::json_target::{derive_year, first_non_empty};
+use super::json_target::{self, derive_year, first_non_empty, read_and_parse};
 use super::mail_forward::{self, MailForwarder};
-use super::sink::{slugify, write_atomic};
-use super::webdav::{PutOutcome, WebdavSink};
+use super::sink::{Merge, sanitize_ext, slugify, update_file};
+use super::tickets::content_type_for;
+use super::webdav::WebdavSink;
 
 /// Where to file `receipt` artifacts.
 pub enum ReceiptSink {
@@ -71,11 +81,13 @@ impl ReceiptSink {
     /// Only the [`ReceiptSink::Forward`] variant uses it; the
     /// LocalDir and WebDAV variants ignore it. Threading it through
     /// the API uniformly keeps the pipeline call site simple.
-    pub fn file_receipt(&self, src: &Path, raw_message: &[u8]) -> Result<FileOutcome> {
-        let body = fs::read_to_string(src)
-            .with_context(|| format!("reading receipt source {}", src.display()))?;
-        let receipt: Receipt = serde_json::from_str(&body)
-            .with_context(|| format!("parsing receipt JSON {}", src.display()))?;
+    pub fn file_receipt(
+        &self,
+        src: &Path,
+        raw_message: &[u8],
+        received_at_epoch: Option<i64>,
+    ) -> Result<FileOutcome> {
+        let (body, receipt) = read_and_parse::<Receipt>(src, "receipt")?;
 
         let merchant = receipt
             .merchant()
@@ -94,58 +106,138 @@ impl ReceiptSink {
             );
         }
 
+        if let ReceiptSink::Forward(fwd) = self {
+            let hint = mail_forward::subject_hint(raw_message);
+            fwd.forward(raw_message, &hint)?;
+            return Ok(FileOutcome::Created(format!("forwarded ({hint})")));
+        }
+        let body_out = json_target::body_with_received_at(&body, received_at_epoch);
+        let filename = format!("{merchant_slug}-{order_slug}.json");
+        let received_at = json_target::received_at_in(body_out.as_bytes())?;
+        self.update(
+            year,
+            &filename,
+            "application/json",
+            "receipt",
+            &json_target::replace_unless_newer(&filename, body_out.as_bytes(), received_at),
+        )
+    }
+
+    /// File a companion blob (typically a PDF) alongside a receipt.
+    ///
+    /// `pair` is the sanitised `(merchant_slug, order_slug, year)`
+    /// pulled from a same-slug `.receipt.json` sibling in the same
+    /// extractor run; the blob is filed under
+    /// `<year>/<merchant>-<order>.<ext>` so it sits beside the JSON.
+    ///
+    /// `received_at` is the date that sibling was filed under. A blob
+    /// has no date of its own, so it follows the JSON: when the record
+    /// on file came from a newer message, the blob on file did too and
+    /// is kept.
+    ///
+    /// The [`ReceiptSink::Forward`] variant is a no-op here: the
+    /// original RFC822 was already forwarded on the JSON receipt.
+    pub fn file_receipt_blob(
+        &self,
+        src: &Path,
+        ext: &str,
+        pair: (&str, &str, i32),
+        received_at: Option<DateTime<Utc>>,
+    ) -> Result<Option<FileOutcome>> {
+        // The forward variant has nothing to do for companion blobs; the
+        // original RFC822 was already forwarded on the JSON side. Short-
+        // circuit before reading the file so we don't slurp its bytes
+        // just to throw them away.
+        if matches!(self, ReceiptSink::Forward(_)) {
+            return Ok(None);
+        }
+        let ext = sanitize_ext(ext)?;
+        let (merchant, order, year) = pair;
+        let name_stem = format!("{merchant}-{order}");
+        let filename = format!("{name_stem}.{ext}");
+        let record = format!("{name_stem}.json");
+        let body =
+            fs::read(src).with_context(|| format!("reading receipt blob {}", src.display()))?;
+        self.update(
+            year,
+            &filename,
+            content_type_for(&ext),
+            "receipt blob",
+            &|_| Ok((!self.filed_from_newer(year, &record, received_at)?).then(|| body.clone())),
+        )
+        .map(Some)
+    }
+
+    /// Whether the receipt JSON at `<year>/<json_filename>`, if any,
+    /// was filed from a newer message than one dated `incoming`. Not
+    /// callable on the forward variant, which keeps no records.
+    fn filed_from_newer(
+        &self,
+        year: i32,
+        json_filename: &str,
+        incoming: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
         match self {
-            ReceiptSink::LocalDir(dir) => {
-                file_to_dir(&merchant_slug, &order_slug, year, body.as_bytes(), dir)
-            }
+            ReceiptSink::LocalDir(dir) => json_target::filed_from_newer(
+                &dir.join(format!("{year:04}")).join(json_filename),
+                incoming,
+            ),
             ReceiptSink::Webdav(sink) => {
-                file_to_webdav(&merchant_slug, &order_slug, year, body.into_bytes(), sink)
+                sink.filed_from_newer(&format!("{year:04}/{json_filename}"), incoming)
             }
-            ReceiptSink::Forward(fwd) => {
-                let hint = mail_forward::subject_hint(raw_message);
-                fwd.forward(raw_message, &hint)?;
-                Ok(FileOutcome::Created(format!("forwarded ({hint})")))
+            ReceiptSink::Forward(_) => {
+                unreachable!("callers short-circuit the forward variant before reaching here")
+            }
+        }
+    }
+
+    /// Replace `<year>/<filename>`, at whichever local or WebDAV backend
+    /// this sink wraps, with whatever `merge` makes of what is there.
+    /// Both blob and JSON call sites route through here so a new
+    /// backend only has to be added once. Not callable on the forward
+    /// variant; callers must short-circuit it first.
+    fn update(
+        &self,
+        year: i32,
+        filename: &str,
+        content_type: &str,
+        log_kind: &str,
+        merge: &Merge<'_>,
+    ) -> Result<FileOutcome> {
+        match self {
+            ReceiptSink::LocalDir(dir) => update_file(
+                &dir.join(format!("{year:04}")).join(filename),
+                log_kind,
+                merge,
+            ),
+            ReceiptSink::Webdav(sink) => sink.update(
+                &format!("{year:04}/{filename}"),
+                content_type,
+                log_kind,
+                merge,
+            ),
+            ReceiptSink::Forward(_) => {
+                unreachable!("callers short-circuit the forward variant before reaching here")
             }
         }
     }
 }
 
-fn file_to_dir(
-    merchant_slug: &str,
-    order_slug: &str,
-    year: i32,
-    body: &[u8],
-    dir: &Path,
-) -> Result<FileOutcome> {
-    let target = dir
-        .join(format!("{year:04}"))
-        .join(format!("{merchant_slug}-{order_slug}.json"));
-
-    let existed = target.exists();
-    write_atomic(&target, body)?;
-
-    if existed {
-        info!(target = %target.display(), "receipt updated");
-        Ok(FileOutcome::Updated(target.display().to_string()))
-    } else {
-        info!(target = %target.display(), "receipt created");
-        Ok(FileOutcome::Created(target.display().to_string()))
+/// Parse `body` as a receipt JSON and return the paired
+/// `(merchant_slug, order_slug, year)` that a companion blob should be
+/// filed under, or `None` if a required field is missing.
+///
+/// Used by the pipeline to resolve a sibling `.receipt.json` to the
+/// name a same-slug `.receipt.<ext>` blob should be filed under.
+pub fn paired_name_from_json(body: &str) -> Option<(String, String, i32)> {
+    let receipt: Receipt = serde_json::from_str(body).ok()?;
+    let merchant_slug = slugify(receipt.merchant()?, false);
+    let order_slug = slugify(receipt.order()?, false);
+    if merchant_slug.is_empty() || order_slug.is_empty() {
+        return None;
     }
-}
-
-fn file_to_webdav(
-    merchant_slug: &str,
-    order_slug: &str,
-    year: i32,
-    body: Vec<u8>,
-    sink: &WebdavSink,
-) -> Result<FileOutcome> {
-    let sub_path = format!("{year:04}/{merchant_slug}-{order_slug}.json");
-    let outcome = sink.put(&sub_path, "application/json", body)?;
-    Ok(match outcome {
-        PutOutcome::Created(url) => FileOutcome::Created(url),
-        PutOutcome::Updated(url) => FileOutcome::Updated(url),
-    })
+    let year = derive_year(receipt.date_candidates());
+    Some((merchant_slug, order_slug, year))
 }
 
 #[cfg(test)]
@@ -179,13 +271,202 @@ mod tests {
         .unwrap();
 
         let sink = ReceiptSink::LocalDir(tmp.path().to_path_buf());
-        let outcome = sink.file_receipt(&src, b"").unwrap();
+        let outcome = sink.file_receipt(&src, b"", None).unwrap();
         let path = match outcome {
             FileOutcome::Created(p) => p,
-            FileOutcome::Updated(_) => panic!("expected Created on first write"),
+            other => panic!("expected Created on first write, got {other:?}"),
         };
         let expected = tmp.path().join("2024/amazon-abc123.json");
         assert_eq!(PathBuf::from(&path), expected);
         assert!(expected.exists());
+    }
+
+    #[test]
+    fn paired_name_from_json_derives_slugs_and_year() {
+        let body =
+            r#"{"merchant":"Digital Ocean","orderNumber":"INV-42","orderDate":"2026-08-01"}"#;
+        let (merchant, order, year) = paired_name_from_json(body).unwrap();
+        assert_eq!(merchant, "digital-ocean");
+        assert_eq!(order, "inv-42");
+        assert_eq!(year, 2026);
+    }
+
+    #[test]
+    fn paired_name_missing_fields_returns_none() {
+        let body = r#"{"orderNumber":"only-order"}"#;
+        assert!(paired_name_from_json(body).is_none());
+    }
+
+    #[test]
+    fn blob_paired_lands_beside_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("blob.pdf");
+        std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
+
+        let sink = ReceiptSink::LocalDir(tmp.path().to_path_buf());
+        let outcome = sink
+            .file_receipt_blob(&src, "pdf", ("digital-ocean", "inv-42", 2026), None)
+            .unwrap()
+            .unwrap();
+        let path = match outcome {
+            FileOutcome::Created(p) => p,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        assert_eq!(
+            PathBuf::from(&path),
+            tmp.path().join("2026/digital-ocean-inv-42.pdf")
+        );
+    }
+
+    #[test]
+    fn webdav_older_mail_does_not_replace_receipt_or_its_blob() {
+        let server = crate::targets::fake_dav::FakeDav::start();
+        let sink = ReceiptSink::Webdav(server.webdav_sink());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("receipt.json");
+        let blob = tmp.path().join("receipt.pdf");
+        let pair = ("digital-ocean", "inv-42", 2026);
+        let at = |epoch| DateTime::from_timestamp(epoch, 0);
+
+        write_receipt(&src, 12.0);
+        std::fs::write(&blob, b"correction").unwrap();
+        sink.file_receipt(&src, b"", Some(CORRECTION_SENT)).unwrap();
+        sink.file_receipt_blob(&blob, "pdf", pair, at(CORRECTION_SENT))
+            .unwrap();
+
+        write_receipt(&src, 10.0);
+        std::fs::write(&blob, b"invoice").unwrap();
+        let outcome = sink.file_receipt(&src, b"", Some(INVOICE_SENT)).unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        let outcome = sink
+            .file_receipt_blob(&blob, "pdf", pair, at(INVOICE_SENT))
+            .unwrap();
+        assert!(matches!(outcome, Some(FileOutcome::Kept(_))));
+
+        let json = server.resource("/2026/digital-ocean-inv-42.json").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["price"], 12.0);
+        assert_eq!(
+            server.resource("/2026/digital-ocean-inv-42.pdf").unwrap(),
+            b"correction"
+        );
+    }
+
+    #[test]
+    fn webdav_newer_mail_replaces_receipt_and_its_blob() {
+        let server = crate::targets::fake_dav::FakeDav::start();
+        let sink = ReceiptSink::Webdav(server.webdav_sink());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("receipt.json");
+        let blob = tmp.path().join("receipt.pdf");
+        let pair = ("digital-ocean", "inv-42", 2026);
+        let at = |epoch| DateTime::from_timestamp(epoch, 0);
+
+        write_receipt(&src, 10.0);
+        std::fs::write(&blob, b"invoice").unwrap();
+        sink.file_receipt(&src, b"", Some(INVOICE_SENT)).unwrap();
+        sink.file_receipt_blob(&blob, "pdf", pair, at(INVOICE_SENT))
+            .unwrap();
+
+        write_receipt(&src, 12.0);
+        std::fs::write(&blob, b"correction").unwrap();
+        let outcome = sink.file_receipt(&src, b"", Some(CORRECTION_SENT)).unwrap();
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+        let outcome = sink
+            .file_receipt_blob(&blob, "pdf", pair, at(CORRECTION_SENT))
+            .unwrap();
+        assert!(matches!(outcome, Some(FileOutcome::Updated(_))));
+
+        let json = server.resource("/2026/digital-ocean-inv-42.json").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["price"], 12.0);
+        assert_eq!(
+            server.resource("/2026/digital-ocean-inv-42.pdf").unwrap(),
+            b"correction"
+        );
+    }
+
+    // 2026-08-01T00:00:00Z and a corrected invoice sent a week later.
+    const INVOICE_SENT: i64 = 1785542400;
+    const CORRECTION_SENT: i64 = 1786147200;
+
+    fn write_receipt(path: &Path, price: f64) {
+        let body = serde_json::json!({
+            "merchant": "Digital Ocean", "orderNumber": "INV-42",
+            "orderDate": "2026-08-01", "price": price,
+        });
+        std::fs::write(path, body.to_string()).unwrap();
+    }
+
+    fn filed_price(dir: &Path) -> serde_json::Value {
+        let body = std::fs::read(dir.join("2026/digital-ocean-inv-42.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        v["price"].clone()
+    }
+
+    #[test]
+    fn older_mail_does_not_replace_receipt_or_its_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("receipt.json");
+        let blob = tmp.path().join("receipt.pdf");
+        let dir = tmp.path().join("out");
+        let sink = ReceiptSink::LocalDir(dir.clone());
+        let pair = ("digital-ocean", "inv-42", 2026);
+        let at = |epoch| DateTime::from_timestamp(epoch, 0);
+
+        write_receipt(&src, 12.0);
+        std::fs::write(&blob, b"correction").unwrap();
+        sink.file_receipt(&src, b"", Some(CORRECTION_SENT)).unwrap();
+        sink.file_receipt_blob(&blob, "pdf", pair, at(CORRECTION_SENT))
+            .unwrap();
+
+        write_receipt(&src, 10.0);
+        std::fs::write(&blob, b"invoice").unwrap();
+        let outcome = sink.file_receipt(&src, b"", Some(INVOICE_SENT)).unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        let outcome = sink
+            .file_receipt_blob(&blob, "pdf", pair, at(INVOICE_SENT))
+            .unwrap();
+        assert!(matches!(outcome, Some(FileOutcome::Kept(_))));
+
+        assert_eq!(filed_price(&dir), 12.0);
+        assert_eq!(
+            std::fs::read(dir.join("2026/digital-ocean-inv-42.pdf")).unwrap(),
+            b"correction"
+        );
+    }
+
+    #[test]
+    fn newer_mail_replaces_receipt_and_its_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("receipt.json");
+        let blob = tmp.path().join("receipt.pdf");
+        let dir = tmp.path().join("out");
+        let sink = ReceiptSink::LocalDir(dir.clone());
+        let pair = ("digital-ocean", "inv-42", 2026);
+        let at = |epoch| DateTime::from_timestamp(epoch, 0);
+
+        write_receipt(&src, 10.0);
+        std::fs::write(&blob, b"invoice").unwrap();
+        sink.file_receipt(&src, b"", Some(INVOICE_SENT)).unwrap();
+        sink.file_receipt_blob(&blob, "pdf", pair, at(INVOICE_SENT))
+            .unwrap();
+
+        write_receipt(&src, 12.0);
+        std::fs::write(&blob, b"correction").unwrap();
+        let outcome = sink.file_receipt(&src, b"", Some(CORRECTION_SENT)).unwrap();
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+        let outcome = sink
+            .file_receipt_blob(&blob, "pdf", pair, at(CORRECTION_SENT))
+            .unwrap();
+        assert!(matches!(outcome, Some(FileOutcome::Updated(_))));
+
+        assert_eq!(filed_price(&dir), 12.0);
+        assert_eq!(
+            std::fs::read(dir.join("2026/digital-ocean-inv-42.pdf")).unwrap(),
+            b"correction"
+        );
     }
 }

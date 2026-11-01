@@ -1,25 +1,25 @@
 # mailsift
 
-A tool that watches your email and automatically pulls out the
-useful structured bits: calendar events, bills, parcels, receipts,
-tickets, subscriptions. The idea is that your inbox already
-contains most of the data you care about (flight times, parcel
-tracking numbers, invoice due dates, restaurant bookings) and a
-small program can lift that data out into proper files and feeds
-so you don't have to.
+A tool that watches your email and pulls out the structured bits:
+calendar events, bills, parcels, receipts, tickets, subscriptions.
+Your inbox already contains most of the data you care about - flight
+times, tracking numbers, invoice due dates, restaurant bookings - and
+a small program can lift it out into proper files and feeds.
 
-Concretely, for each incoming message mailsift runs a set of small
-per-vendor extractor scripts. Each extractor reads the raw RFC822
-on stdin and writes typed artifact files into a per-run tempdir:
+For each incoming message mailsift runs a set of small per-vendor
+extractor scripts. Each reads the raw RFC822 on stdin and writes typed
+artifact files into a per-run tempdir:
 
 | Suffix             | What it is                                                                          |
 |--------------------|-------------------------------------------------------------------------------------|
 | `.event.ics`       | iCalendar event (parsed and re-emitted via the [`icalendar`] crate).                |
-| `.reservation.json`| schema.org reservation (Flight/Train/Bus/Lodging/Event/FoodEstablishment). Converted to a single VEVENT. |
+| `.reservation.json`| schema.org reservation (Flight/Train/Bus/Lodging/Event/FoodEstablishment). Converted to a single VEVENT, and archived as JSON when `reservations_dir` is set. |
 | `.bill.json`       | Loosely schema.org `Invoice`-shaped record (payee, invoice number, due date, ...).  |
+| `.bill.<ext>`      | Companion blob for a bill (typically the vendor PDF). Must ship with a same-slug `.bill.json` in the same run; orphan blobs are dropped. |
 | `.parcel.json`     | schema.org `ParcelDelivery`-shaped record (merged across status-update mails).      |
 | `.receipt.json`    | Loosely schema.org `Order`-shaped record (merchant, order number, date, ...).       |
-| `.ticket.<ext>`    | Opaque ticket / boarding pass blob (`pdf`, `pkpass`, image formats).                |
+| `.receipt.<ext>`   | Companion blob for a receipt (typically the vendor PDF). Must ship with a same-slug `.receipt.json` in the same run; orphan blobs are dropped. |
+| `.ticket.<ext>`    | Opaque ticket / boarding pass blob (`pdf`, `pkpass`, image formats). Filed with a `.meta.json` sidecar describing it. |
 
 Events go to a CalDAV inbox calendar or to a local `<UID>.ics` directory.
 Bills, parcels, receipts and tickets get filed under year-keyed local
@@ -36,23 +36,19 @@ cargo install --path .
 ```
 
 The build needs a C toolchain (for `aws-lc-rs`) and, by default, a
-system GSSAPI library (MIT Kerberos or Heimdal). To build without
-Kerberos:
+system GSSAPI library (MIT Kerberos or Heimdal). The `gssapi` feature
+gates SASL `GSSAPI` for IMAP and HTTP `Negotiate` for CalDAV; both fall
+back to basic auth. To build without Kerberos:
 
 ```sh
 cargo install --path . --no-default-features
 ```
 
-The `gssapi` Cargo feature gates SASL `GSSAPI` for IMAP and HTTP
-`Negotiate` for CalDAV. Both fall back gracefully; basic auth still
-works.
-
 ## Configure
 
-mailsift looks for `$XDG_CONFIG_HOME/mailsift/config.toml`
-(typically `~/.config/mailsift/config.toml`) automatically. Pass
-`--config <path>` to override. See `config.example.toml` for the
-shape; every key is optional.
+mailsift reads `$XDG_CONFIG_HOME/mailsift/config.toml` (typically
+`~/.config/mailsift/config.toml`); `--config <path>` overrides it. See
+`config.example.toml` for the shape; every key is optional.
 
 A minimal config:
 
@@ -62,6 +58,7 @@ bills_dir      = "/home/jelmer/Documents/bills"
 parcels_dir    = "/home/jelmer/Documents/parcels"
 receipts_dir   = "/home/jelmer/Documents/receipts"
 tickets_dir    = "/home/jelmer/Documents/tickets"
+reservations_dir = "/home/jelmer/Documents/reservations"
 
 [caldav]
 url           = "https://jelmer@cal.example.org/dav/jelmer/inbox/"
@@ -95,27 +92,87 @@ mailsift imap-scan imaps://jelmer@mail.example.org/INBOX \
 ```
 
 The URL is the whole connection spec: scheme, optional user, host,
-optional port, optional mailbox path. With the `gssapi` feature, omit
-`--password-file` to authenticate via Kerberos from the caller's
-credential cache. Without a user in the URL the current OS user is
-used. Selects the mailbox **read-only**: no flags set, nothing
-expunged.
+optional port, optional mailbox path; without a user the current OS user
+is used. With the `gssapi` feature, omit `--password-file` to
+authenticate via Kerberos. The mailbox is selected **read-only**.
 
-For Gmail (and other XOAUTH2 providers), pass a short-lived OAuth2
-bearer token via `--oauth2-token-file` instead of `--password-file`:
+`--extractor NAME` restricts the run to one extractor; repeat it to
+select several. Unknown names are an error rather than a silently
+smaller run.
+
+Every scan already prefilters before fetching bodies: each batch first
+asks for `BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)]` and `BODYSTRUCTURE`,
+and only messages some extractor could match are fetched in full.
+Narrowing with `--extractor` tightens that automatically. On top of it,
+when every selected extractor declares `from_domains`, the `UID SEARCH`
+itself is narrowed to those senders:
 
 ```sh
-mailsift imap-scan imaps://you@imap.gmail.com/INBOX \
-    --oauth2-token-file ~/.cache/mailsift/gmail.token \
-    --since 01-Jan-2026
+mailsift imap-scan imaps://jelmer@mail.example.org/INBOX \
+    --since 01-Jan-2026 --extractor parcel-dhl
+# UID SEARCH SINCE 01-Jan-2026 HEADER FROM "dhl.com"
 ```
 
-The token file must contain just the access token (trailing newline is
-trimmed). Obtain one however you like; `oauth2l fetch --type=bearer
---scope=https://mail.google.com/ --output_format=bare > gmail.token`
-works for personal accounts; for workspace accounts use a service
-account with domain-wide delegation. Gmail access tokens expire after
-~1 hour, so refresh before each run.
+so the server never returns the other UIDs at all. The `HEADER FROM`
+terms are a deliberate superset of the manifest's matching rule (a
+substring test over the whole header, so `*.dhl.com` and `dhl.com`
+alike become `dhl.com`); the exact check still runs per message
+afterwards. Servers that dislike the query are no problem: the scan
+warns and retries unnarrowed, with unchanged results.
+
+The narrowing is off whenever a selected extractor declares no
+`from_domains`, since it could match mail from anyone.
+
+#### Gmail
+
+Gmail rejects normal passwords over IMAP, so use either an app password
+or OAuth2.
+
+**App password.** With 2-Step Verification on, create an [app
+password](https://myaccount.google.com/apppasswords), put it in a file,
+and use it like any other IMAP password:
+
+```sh
+mkdir -p ~/.config/mailsift
+(umask 077; cat > ~/.config/mailsift/gmail.pass)   # paste, then Ctrl-D
+mailsift imap-scan imaps://you@imap.gmail.com/INBOX \
+    --password-file ~/.config/mailsift/gmail.pass --since 01-Jan-2026
+```
+
+Spaces in the pasted password are fine; the file is used verbatim after
+trimming surrounding whitespace. Workspace admins can disable app
+passwords, in which case use OAuth2.
+
+**OAuth2 (XOAUTH2).** Run `mailsift imap-auth` once to do the browser
+consent flow and write a JSON credential bundle, then point `imap-scan`
+at it. A fresh access token is minted at every connect, so this survives
+token expiry across reconnects and `--watch` sessions.
+
+```sh
+mailsift imap-auth you@gmail.com \
+    --client-id "$CLIENT_ID.apps.googleusercontent.com" \
+    --client-secret-file ~/.config/mailsift/gmail.client-secret \
+    --output ~/.config/mailsift/gmail.json
+mailsift imap-scan imaps://you@imap.gmail.com/INBOX \
+    --oauth2-credentials-file ~/.config/mailsift/gmail.json --watch
+```
+
+`imap-auth` starts a temporary server on `127.0.0.1` and opens your
+browser; `--no-browser` prints the URL and reads the redirect back
+instead. The provider is derived from the account domain, or named with
+`--provider google|microsoft`. The client id and secret come from an
+OAuth2 client you register with the provider (a "Desktop app" client for
+Google; a public/native client for Microsoft, which has no secret). The
+bundle holds a long-lived refresh token and is written owner-readable.
+
+A bundle can also be assembled by hand from an existing refresh token
+with `--oauth2-refresh-token-file`, `--oauth2-client-id`,
+`--oauth2-client-secret-file` and `--oauth2-provider` /
+`--oauth2-token-endpoint`.
+
+For a one-off scan finishing within the hour, `--oauth2-token-file`
+takes a plain short-lived bearer token instead. It is read once at
+startup, so it will not outlast a long `--watch` session.
 
 A progress bar shows scan progress when stderr is a TTY; one summary
 line per message names the UID, extractor, and what was extracted:
@@ -126,11 +183,9 @@ INFO extracted from UID 1234: easyjet=2 events
 ```
 
 Add `--watch` to stay connected after the initial scan and process new
-messages as they arrive (IMAP IDLE, RFC 2177). The same connection is
-reused; on transport errors it reconnects with exponential backoff
-(1, 2, 4, ..., 60 s). `--limit` then applies only to the initial
-backfill; once watching, every new UID is processed. Ctrl-C exits
-cleanly (within the IDLE keepalive window, currently 5 minutes).
+messages as they arrive (IMAP IDLE, RFC 2177), reconnecting with
+exponential backoff on transport errors. `--limit` then applies only to
+the initial backfill.
 
 ```sh
 mailsift imap-scan imaps://jelmer@mail.example.org/INBOX \
@@ -141,23 +196,143 @@ Watch refuses to continue if the mailbox's `UIDVALIDITY` changes
 between reconnects (server restored from backup or renumbered the
 mailbox); restart manually in that case.
 
+Watch saves how far it got, per account and mailbox, under
+`$XDG_STATE_HOME/mailsift/imap/`, so a restart picks up after the last
+processed message instead of scanning the whole mailbox again. The
+saved position is dropped when `UIDVALIDITY` has changed, and is not
+used with `--since`, `--before`, `--limit` or `--dry-run`. Pass
+`--rescan` to start from the top regardless.
+
+The saved position also records a fingerprint of each extractor's
+manifest and script. When an extractor is added or changed, a restart
+first runs just that extractor over the earlier mail, searching only
+its `from_domains` when it has them, and then carries on. A changed
+catch-all extractor such as `schema-ld` still means a full pass, but
+only for that extractor. Shared helpers under `_lib/` aren't
+fingerprinted; use `--rescan` after changing those.
+
+### `maildir-scan`: walk a Maildir on disk
+
+```sh
+mailsift maildir-scan /srv/mail/jelmer/Maildir
+mailsift maildir-scan /srv/mail/jelmer/Maildir --recurse
+mailsift maildir-scan /srv/mail/jelmer/Maildir --recurse --since 2026-01-01
+mailsift maildir-scan /srv/mail/jelmer/Maildir --recurse --extractor parcel-dhl
+```
+
+Reads `cur/` and `new/` (`tmp/` is skipped); `--recurse` also descends
+into Maildir++ subfolders. Useful for one-off backfills against archived
+mail.
+
+Both scans share the milter's dedup store
+(`$XDG_STATE_HOME/mailsift/seen.db`), so scanning the same mail again
+only sends CalDAV the events that changed. Pass `--no-dedup` to send
+every event regardless, e.g. to restore ones that were edited or
+deleted on the server.
+
+`--extractor NAME` restricts the run to one extractor; repeat it to
+select several. Unknown names are an error rather than a silently
+smaller run.
+
+Backfilling a single extractor over a large archive doesn't have to read
+every message: when every selected extractor declares `from_domains` or
+`subject_regex` in its manifest, the scan first reads just the header
+block of each file and drops the messages no selected extractor could
+match, so only the survivors are parsed and dispatched in full. This is
+the on-disk counterpart to `imap-scan`'s `BODY[HEADER.FIELDS]`
+prefilter. A message whose header block is implausibly large, or that
+can't be read, is passed through to the pipeline rather than dropped.
+
+The narrowing is off whenever any selected extractor declares neither
+hint, since such an extractor matches every message and the bodies would
+have to be read anyway. The run logs how many messages the prefilter
+dropped, so it's visible when it applied.
+
 ### `milter`: Postfix milter
 
 ```sh
 mailsift milter --socket unix:/run/mailsift/milter.sock
 ```
 
-Listens for milter calls and runs the pipeline at end-of-message. Always
-returns `Continue`; extraction failures never block mail delivery. A
-wall-clock deadline (default 20 s) caps each message; if exceeded the
-mail is accepted without extraction.
+Runs the pipeline at end-of-message and always returns `Continue`, so
+extraction failures never block delivery. A wall-clock deadline
+(default 20 s) caps each message.
 
-The milter front-end can't enforce extractor-level `require_dkim`
-constraints (it sees mail before the local MTA's DKIM check has run), so
-it skips that check. Use `replay`/`imap-scan` for retroactive runs that
-do want DKIM enforcement.
+The milter sees mail before the local MTA's DKIM check has run, so it
+can't enforce extractor-level `require_dkim` and skips that check. Use
+`replay`/`imap-scan` for runs that do want DKIM enforcement.
+
+### `web`: browse extracted artifacts
+
+Build with the optional `web` feature:
+
+```sh
+cargo install --path . --features web
+```
+
+Then serve a read-only HTML dashboard over the configured
+`bills_dir` / `parcels_dir` / `receipts_dir` / `subscriptions_dir` /
+`events_dir` / `reservations_dir` / `tickets_dir`:
+
+```sh
+mailsift web --listen 127.0.0.1:8088          # TCP
+mailsift web --listen unix:/run/mailsift.sock  # unix socket
+```
+
+The dashboard rescans the artifact directories on every request, so it
+happily sits alongside a running milter or `imap-scan --watch`. JSON
+views for scripting live at `/api/bills.json`, `/api/parcels.json`,
+`/api/receipts.json`, `/api/subscriptions.json` and
+`/api/reservations.json`; raw `.ics` and ticket blobs are served with
+their proper Content-Type.
+
+No authentication is built in; bind to loopback (or put it behind a
+reverse proxy) if the artifacts are personal.
+
+### Dovecot Sieve
+
+There is no dedicated Sieve mode: `replay -` already fits the Sieve
+pipe contract (raw RFC822 on stdin, run the pipeline, exit 0). Sieve
+runs during local delivery, after Dovecot has added its
+`Authentication-Results:` header, so unlike the milter this path *does*
+enforce `require_dkim`.
+
+Enable the `sieve_extprograms` plugin and the `pipe` extension:
+
+```
+# dovecot / pigeonhole plugin block
+plugin {
+  sieve_plugins       = sieve_extprograms
+  sieve_extensions    = +vnd.dovecot.pipe
+  sieve_pipe_bin_dir  = /usr/lib/dovecot/sieve-pipe
+}
+```
+
+Programs in `sieve_pipe_bin_dir` are invoked with a fixed argv, so drop
+a wrapper there rather than symlinking the binary directly:
+
+```sh
+# /usr/lib/dovecot/sieve-pipe/mailsift
+#!/bin/sh
+exec /usr/local/bin/mailsift --config /etc/mailsift/config.toml replay -
+```
+
+Then pipe delivered mail through it:
+
+```sieve
+require ["vnd.dovecot.pipe"];
+pipe :copy "mailsift";
+```
+
+The `:copy` modifier is load-bearing: without it `pipe` counts as the
+message's delivery action and the mail never reaches the mailbox. Put
+the rule in a `sieve_before` script to run it ahead of users' own
+filters.
 
 ## Extractors
+
+A collection of ready-to-use extractors lives at
+[mailsift-extractors](https://github.com/jelmer/mailsift-extractors).
 
 Each extractor is a pair: a YAML manifest and an executable script.
 mailsift discovers them by scanning the configured `extractors_dir`
@@ -185,9 +360,12 @@ every message today.
 
 Each script receives the raw RFC822 on stdin, runs in a fresh tempdir,
 and writes named artifact files into its cwd. Python extractors can use
-the helper at `extractors/_lib/mailsift_extractor.py`; others just
-parse the message themselves. Exit 0 means "done, look at my output";
-non-zero means "I failed, skip me".
+the helper at `extractors/_lib/mailsift_extractor.py`. Exit 0 means
+"done, look at my output"; non-zero means "I failed, skip me".
+
+For the full extractor contract - manifest fields, dispatch semantics,
+artifact filenames, and how to test one - see
+[README.extractors.md](README.extractors.md).
 
 ## Development
 
@@ -199,7 +377,7 @@ cargo fmt
 ```
 
 Integration tests in `tests/` replay corpus messages through the full
-pipeline and compare the resulting `.ics` / `.json` artifacts byte-for-byte.
+pipeline and compare the resulting artifacts byte-for-byte.
 
 ## License
 

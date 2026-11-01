@@ -15,11 +15,32 @@
 //! - Otherwise return the original 401 to the caller, who decides
 //!   whether to error or accept.
 
-#[cfg(feature = "gssapi")]
-use anyhow::anyhow;
-use anyhow::{Context, Result};
-use reqwest::header::{HeaderMap, WWW_AUTHENTICATE};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow};
+use reqwest::header::{ETAG, HeaderMap, IF_MATCH, IF_NONE_MATCH, RETRY_AFTER, WWW_AUTHENTICATE};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use tracing::{debug, warn};
+
+use super::http_client::truncate;
+
+/// Maximum number of send attempts against a single request. One attempt
+/// plus this many additional retries on transient failure.
+const MAX_TRANSIENT_RETRIES: u32 = 3;
+
+/// Base delay for exponential backoff on transient failures. Doubles on
+/// each subsequent attempt; capped at [`MAX_BACKOFF`].
+const BASE_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Cap on the exponential-backoff delay. A `Retry-After` header from
+/// the server can override this (up to a sanity limit).
+const MAX_BACKOFF: Duration = Duration::from_secs(8);
+
+/// Absolute cap on any wait, even if the server sends a huge
+/// `Retry-After`. A misconfigured server shouldn't be able to freeze
+/// the daemon.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// HTTP auth credentials available to a sink.
 ///
@@ -62,6 +83,19 @@ impl AttemptScheme {
             Auth::Negotiate { .. } => Self::Negotiate,
             #[cfg(feature = "gssapi")]
             Auth::Both { .. } => Self::Negotiate,
+        }
+    }
+
+    /// Pick a fallback for when the preferred scheme couldn't even be
+    /// applied locally. Unlike [`Self::fallback`] there's no server
+    /// challenge to consult, so this only fires when we hold complete
+    /// credentials for the other scheme.
+    #[cfg_attr(not(feature = "gssapi"), allow(unused_variables))]
+    fn local_failure_fallback(auth: &Auth, attempted: Self) -> Option<Self> {
+        match (auth, attempted) {
+            #[cfg(feature = "gssapi")]
+            (Auth::Both { .. }, Self::Negotiate) => Some(Self::Basic),
+            _ => None,
         }
     }
 
@@ -170,8 +204,74 @@ pub fn apply_auth(
     }
 }
 
+/// How often to redo a read-then-conditional-PUT whose resource keeps
+/// changing in between before giving up.
+pub const MAX_UPDATE_ATTEMPTS: u32 = 5;
+
+/// A resource as [`get_if_exists`] found it.
+pub struct Fetched {
+    pub body: Vec<u8>,
+    /// Its entity tag, if the server sent one a later PUT can be made
+    /// conditional on.
+    pub etag: Option<String>,
+}
+
+/// GET `url` through [`send_with_auth_retry`], or `None` if nothing is
+/// there yet.
+pub async fn get_if_exists(client: &Client, auth: &Auth, url: &str) -> Result<Option<Fetched>> {
+    let response = send_with_auth_retry(client, auth, |client| client.get(url))
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = response.status();
+    if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "GET {url} returned {status}: {}",
+            truncate(&body, 200)
+        ));
+    }
+    // `If-Match` compares strongly, so a weak tag would never match.
+    let etag = response
+        .headers()
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .filter(|etag| !etag.starts_with("W/"))
+        .map(str::to_string);
+    let body = response
+        .bytes()
+        .await
+        .with_context(|| format!("reading body of {url}"))?
+        .to_vec();
+    Ok(Some(Fetched { body, etag }))
+}
+
+/// Make the PUT `request` conditional on its resource still being as
+/// `found`: absent, or carrying the same entity tag. The server then
+/// answers `412 Precondition Failed` rather than let the PUT land on
+/// top of a change made since, whoever made it.
+pub fn unless_changed(request: RequestBuilder, found: Option<&Fetched>) -> RequestBuilder {
+    match found {
+        None => request.header(IF_NONE_MATCH, "*"),
+        Some(Fetched {
+            etag: Some(etag), ..
+        }) => request.header(IF_MATCH, etag),
+        // Nothing to make it conditional on.
+        Some(Fetched { etag: None, .. }) => request,
+    }
+}
+
+/// Set once we've reported that the preferred scheme can't be applied
+/// locally, so a bulk run doesn't repeat the same warning per request.
+static LOCAL_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// Send a request, retrying once with a fallback scheme on 401 when the
-/// server's `WWW-Authenticate` invites it. The closure builds a fresh
+/// server's `WWW-Authenticate` invites it, and up to
+/// [`MAX_TRANSIENT_RETRIES`] times with exponential backoff on transient
+/// server errors (429, 500, 502, 503, 504). Honours `Retry-After` when
+/// present (capped at [`MAX_RETRY_AFTER`]). The closure builds a fresh
 /// request each time it's called (since `RequestBuilder` is consumed by
 /// `send()`).
 pub async fn send_with_auth_retry<F>(
@@ -182,8 +282,59 @@ pub async fn send_with_auth_retry<F>(
 where
     F: Fn(&Client) -> RequestBuilder,
 {
+    let mut attempt: u32 = 0;
+    loop {
+        let response = send_with_auth_only(client, auth, &build_request).await?;
+        if !is_transient(response.status()) || attempt >= MAX_TRANSIENT_RETRIES {
+            return Ok(response);
+        }
+        let wait = retry_after(response.headers()).unwrap_or_else(|| backoff(attempt));
+        warn!(
+            status = %response.status(),
+            attempt = attempt + 1,
+            max = MAX_TRANSIENT_RETRIES,
+            wait_ms = wait.as_millis() as u64,
+            "transient HTTP failure; retrying after backoff"
+        );
+        // Consume the body so the connection can be reused on the retry.
+        drop(response);
+        tokio::time::sleep(wait).await;
+        attempt += 1;
+    }
+}
+
+/// The original auth-retry-only path, split out so the transient-retry
+/// loop can invoke it once per attempt.
+async fn send_with_auth_only<F>(client: &Client, auth: &Auth, build_request: &F) -> Result<Response>
+where
+    F: Fn(&Client) -> RequestBuilder,
+{
     let preferred = AttemptScheme::preferred(auth);
-    let response = send_once(client, auth, &build_request, preferred).await?;
+    let response = match send_once(client, auth, build_request, preferred).await {
+        Ok(response) => response,
+        // Negotiate can fail before anything is sent (no Kerberos
+        // ticket, unreadable credential cache). That's a local
+        // condition, not a server rejection, so the 401-driven
+        // fallback below never gets a chance to run. When we also hold
+        // Basic credentials, use them rather than failing the request.
+        Err(error) => match AttemptScheme::local_failure_fallback(auth, preferred) {
+            Some(fallback) => {
+                // A bulk backfill makes this per request; say it once
+                // at WARN and keep the rest for debug.
+                if !LOCAL_FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        scheme = ?preferred,
+                        error = %format!("{error:#}"),
+                        "auth scheme unavailable locally; falling back for this and later requests"
+                    );
+                } else {
+                    debug!(scheme = ?preferred, "auth scheme unavailable locally; falling back");
+                }
+                return send_once(client, auth, build_request, fallback).await;
+            }
+            None => return Err(error),
+        },
+    };
     if response.status() != StatusCode::UNAUTHORIZED {
         return Ok(response);
     }
@@ -192,7 +343,37 @@ where
     let Some(fallback) = AttemptScheme::fallback(auth, preferred, &challenge) else {
         return Ok(response);
     };
-    send_once(client, auth, &build_request, fallback).await
+    send_once(client, auth, build_request, fallback).await
+}
+
+/// Which status codes we treat as safe to retry. 429 is the standard
+/// rate-limit signal; the 5xx set is the transient family the client
+/// can't distinguish from server bugs, so we err on the side of retrying.
+fn is_transient(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+/// Exponential backoff for attempt N (0-indexed): 0.5s, 1s, 2s, 4s...
+/// clamped to [`MAX_BACKOFF`].
+fn backoff(attempt: u32) -> Duration {
+    let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+    BASE_BACKOFF.saturating_mul(factor).min(MAX_BACKOFF)
+}
+
+/// Parse a `Retry-After` header value. Supports the delay-in-seconds
+/// form only; the HTTP-date form is technically valid but rare in
+/// practice and adds an httpdate dep for a marginal case.
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    let secs: u64 = value.parse().ok()?;
+    Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER))
 }
 
 async fn send_once<F>(
@@ -242,6 +423,44 @@ pub fn parse_www_authenticate(headers: &HeaderMap) -> WwwAuthenticate {
 mod tests {
     use super::*;
     use reqwest::header::HeaderValue;
+
+    fn precondition_headers(found: Option<&Fetched>) -> Vec<(String, String)> {
+        let request = Client::new().put("http://dav.example.org/x");
+        let request = unless_changed(request, found).build().unwrap();
+        request
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_string()))
+            .collect()
+    }
+
+    fn fetched(etag: Option<&str>) -> Fetched {
+        Fetched {
+            body: Vec::new(),
+            etag: etag.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn unless_changed_requires_absence_when_nothing_was_found() {
+        assert_eq!(
+            precondition_headers(None),
+            vec![("if-none-match".to_string(), "*".to_string())]
+        );
+    }
+
+    #[test]
+    fn unless_changed_requires_the_etag_that_was_found() {
+        assert_eq!(
+            precondition_headers(Some(&fetched(Some("\"v3\"")))),
+            vec![("if-match".to_string(), "\"v3\"".to_string())]
+        );
+    }
+
+    #[test]
+    fn unless_changed_is_unconditional_without_an_etag() {
+        assert_eq!(precondition_headers(Some(&fetched(None))), vec![]);
+    }
 
     fn headers_with(values: &[&str]) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -294,5 +513,93 @@ mod tests {
     fn missing_credentials_without_gssapi_is_rejected() {
         let err = build_auth("https://example.org/", None, None, "WebDAV").unwrap_err();
         assert!(err.to_string().contains("requires a username"), "{err}");
+    }
+
+    #[test]
+    fn transient_codes_are_the_expected_set() {
+        assert!(is_transient(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_transient(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_transient(StatusCode::BAD_GATEWAY));
+        assert!(is_transient(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_transient(StatusCode::GATEWAY_TIMEOUT));
+        assert!(!is_transient(StatusCode::OK));
+        assert!(!is_transient(StatusCode::UNAUTHORIZED));
+        assert!(!is_transient(StatusCode::BAD_REQUEST));
+        assert!(!is_transient(StatusCode::NOT_FOUND));
+        assert!(!is_transient(StatusCode::CONFLICT));
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        assert_eq!(backoff(0), BASE_BACKOFF);
+        assert_eq!(backoff(1), BASE_BACKOFF * 2);
+        assert_eq!(backoff(2), BASE_BACKOFF * 4);
+        assert_eq!(backoff(3), BASE_BACKOFF * 8);
+        // High attempt numbers saturate to the cap rather than overflowing.
+        assert_eq!(backoff(20), MAX_BACKOFF);
+        assert_eq!(backoff(u32::MAX), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn retry_after_parses_seconds() {
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("3"));
+        assert_eq!(retry_after(&h), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn retry_after_caps_absurd_values() {
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("999999"));
+        assert_eq!(retry_after(&h), Some(MAX_RETRY_AFTER));
+    }
+
+    #[test]
+    fn retry_after_ignores_http_date_form() {
+        // We only support the delay-seconds form; a date-form value
+        // returns None so the caller falls back to exponential backoff.
+        let mut h = HeaderMap::new();
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after(&h), None);
+    }
+
+    #[test]
+    fn retry_after_absent_returns_none() {
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
+
+    #[cfg(feature = "gssapi")]
+    #[test]
+    fn negotiate_failing_locally_falls_back_to_basic() {
+        // A missing or unreadable Kerberos cache makes Negotiate fail
+        // before the request is sent, so there's no 401 to drive the
+        // usual fallback. With Basic credentials in hand we should
+        // still use them.
+        let auth = Auth::Both {
+            user: "jelmer".into(),
+            password: "secret".into(),
+            host: "cal.example".into(),
+        };
+        assert_eq!(
+            AttemptScheme::local_failure_fallback(&auth, AttemptScheme::Negotiate),
+            Some(AttemptScheme::Basic)
+        );
+    }
+
+    #[cfg(feature = "gssapi")]
+    #[test]
+    fn negotiate_only_has_no_local_fallback() {
+        // Without a password there is nothing to fall back to; the
+        // error must surface rather than being swallowed.
+        let auth = Auth::Negotiate {
+            host: "cal.example".into(),
+        };
+        assert_eq!(
+            AttemptScheme::local_failure_fallback(&auth, AttemptScheme::Negotiate),
+            None
+        );
     }
 }

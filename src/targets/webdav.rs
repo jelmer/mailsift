@@ -8,8 +8,10 @@
 //! Layout: each PUT lands at `<base_url>/<sub_path>`, where `sub_path`
 //! is set by the caller (e.g. `<year>/<slug>.<ext>`). The first time a
 //! PUT to a sub-collection fails with 409 we MKCOL the parent(s) and
-//! retry. PUT semantics are idempotent: an existing resource at the
-//! same name is replaced.
+//! retry. [`WebdavSink::update`] reads the resource, lets the caller
+//! decide what should replace it, and makes the PUT conditional on the
+//! resource not having changed in between (`If-Match` on its ETag), so
+//! that decision can't be overtaken by another writer.
 //!
 //! Like CalDAV, the public entry point is sync and blocks on the
 //! supplied tokio runtime handle. Each request runs through the shared
@@ -18,22 +20,16 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Utc};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Client, Method, StatusCode};
 use tokio::runtime::Handle;
 use tracing::{debug, info};
 
-use super::http_auth::{self, Auth};
+use super::http_auth::{self, Auth, Fetched};
 use super::http_client::{build_client_with_timeout, truncate};
-
-/// What we did with a PUT.
-#[derive(Debug)]
-pub enum PutOutcome {
-    /// The server created the resource (2xx including `201 Created`).
-    Created(String),
-    /// The server replaced an existing resource (`200 OK`/`204 No Content`).
-    Updated(String),
-}
+use super::json_target;
+use super::sink::{FileOutcome, Merge, log_kept};
 
 /// Everything except RFC 3986 "unreserved" characters
 /// (`ALPHA / DIGIT / "-" / "." / "_" / "~"`) gets percent-encoded when
@@ -79,38 +75,78 @@ impl WebdavSink {
         })
     }
 
-    /// PUT a blob to `<base_url>/<sub_path>` with the given Content-Type.
-    /// `body` is moved in; callers that want to reuse it should clone
-    /// before calling.
-    pub fn put(&self, sub_path: &str, content_type: &str, body: Vec<u8>) -> Result<PutOutcome> {
-        self.runtime
-            .block_on(self.put_async(sub_path, content_type, body))
+    /// Replace `<base_url>/<sub_path>` with whatever `merge` makes of
+    /// what is there. The PUT is conditional on the resource not having
+    /// changed since it was read; if it has, start over.
+    pub fn update(
+        &self,
+        sub_path: &str,
+        content_type: &str,
+        kind: &str,
+        merge: &Merge<'_>,
+    ) -> Result<FileOutcome> {
+        let url = self.target_url(sub_path);
+        for _ in 0..http_auth::MAX_UPDATE_ATTEMPTS {
+            let found =
+                self.runtime
+                    .block_on(http_auth::get_if_exists(&self.client, &self.auth, &url))?;
+            let Some(body) = merge(found.as_ref().map(|found| found.body.as_slice()))? else {
+                return Ok(log_kept(url, kind));
+            };
+            let put = self.put_async(sub_path, content_type, &body, found.as_ref());
+            if let Some(outcome) = self.runtime.block_on(put)? {
+                return Ok(outcome);
+            }
+            debug!(url, "changed since it was read; starting over");
+        }
+        Err(anyhow!("{url} kept changing while being updated"))
     }
 
+    /// PUT `body`, on condition that the resource is still as `found`.
+    /// `None` when it is not.
     async fn put_async(
         &self,
         sub_path: &str,
         content_type: &str,
-        body: Vec<u8>,
-    ) -> Result<PutOutcome> {
+        body: &[u8],
+        found: Option<&Fetched>,
+    ) -> Result<Option<FileOutcome>> {
         let url = self.target_url(sub_path);
-        let response = self.send_put(&url, content_type, &body).await?;
-        let status = response.status();
+        let mut response = self.send_put(&url, content_type, body, found).await?;
 
         // 409 Conflict from a PUT typically means a parent collection
         // doesn't exist. Walk the path, MKCOL each missing parent, and
         // retry the PUT once.
-        if status == StatusCode::CONFLICT {
+        if response.status() == StatusCode::CONFLICT {
             debug!(url, "PUT 409, creating parent collections via MKCOL");
             self.ensure_parent_collections(sub_path).await?;
-            let response = self.send_put(&url, content_type, &body).await?;
-            return self.classify(&url, response).await;
+            response = self.send_put(&url, content_type, body, found).await?;
         }
-
-        self.classify(&url, response).await
+        if response.status() == StatusCode::PRECONDITION_FAILED {
+            return Ok(None);
+        }
+        self.classify(&url, response).await.map(Some)
     }
 
-    async fn classify(&self, url: &str, response: reqwest::Response) -> Result<PutOutcome> {
+    /// Whether the JSON record at `<base_url>/<sub_path>`, if any, was
+    /// filed from a newer message than one dated `incoming`.
+    pub fn filed_from_newer(
+        &self,
+        sub_path: &str,
+        incoming: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        // Nothing to order by; spare the round trip.
+        if incoming.is_none() {
+            return Ok(false);
+        }
+        let url = self.target_url(sub_path);
+        Ok(self
+            .runtime
+            .block_on(http_auth::get_if_exists(&self.client, &self.auth, &url))?
+            .is_some_and(|found| json_target::is_from_newer(&found.body, &url, incoming)))
+    }
+
+    async fn classify(&self, url: &str, response: reqwest::Response) -> Result<FileOutcome> {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -122,11 +158,11 @@ impl WebdavSink {
         match status {
             StatusCode::CREATED => {
                 info!(target = %url, "uploaded");
-                Ok(PutOutcome::Created(url.to_string()))
+                Ok(FileOutcome::Created(url.to_string()))
             }
             _ => {
                 info!(target = %url, %status, "replaced");
-                Ok(PutOutcome::Updated(url.to_string()))
+                Ok(FileOutcome::Updated(url.to_string()))
             }
         }
     }
@@ -136,14 +172,16 @@ impl WebdavSink {
         url: &str,
         content_type: &str,
         body: &[u8],
+        found: Option<&Fetched>,
     ) -> Result<reqwest::Response> {
         let content_type = content_type.to_string();
         let body = body.to_vec();
         http_auth::send_with_auth_retry(&self.client, &self.auth, |client| {
-            client
+            let request = client
                 .put(url)
                 .header(reqwest::header::CONTENT_TYPE, content_type.clone())
-                .body(body.clone())
+                .body(body.clone());
+            http_auth::unless_changed(request, found)
         })
         .await
         .with_context(|| format!("PUT {url}"))
@@ -193,7 +231,7 @@ impl WebdavSink {
 
     /// Compose `<base_url>/<sub_path>`, percent-encoding the sub-path
     /// while preserving `/` separators.
-    fn target_url(&self, sub_path: &str) -> String {
+    pub(super) fn target_url(&self, sub_path: &str) -> String {
         let sep = if self.base_url.ends_with('/') {
             ""
         } else {
@@ -224,6 +262,242 @@ mod tests {
             test_handle(),
         )
         .unwrap()
+    }
+
+    use crate::targets::fake_dav::FakeDav;
+
+    fn at(rfc3339: &str) -> Option<DateTime<Utc>> {
+        Some(rfc3339.parse().unwrap())
+    }
+
+    #[test]
+    fn filed_from_newer_compares_against_the_stored_record() {
+        let server = FakeDav::start();
+        let s = server.webdav_sink();
+        server.put(
+            "/2026/acme-1.json",
+            br#"{"receivedAt":"2026-01-28T10:00:00Z"}"#,
+        );
+
+        assert!(
+            s.filed_from_newer("2026/acme-1.json", at("2025-10-28T10:00:00Z"))
+                .unwrap()
+        );
+        assert!(
+            !s.filed_from_newer("2026/acme-1.json", at("2026-01-28T10:00:00Z"))
+                .unwrap()
+        );
+        assert!(
+            !s.filed_from_newer("2026/acme-1.json", at("2026-02-01T10:00:00Z"))
+                .unwrap()
+        );
+    }
+
+    fn record(received_at: &str) -> Vec<u8> {
+        format!(r#"{{"receivedAt":"{received_at}"}}"#).into_bytes()
+    }
+
+    /// File `body` at `2026/acme-1.json` unless what is there is newer.
+    fn file(s: &WebdavSink, body: &[u8]) -> FileOutcome {
+        let incoming = json_target::received_at_in(body).unwrap();
+        s.update(
+            "2026/acme-1.json",
+            "application/json",
+            "receipt",
+            &json_target::replace_unless_newer("acme-1", body, incoming),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn update_creates_then_replaces() {
+        let server = FakeDav::start();
+        let s = server.webdav_sink();
+        let first = file(&s, &record("2026-01-20T10:00:00Z"));
+        assert!(matches!(first, FileOutcome::Created(_)));
+        let second = file(&s, &record("2026-01-28T10:00:00Z"));
+        assert!(matches!(second, FileOutcome::Updated(_)));
+        assert_eq!(
+            server.resource("/2026/acme-1.json").unwrap(),
+            record("2026-01-28T10:00:00Z")
+        );
+    }
+
+    /// Another writer files a newer record between our read and our
+    /// write. Our PUT must not land on top of it.
+    #[test]
+    fn update_does_not_overwrite_a_newer_record_that_overtook_it() {
+        let server = FakeDav::start();
+        let s = server.webdav_sink();
+        server.put("/2026/acme-1.json", &record("2026-01-20T10:00:00Z"));
+        server.overtake_after_next_get("/2026/acme-1.json", &record("2026-01-28T10:00:00Z"));
+
+        let outcome = file(&s, &record("2026-01-25T10:00:00Z"));
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        assert_eq!(
+            server.resource("/2026/acme-1.json").unwrap(),
+            record("2026-01-28T10:00:00Z")
+        );
+        assert_eq!(
+            server.requests(),
+            vec![
+                "GET /2026/acme-1.json",
+                "PUT /2026/acme-1.json",
+                "GET /2026/acme-1.json",
+            ]
+        );
+    }
+
+    /// The same, where nothing was there when we looked.
+    #[test]
+    fn update_does_not_overwrite_a_newer_record_created_under_it() {
+        let server = FakeDav::start();
+        let s = server.webdav_sink();
+        server.overtake_after_next_get("/2026/acme-1.json", &record("2026-01-28T10:00:00Z"));
+
+        let outcome = file(&s, &record("2026-01-25T10:00:00Z"));
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        assert_eq!(
+            server.resource("/2026/acme-1.json").unwrap(),
+            record("2026-01-28T10:00:00Z")
+        );
+    }
+
+    /// An older record overtaking us only costs a second attempt.
+    #[test]
+    fn update_replaces_an_older_record_that_overtook_it() {
+        let server = FakeDav::start();
+        let s = server.webdav_sink();
+        server.put("/2026/acme-1.json", &record("2026-01-20T10:00:00Z"));
+        server.overtake_after_next_get("/2026/acme-1.json", &record("2026-01-22T10:00:00Z"));
+
+        let outcome = file(&s, &record("2026-01-25T10:00:00Z"));
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+        assert_eq!(
+            server.resource("/2026/acme-1.json").unwrap(),
+            record("2026-01-25T10:00:00Z")
+        );
+    }
+
+    /// `If-Match` can't be used with a weak ETag, so against such a
+    /// server the PUT goes out unconditionally, as it always used to.
+    #[test]
+    fn update_is_unconditional_against_weak_etags() {
+        let server = FakeDav::start();
+        server.use_weak_etags();
+        let s = server.webdav_sink();
+        server.put("/2026/acme-1.json", &record("2026-01-20T10:00:00Z"));
+        server.overtake_after_next_get("/2026/acme-1.json", &record("2026-01-28T10:00:00Z"));
+
+        let outcome = file(&s, &record("2026-01-25T10:00:00Z"));
+        assert!(matches!(outcome, FileOutcome::Updated(_)));
+        assert_eq!(
+            server.requests(),
+            vec!["GET /2026/acme-1.json", "PUT /2026/acme-1.json"]
+        );
+    }
+
+    #[test]
+    fn update_gives_up_on_a_resource_that_keeps_changing() {
+        let server = FakeDav::start();
+        let s = server.webdav_sink();
+        server.put("/2026/acme-1.json", &record("2026-01-20T10:00:00Z"));
+        server.keep_changing("/2026/acme-1.json");
+
+        let body = record("2026-01-25T10:00:00Z");
+        let incoming = json_target::received_at_in(&body).unwrap();
+        let err = s
+            .update(
+                "2026/acme-1.json",
+                "application/json",
+                "receipt",
+                &json_target::replace_unless_newer("acme-1", &body, incoming),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{}2026/acme-1.json kept changing while being updated",
+                server.base_url
+            )
+        );
+        assert_eq!(
+            server.resource("/2026/acme-1.json").unwrap(),
+            record("2026-01-20T10:00:00Z")
+        );
+        assert_eq!(
+            server.requests().len(),
+            2 * http_auth::MAX_UPDATE_ATTEMPTS as usize
+        );
+    }
+
+    /// A lookup that fails must not be taken for "nothing there".
+    #[test]
+    fn update_reports_a_failing_lookup_and_writes_nothing() {
+        let server = FakeDav::start();
+        let s = server.webdav_sink();
+        server.fail_gets_with("403 Forbidden");
+
+        let body = record("2026-01-25T10:00:00Z");
+        let incoming = json_target::received_at_in(&body).unwrap();
+        let err = s
+            .update(
+                "2026/acme-1.json",
+                "application/json",
+                "receipt",
+                &json_target::replace_unless_newer("acme-1", &body, incoming),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "GET {}2026/acme-1.json returned 403 Forbidden: ",
+                server.base_url
+            )
+        );
+        assert_eq!(server.requests(), vec!["GET /2026/acme-1.json"]);
+    }
+
+    #[test]
+    fn update_creates_missing_parent_collections() {
+        let server = FakeDav::start();
+        server.require_collections();
+        let s = server.webdav_sink();
+
+        let outcome = file(&s, &record("2026-01-25T10:00:00Z"));
+        assert!(matches!(outcome, FileOutcome::Created(_)));
+        assert_eq!(
+            server.requests(),
+            vec![
+                "GET /2026/acme-1.json",
+                "PUT /2026/acme-1.json",
+                "MKCOL /2026",
+                "PUT /2026/acme-1.json",
+            ]
+        );
+        assert_eq!(
+            server.resource("/2026/acme-1.json").unwrap(),
+            record("2026-01-25T10:00:00Z")
+        );
+    }
+
+    #[test]
+    fn filed_from_newer_is_false_when_nothing_is_stored() {
+        let server = FakeDav::start();
+        let s = server.webdav_sink();
+        assert!(
+            !s.filed_from_newer("2026/acme-1.json", at("2025-10-28T10:00:00Z"))
+                .unwrap()
+        );
+        assert_eq!(server.requests(), vec!["GET /2026/acme-1.json"]);
+    }
+
+    #[test]
+    fn filed_from_newer_skips_the_request_for_an_undated_message() {
+        let server = FakeDav::start();
+        let s = server.webdav_sink();
+        assert!(!s.filed_from_newer("2026/acme-1.json", None).unwrap());
+        assert_eq!(server.requests(), Vec::<String>::new());
     }
 
     #[test]

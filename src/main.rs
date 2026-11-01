@@ -14,6 +14,27 @@ use mailsift::{imap_scan, milter, pipeline};
 
 const DEFAULT_EXTRACTORS_DIR: &str = "extractors";
 
+/// A mistake in how the user invoked us (missing/conflicting flags, an
+/// unparseable URL) rather than an unexpected failure. Reported as a plain
+/// one-line message with no backtrace; genuine errors keep anyhow's default
+/// `Debug` output.
+#[derive(Debug)]
+struct UsageError(String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+macro_rules! usage_error {
+    ($($arg:tt)*) => {
+        anyhow::Error::new(UsageError(format!($($arg)*)))
+    };
+}
+
 /// Read a password / API-token file, trim, and return its contents.
 /// Used by every sink that reads a secret from disk (CalDAV/WebDAV
 /// passwords, SMTP password, Firefly / Karrio / 17track tokens).
@@ -22,6 +43,165 @@ fn read_secret_file(path: &Path) -> Result<String> {
         .with_context(|| format!("reading {}", path.display()))?
         .trim()
         .to_string())
+}
+
+/// Resolve the username for XOAUTH2 auth, which the SASL message needs.
+/// XOAUTH2 has no equivalent of a username-less GSSAPI ticket, so unlike
+/// `LOGIN` we can't fall back to nothing: the account must be in the URL.
+fn xoauth2_user(resolved_user: Option<&str>) -> Result<&str> {
+    resolved_user.ok_or_else(|| {
+        usage_error!(
+            "XOAUTH2 requires a username; include one in the URL \
+             (imaps://you@imap.gmail.com/INBOX)"
+        )
+    })
+}
+
+/// clap value parser for `--socket-mode`. Accepts octal digits with an
+/// optional `0o` prefix (`0666`, `0o660`, `660` all parse the same).
+#[cfg(feature = "web")]
+fn parse_octal_mode(raw: &str) -> Result<u32, String> {
+    let s = raw.strip_prefix("0o").unwrap_or(raw);
+    u32::from_str_radix(s, 8).map_err(|e| format!("invalid octal mode {raw:?}: {e}"))
+}
+
+/// The `--oauth2-*` flags of `imap-scan`, borrowed for
+/// [`build_token_provider`].
+struct OAuth2ScanFlags<'a> {
+    credentials_file: Option<&'a Path>,
+    refresh_token_file: Option<&'a Path>,
+    client_id: Option<&'a str>,
+    client_secret_file: Option<&'a Path>,
+    provider_name: Option<&'a str>,
+    token_endpoint: Option<&'a str>,
+}
+
+/// Build an OAuth2 [`TokenProvider`](mailsift::oauth2::TokenProvider)
+/// from the `--oauth2-*` flags, or return `None` if neither a credential
+/// bundle nor a refresh token was given (the caller then falls back to
+/// the other auth methods).
+///
+/// A `--oauth2-credentials-file` is self-contained. Otherwise the token
+/// endpoint is taken from `--oauth2-token-endpoint` if given, else from
+/// `--oauth2-provider`, else derived from the IMAP host. An unrecognised
+/// host with no explicit endpoint is a usage error rather than a silent
+/// guess.
+fn build_token_provider(
+    flags: &OAuth2ScanFlags<'_>,
+    imap_host: &str,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<mailsift::oauth2::TokenProvider>> {
+    use mailsift::oauth2::{OAuth2Config, Provider, TokenProvider};
+
+    // A credential bundle is self-contained; use it directly.
+    if let Some(path) = flags.credentials_file {
+        let config = OAuth2Config::load(path)?;
+        return Ok(Some(TokenProvider::new(config, runtime.clone())));
+    }
+
+    let Some(refresh_token_file) = flags.refresh_token_file else {
+        return Ok(None);
+    };
+    // clap's `requires = "oauth2_client_id"` guarantees this, but the
+    // handler shouldn't assume the parser's invariants hold.
+    let client_id = flags
+        .client_id
+        .ok_or_else(|| usage_error!("--oauth2-refresh-token-file requires --oauth2-client-id"))?;
+
+    let endpoint = match (flags.token_endpoint, flags.provider_name) {
+        (Some(explicit), _) => explicit.to_string(),
+        (None, Some(name)) => Provider::from_name(name)
+            .ok_or_else(|| {
+                usage_error!(
+                    "unknown --oauth2-provider {name:?}; use google or microsoft, \
+                     or pass --oauth2-token-endpoint"
+                )
+            })?
+            .token_endpoint()
+            .to_string(),
+        (None, None) => Provider::from_imap_host(imap_host)
+            .ok_or_else(|| {
+                usage_error!(
+                    "cannot derive an OAuth2 provider from IMAP host {imap_host:?}; \
+                     pass --oauth2-provider or --oauth2-token-endpoint"
+                )
+            })?
+            .token_endpoint()
+            .to_string(),
+    };
+
+    let refresh_token = read_secret_file(refresh_token_file)?;
+    let client_secret = flags.client_secret_file.map(read_secret_file).transpose()?;
+    Ok(Some(TokenProvider::new(
+        OAuth2Config {
+            token_endpoint: endpoint,
+            client_id: client_id.to_string(),
+            client_secret,
+            refresh_token,
+        },
+        runtime.clone(),
+    )))
+}
+
+/// Handle `mailsift imap-auth`: run the browser consent flow and write
+/// the credential bundle.
+fn run_imap_auth(args: ImapAuthArgs, runtime: &tokio::runtime::Handle) -> Result<()> {
+    use mailsift::oauth2::{ConsentRequest, Provider, consent};
+
+    let provider = match args.provider.as_deref() {
+        Some(name) => Provider::from_name(name)
+            .ok_or_else(|| usage_error!("unknown --provider {name:?}; use google or microsoft"))?,
+        None => {
+            let domain = args.account.rsplit('@').next().filter(|d| !d.is_empty());
+            // Only Gmail/Outlook domains are auto-derivable; anything
+            // else must name the provider explicitly.
+            match domain {
+                Some(d) if d.eq_ignore_ascii_case("gmail.com") => Provider::Google,
+                Some(d)
+                    if d.eq_ignore_ascii_case("outlook.com")
+                        || d.eq_ignore_ascii_case("hotmail.com")
+                        || d.eq_ignore_ascii_case("live.com") =>
+                {
+                    Provider::Microsoft
+                }
+                _ => {
+                    return Err(usage_error!(
+                        "cannot derive the provider from {:?}; pass --provider google|microsoft",
+                        args.account
+                    ));
+                }
+            }
+        }
+    };
+
+    let client_secret = args
+        .client_secret_file
+        .as_deref()
+        .map(read_secret_file)
+        .transpose()?;
+
+    let config = consent(
+        ConsentRequest {
+            auth_endpoint: provider.auth_endpoint(),
+            token_endpoint: provider.token_endpoint(),
+            client_id: &args.client_id,
+            client_secret: client_secret.as_deref(),
+            scope: provider.consent_scope(),
+            login_hint: Some(&args.account),
+            no_browser: args.no_browser,
+        },
+        runtime,
+    )?;
+
+    config.save(&args.output)?;
+    println!(
+        "Wrote OAuth2 credentials to {}. Use it with:\n  \
+         mailsift imap-scan imaps://{}@<host>/INBOX --oauth2-credentials-file {}",
+        args.output.display(),
+        args.account,
+        args.output.display()
+    );
+    Ok(())
 }
 
 #[derive(Parser)]
@@ -67,7 +247,7 @@ impl EventTargetArgs {
         // `--events-dir` on the command line.
         let (events_dir, caldav_url) = match (&self.events_dir, &self.caldav_url) {
             (Some(_), Some(_)) => {
-                return Err(anyhow!(
+                return Err(usage_error!(
                     "specify either --events-dir or a CalDAV target, not both"
                 ));
             }
@@ -80,7 +260,7 @@ impl EventTargetArgs {
         };
 
         match (events_dir, caldav_url) {
-            (Some(_), Some(_)) => Err(anyhow!(
+            (Some(_), Some(_)) => Err(usage_error!(
                 "config specifies both events_dir and [caldav]; pick one"
             )),
             (Some(dir), None) => Ok(EventSinkKind::LocalDir(dir)),
@@ -99,11 +279,178 @@ impl EventTargetArgs {
                     runtime.clone(),
                 )?))
             }
-            (None, None) => Err(anyhow!(
+            (None, None) => Err(usage_error!(
                 "no event target specified: pass --events-dir, --caldav-url, or set one in the config"
             )),
         }
     }
+}
+
+/// Arguments for the `imap-scan` subcommand. Split out of the
+/// [`Command`] enum (and boxed there) because its flag set is far larger
+/// than any other variant's.
+#[derive(Args)]
+struct ImapScanArgs {
+    /// IMAP URL: `imaps://[user@]host[:port]/[mailbox]`. Without a
+    /// user the current OS user is used; without a mailbox `INBOX`
+    /// is used.
+    url: String,
+    /// File containing the IMAP password. Provide for plain LOGIN;
+    /// omit to authenticate via Kerberos (`gssapi` feature only) or
+    /// pass `--oauth2-token-file` for SASL XOAUTH2 (Gmail etc.).
+    #[arg(long, conflicts_with_all = ["oauth2_token_file", "oauth2_refresh_token_file"], help_heading = "Authentication")]
+    password_file: Option<PathBuf>,
+    /// File containing a fixed OAuth2 bearer token for SASL XOAUTH2.
+    /// The URL must include the account
+    /// (`imaps://you@imap.gmail.com/INBOX`). Tokens expire, so this
+    /// is only suitable for a one-off scan that finishes within the
+    /// token's lifetime; for `--watch` use
+    /// `--oauth2-refresh-token-file` instead. Mutually exclusive with
+    /// the refresh-token flags.
+    #[arg(
+        long,
+        conflicts_with = "oauth2_refresh_token_file",
+        help_heading = "Authentication"
+    )]
+    oauth2_token_file: Option<PathBuf>,
+    /// JSON credential bundle from `mailsift imap-auth` (client id,
+    /// secret, refresh token, and token endpoint in one file). The
+    /// self-contained equivalent of the `--oauth2-refresh-token-file` +
+    /// `--oauth2-client-*` flags; mints a fresh access token at every
+    /// (re)connect, so it suits `--watch`. The URL must include the
+    /// account.
+    #[arg(
+        long,
+        conflicts_with_all = ["password_file", "oauth2_token_file", "oauth2_refresh_token_file"],
+        help_heading = "Authentication"
+    )]
+    oauth2_credentials_file: Option<PathBuf>,
+    /// File containing a long-lived OAuth2 refresh token for SASL
+    /// XOAUTH2. mailsift mints a fresh access token from it at every
+    /// (re)connect, so this survives token expiry across a `--watch`
+    /// session. Requires `--oauth2-client-id`; the provider (token
+    /// endpoint) is derived from the IMAP host for Gmail/Outlook and
+    /// can be overridden with `--oauth2-provider` /
+    /// `--oauth2-token-endpoint`. The URL must include the account.
+    #[arg(long, requires = "oauth2_client_id", help_heading = "Authentication")]
+    oauth2_refresh_token_file: Option<PathBuf>,
+    /// OAuth2 client id of the registered application. Required with
+    /// `--oauth2-refresh-token-file`.
+    #[arg(long, help_heading = "Authentication")]
+    oauth2_client_id: Option<String>,
+    /// File containing the OAuth2 client secret. Google desktop apps
+    /// need one; Microsoft public (native) clients must omit it.
+    #[arg(long, help_heading = "Authentication")]
+    oauth2_client_secret_file: Option<PathBuf>,
+    /// Override the OAuth2 provider instead of deriving it from the
+    /// IMAP host. One of `google` or `microsoft`. Rarely needed; use
+    /// it when the host isn't recognised but is one of these
+    /// providers, or use `--oauth2-token-endpoint` for anything else.
+    #[arg(long, help_heading = "Authentication")]
+    oauth2_provider: Option<String>,
+    /// OAuth2 token endpoint URL, for a provider not derivable from
+    /// the IMAP host (anything other than Gmail/Outlook). Takes
+    /// precedence over `--oauth2-provider` and host derivation.
+    #[arg(long, help_heading = "Authentication")]
+    oauth2_token_endpoint: Option<String>,
+    /// Optional SASL authorization identity for GSSAPI auth.
+    #[arg(long, help_heading = "Authentication")]
+    authzid: Option<String>,
+    /// Only consider messages from this date onward, in IMAP date
+    /// format (e.g. `01-Jan-2026`).
+    #[arg(long)]
+    since: Option<String>,
+    /// Only consider messages with an internal date strictly before
+    /// this date, in IMAP date format. Combines with `--since` to
+    /// bound a scan to a window (e.g. one month) so a single IMAP
+    /// session doesn't outrun the server's idle timeout on very large
+    /// mailboxes.
+    #[arg(long)]
+    before: Option<String>,
+    /// Cap on the number of messages to process in the initial
+    /// scan. With `--watch`, the cap applies only to the backfill
+    /// pass; messages arriving while watching are not counted.
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Directory containing extractor scripts.
+    #[arg(long)]
+    extractors: Option<PathBuf>,
+    /// Only run the named extractor. Repeat to select several.
+    ///
+    /// When every selected extractor declares `from_domains`, the
+    /// `UID SEARCH` is narrowed to those senders so the server never
+    /// returns the other messages. Falls back to the unnarrowed
+    /// search if the server rejects the query.
+    #[arg(long = "extractor", value_name = "NAME")]
+    only: Vec<String>,
+    #[command(flatten)]
+    target: EventTargetArgs,
+    #[command(flatten)]
+    artifacts: ArtifactDirArgs,
+    #[command(flatten)]
+    trackers: TrackerArgs,
+    #[command(flatten)]
+    firefly: FireflyArgs,
+    /// Don't actually file artifacts; just report what would happen.
+    #[arg(long)]
+    dry_run: bool,
+    /// Skip appending per-extractor events to the stats log
+    /// (`$XDG_STATE_HOME/mailsift/events.ndjson`). Enable for one-off
+    /// bulk imports whose skew you don't want reflected in the
+    /// dashboard.
+    #[arg(long)]
+    no_stats: bool,
+    /// Send every event to CalDAV again, even those the dedup store
+    /// (`$XDG_STATE_HOME/mailsift/seen.db`) says were filed unchanged
+    /// before. Use it to restore events that were edited or deleted
+    /// on the server.
+    #[arg(long)]
+    no_dedup: bool,
+    /// After the initial scan, stay connected and process new
+    /// messages as they arrive (IMAP IDLE, RFC 2177). Runs until
+    /// interrupted (Ctrl-C). On transport errors the connection is
+    /// rebuilt with exponential backoff.
+    ///
+    /// The scan position is saved (under
+    /// `$XDG_STATE_HOME/mailsift/imap/`), so a restart carries on from
+    /// where the last run got to instead of rescanning the mailbox.
+    /// Not with `--since`, `--before`, `--limit` or `--dry-run`, which
+    /// describe a one-off window.
+    #[arg(long)]
+    watch: bool,
+    /// With `--watch`, ignore the saved scan position and start again
+    /// from the top of the mailbox.
+    #[arg(long, requires = "watch")]
+    rescan: bool,
+}
+
+/// Arguments for the `imap-auth` subcommand.
+#[derive(Args)]
+struct ImapAuthArgs {
+    /// The email account to authorize (`you@gmail.com`). Used to derive
+    /// the provider when `--provider` is omitted and to pre-fill the
+    /// consent screen.
+    account: String,
+    /// OAuth2 provider: `google` or `microsoft`. Derived from the
+    /// account's domain when omitted.
+    #[arg(long)]
+    provider: Option<String>,
+    /// OAuth2 client id of your registered application.
+    #[arg(long)]
+    client_id: String,
+    /// File containing the OAuth2 client secret. Google desktop apps
+    /// need one; Microsoft public (native) clients omit it.
+    #[arg(long)]
+    client_secret_file: Option<PathBuf>,
+    /// Where to write the JSON credential bundle. Pass this file to
+    /// `imap-scan --oauth2-credentials-file`. Created with owner-only
+    /// permissions.
+    #[arg(long, short)]
+    output: PathBuf,
+    /// Don't start a local server or open a browser; print the URL and
+    /// read the redirected URL back from stdin. For headless / SSH use.
+    #[arg(long)]
+    no_browser: bool,
 }
 
 #[derive(Subcommand)]
@@ -131,39 +478,50 @@ enum Command {
         /// what artifacts each producing extractor emitted.
         #[arg(long)]
         explain: bool,
+        /// When the message reached you (RFC 3339, or YYYY-MM-DD for
+        /// midnight UTC). Lets an extractor's `unsigned_before` accept
+        /// old unsigned mail; nothing in the message itself is trusted
+        /// for that, so without this flag unsigned mail is refused.
+        #[arg(long, value_parser = parse_received_at)]
+        received_at: Option<i64>,
     },
     /// Walk an IMAP mailbox and run the pipeline over each message.
-    ImapScan {
-        /// IMAP URL: `imaps://[user@]host[:port]/[mailbox]`. Without a
-        /// user the current OS user is used; without a mailbox `INBOX`
-        /// is used.
-        url: String,
-        /// File containing the IMAP password. Provide for plain LOGIN;
-        /// omit to authenticate via Kerberos (`gssapi` feature only) or
-        /// pass `--oauth2-token-file` for SASL XOAUTH2 (Gmail etc.).
-        #[arg(long, conflicts_with = "oauth2_token_file")]
-        password_file: Option<PathBuf>,
-        /// File containing an OAuth2 bearer token for SASL XOAUTH2.
-        /// Required for Gmail; the URL must include the account
-        /// (`imaps://you@imap.gmail.com/INBOX`). Tokens expire; refresh
-        /// before each run.
+    // Boxed: this variant's args dwarf the others, so an unboxed
+    // struct-variant trips clippy's `large_enum_variant`. See
+    // [`ImapScanArgs`].
+    ImapScan(Box<ImapScanArgs>),
+    /// Obtain an OAuth2 refresh token via the browser consent flow and
+    /// write a credential bundle for `imap-scan --oauth2-credentials-file`.
+    ImapAuth(ImapAuthArgs),
+    /// Walk a Maildir on disk and run the pipeline over each message.
+    ///
+    /// Useful for one-off backfills against archived mail. Reads
+    /// `cur/` and `new/` (`tmp/` is skipped) and, with `--recurse`,
+    /// descends into Maildir++ subfolders (`.name/cur`, `.name/new`).
+    MaildirScan {
+        /// Path to the Maildir root (contains `cur/`, `new/`, `tmp/`).
+        path: PathBuf,
+        /// Also process Maildir++ subfolders (`.foo/cur`, `.foo/new`).
         #[arg(long)]
-        oauth2_token_file: Option<PathBuf>,
-        /// Optional SASL authorization identity for GSSAPI auth.
-        #[arg(long)]
-        authzid: Option<String>,
-        /// Only consider messages from this date onward, in IMAP date
-        /// format (e.g. `01-Jan-2026`).
+        recurse: bool,
+        /// Skip messages whose file mtime is older than this
+        /// `YYYY-MM-DD` date.
         #[arg(long)]
         since: Option<String>,
-        /// Cap on the number of messages to process in the initial
-        /// scan. With `--watch`, the cap applies only to the backfill
-        /// pass; messages arriving while watching are not counted.
+        /// Cap on the number of messages to process.
         #[arg(long)]
         limit: Option<usize>,
         /// Directory containing extractor scripts.
         #[arg(long)]
         extractors: Option<PathBuf>,
+        /// Only run the named extractor. Repeat to select several.
+        ///
+        /// When every selected extractor declares `from_domains` or
+        /// `subject_regex` in its manifest, the scan reads just each
+        /// message's headers and skips the ones no selected extractor
+        /// could match, rather than parsing every message in full.
+        #[arg(long = "extractor", value_name = "NAME")]
+        only: Vec<String>,
         #[command(flatten)]
         target: EventTargetArgs,
         #[command(flatten)]
@@ -175,12 +533,18 @@ enum Command {
         /// Don't actually file artifacts; just report what would happen.
         #[arg(long)]
         dry_run: bool,
-        /// After the initial scan, stay connected and process new
-        /// messages as they arrive (IMAP IDLE, RFC 2177). Runs until
-        /// interrupted (Ctrl-C). On transport errors the connection is
-        /// rebuilt with exponential backoff.
+        /// Skip appending per-extractor events to the stats log
+        /// (`$XDG_STATE_HOME/mailsift/events.ndjson`). Enable for
+        /// one-off bulk imports whose skew you don't want reflected
+        /// in the dashboard.
         #[arg(long)]
-        watch: bool,
+        no_stats: bool,
+        /// Send every event to CalDAV again, even those the dedup
+        /// store (`$XDG_STATE_HOME/mailsift/seen.db`) says were filed
+        /// unchanged before. Use it to restore events that were
+        /// edited or deleted on the server.
+        #[arg(long)]
+        no_dedup: bool,
     },
     /// Validate every discoverable extractor manifest. Parses each
     /// `<name>.yaml`, compiles the `subject_regex`, parses `requires:`
@@ -210,6 +574,29 @@ enum Command {
         /// the milter writes to.
         #[arg(long)]
         log: Option<PathBuf>,
+    },
+    /// Serve a read-only HTTP dashboard over the configured artifact
+    /// directories (events, bills, parcels, receipts, subscriptions,
+    /// tickets). Rescans on every request; safe to leave running
+    /// alongside the milter or an `imap-scan --watch`.
+    #[cfg(feature = "web")]
+    Web {
+        /// Listen address: `host:port` for TCP or `unix:/path/to/sock`
+        /// for a unix socket.
+        #[arg(long, default_value = "127.0.0.1:8088")]
+        listen: String,
+        /// Permission bits for the unix socket, in octal. Default 0666
+        /// so a reverse proxy running as a different user can connect;
+        /// tighten (e.g. 0660 with a shared group) for multi-user hosts.
+        /// Ignored for TCP listens.
+        #[arg(long, value_parser = parse_octal_mode)]
+        socket_mode: Option<u32>,
+        /// URL prefix under which the app is mounted (e.g. `/mailsift`).
+        /// Every generated link is prefixed with this so the app works
+        /// behind a reverse proxy that only forwards a sub-path. Empty
+        /// or `/` means serve at the site root.
+        #[arg(long, default_value = "")]
+        base_path: String,
     },
     /// Run as a Postfix milter.
     Milter {
@@ -282,6 +669,11 @@ struct ArtifactDirArgs {
     /// omitted, subscription artifacts are dropped with a warning.
     #[arg(long)]
     subscriptions_dir: Option<PathBuf>,
+    /// Directory under which to archive the raw JSON of `reservation`
+    /// artifacts. Reservations are converted to calendar events
+    /// regardless; this additionally keeps the full booking record.
+    #[arg(long)]
+    reservations_dir: Option<PathBuf>,
     /// Directory under which to file `receipt` artifacts. Mutually
     /// exclusive with `--receipts-webdav-url` and
     /// `--receipts-forward-to`. If none is set, receipt artifacts are
@@ -359,6 +751,11 @@ impl ArtifactDirArgs {
             .as_ref()
             .or(config.subscriptions_dir.as_ref())
             .cloned();
+        let reservations = self
+            .reservations_dir
+            .as_ref()
+            .or(config.reservations_dir.as_ref())
+            .cloned();
 
         let receipts = self.build_receipts_sink(config, runtime)?;
         let tickets = self.build_tickets_sink(config, runtime)?;
@@ -367,6 +764,7 @@ impl ArtifactDirArgs {
             bills,
             parcels,
             subscriptions,
+            reservations,
             receipts,
             tickets,
         })
@@ -431,7 +829,7 @@ impl ArtifactDirArgs {
         runtime: &tokio::runtime::Handle,
     ) -> Result<mailsift::targets::mail_forward::MailForwarder> {
         let from = self.receipts_forward_from.as_deref().ok_or_else(|| {
-            anyhow!("--receipts-forward-from is required with --receipts-forward-to")
+            usage_error!("--receipts-forward-from is required with --receipts-forward-to")
         })?;
 
         let transport = match (
@@ -503,6 +901,7 @@ struct ResolvedArtifactTargets {
     bills: Option<PathBuf>,
     parcels: Option<PathBuf>,
     subscriptions: Option<PathBuf>,
+    reservations: Option<PathBuf>,
     receipts: Option<mailsift::targets::receipts::ReceiptSink>,
     tickets: Option<mailsift::targets::tickets::TicketSink>,
 }
@@ -602,6 +1001,87 @@ fn resolve_extractors(cli: Option<PathBuf>, config: &Config) -> Vec<PathBuf> {
         return dirs.as_slice().to_vec();
     }
     vec![PathBuf::from(DEFAULT_EXTRACTORS_DIR)]
+}
+
+/// Discover extractors for a processing command, failing if none were
+/// found. A commonly-mistyped `extractors_dir` still names a real
+/// directory, so discovery succeeds with an empty set; without this
+/// guard the command would silently process nothing. `check` prints
+/// its (possibly empty) result instead of calling this.
+fn discover_required(dirs: &[PathBuf]) -> Result<Vec<mailsift::extractor::Extractor>> {
+    let extractors = mailsift::extractor::discover(dirs)
+        .with_context(|| format!("discovering extractors in {}", render_paths(dirs)))?;
+    if extractors.is_empty() {
+        return Err(usage_error!(
+            "no extractors found under {}; check extractors_dir",
+            render_paths(dirs)
+        ));
+    }
+    tracing::info!(
+        "loaded {} extractor{} from {}",
+        extractors.len(),
+        if extractors.len() == 1 { "" } else { "s" },
+        render_paths(dirs),
+    );
+    Ok(extractors)
+}
+
+/// Narrow a discovered extractor set to the names given on the command
+/// line. An empty `names` keeps everything. Every name must match a
+/// discovered extractor; a typo would otherwise silently scan with a
+/// smaller set than the user asked for.
+fn select_extractors(
+    extractors: Vec<mailsift::extractor::Extractor>,
+    names: &[String],
+) -> Result<Vec<mailsift::extractor::Extractor>> {
+    if names.is_empty() {
+        return Ok(extractors);
+    }
+    let mut unknown: Vec<&str> = names
+        .iter()
+        .filter(|n| !extractors.iter().any(|ex| &ex.name == *n))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        unknown.dedup();
+        let mut available: Vec<&str> = extractors.iter().map(|ex| ex.name.as_str()).collect();
+        available.sort_unstable();
+        return Err(usage_error!(
+            "unknown extractor{} {}; available: {}",
+            if unknown.len() == 1 { "" } else { "s" },
+            unknown.join(", "),
+            available.join(", ")
+        ));
+    }
+    let selected: Vec<_> = extractors
+        .into_iter()
+        .filter(|ex| names.iter().any(|n| n == &ex.name))
+        .collect();
+    tracing::info!(
+        "selected {} of the discovered extractors: {}",
+        selected.len(),
+        selected
+            .iter()
+            .map(|ex| ex.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(selected)
+}
+
+/// Parse a `YYYY-MM-DD` date into the local-midnight `SystemTime` we
+/// compare Maildir mtimes against.
+fn parse_since_date(s: &str) -> Result<std::time::SystemTime> {
+    use chrono::{Local, NaiveDate, TimeZone};
+    let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .with_context(|| format!("parsing --since {s:?} (want YYYY-MM-DD)"))?;
+    let dt = date.and_hms_opt(0, 0, 0).expect("00:00:00 is a valid time");
+    let local = Local
+        .from_local_datetime(&dt)
+        .single()
+        .ok_or_else(|| anyhow!("{s} is ambiguous or non-existent in local time"))?;
+    Ok(local.into())
 }
 
 /// Print a per-extractor dispatch table from a `replay --explain` run.
@@ -709,6 +1189,48 @@ fn render_paths(paths: &[PathBuf]) -> String {
         .join(", ")
 }
 
+/// Parse `replay --received-at` into a unix timestamp.
+fn parse_received_at(s: &str) -> Result<i64, String> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.timestamp());
+    }
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .map(|d| d.and_time(chrono::NaiveTime::MIN).and_utc().timestamp())
+        .map_err(|_| format!("{s:?} is neither RFC 3339 nor YYYY-MM-DD"))
+}
+
+/// Open the dedup store at its default location, best-effort: if it
+/// can't be opened we warn and run without it. The sinks stay correct
+/// either way; we just pay the network cost.
+fn open_seen_store() -> Option<mailsift::seen::Store> {
+    let path = mailsift::seen::Store::default_path()?;
+    match mailsift::seen::Store::open(&path) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                path = %path.display(),
+                "seen.db open failed; running without dedup"
+            );
+            None
+        }
+    }
+}
+
+/// The dedup store for a scan, so a rescan doesn't send CalDAV every
+/// event it already has. Only the CalDAV sink consults the store, so a
+/// scan that files events elsewhere leaves it alone.
+fn scan_seen_store(
+    sink: &EventSinkKind,
+    no_dedup: bool,
+    dry_run: bool,
+) -> Option<mailsift::seen::Store> {
+    if no_dedup || dry_run || !matches!(sink, EventSinkKind::Caldav(_)) {
+        return None;
+    }
+    open_seen_store()
+}
+
 /// Build the per-process set of tracker-registration sinks. Each
 /// sink-source (CLI flag or config section) contributes one element;
 /// the returned value is empty when nothing is configured, which the
@@ -782,6 +1304,29 @@ fn build_firefly(
 }
 
 fn main() -> Result<()> {
+    match run() {
+        // Caller mistakes (bad flags, a mailbox that doesn't exist) are not
+        // bugs: a plain message is more useful than anyhow's Debug backtrace.
+        // Everything else keeps the default `?`-from-main behaviour so real
+        // failures stay loud.
+        Err(err) if err.is::<UsageError>() || err.is::<imap_scan::MailboxNotFound>() => {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        }
+        // A dead refresh token (Google's 7-day cutoff for testing-mode
+        // apps, or a manual revocation) can't be fixed by retrying, only
+        // by re-consent. Print one clear actionable line and exit with a
+        // dedicated code so systemd's Restart=on-failure can be filtered
+        // against it if desired (e.g. RestartPreventExitStatus=75).
+        Err(err) if err.is::<mailsift::oauth2::PermanentRefreshError>() => {
+            eprintln!("error: {err}");
+            std::process::exit(75);
+        }
+        other => other,
+    }
+}
+
+fn run() -> Result<()> {
     // rustls 0.23 needs a CryptoProvider explicitly installed before any
     // TLS handshake; do it here so every subcommand that uses TLS
     // (imap-scan, milter health-checks, caldav target) is covered.
@@ -794,6 +1339,7 @@ fn main() -> Result<()> {
         )
         .without_time()
         .with_target(false)
+        .with_level(false)
         .init();
 
     let cli = Cli::parse();
@@ -879,15 +1425,11 @@ fn main() -> Result<()> {
             firefly,
             dry_run,
             explain,
+            received_at,
         } => {
             let sink = target.build_sink(&config, runtime.handle())?;
             let extractors_dir = resolve_extractors(extractors, &config);
-            let extractors = mailsift::extractor::discover(&extractors_dir).with_context(|| {
-                format!(
-                    "discovering extractors in {}",
-                    render_paths(&extractors_dir)
-                )
-            })?;
+            let extractors = discover_required(&extractors_dir)?;
             let dirs = artifacts.resolve(&config, runtime.handle())?;
             let trackers = build_trackers(&trackers, &config, runtime.handle())?;
             let firefly = build_firefly(&firefly, &config, runtime.handle())?;
@@ -917,6 +1459,7 @@ fn main() -> Result<()> {
                     bills_dir: dirs.bills.as_deref(),
                     parcels_dir: dirs.parcels.as_deref(),
                     subscriptions_dir: dirs.subscriptions.as_deref(),
+                    reservations_dir: dirs.reservations.as_deref(),
                     receipts: dirs.receipts.as_ref(),
                     tickets: dirs.tickets.as_ref(),
                     firefly: firefly.as_ref(),
@@ -930,7 +1473,7 @@ fn main() -> Result<()> {
                     // happen. Dedup belongs to the daemon.
                     seen: None,
                 },
-                DkimPolicy::Enforce,
+                DkimPolicy::Enforce { received_at },
                 dry_run,
                 explain.then_some(&mut explain_buf),
             );
@@ -939,32 +1482,41 @@ fn main() -> Result<()> {
             }
             result
         }
-        Command::ImapScan {
-            url,
-            password_file,
-            oauth2_token_file,
-            // Consumed only by the IMAP GSSAPI path, which is commented out on
-            // the release branch (see imap_scan.rs).
-            #[allow(unused_variables)]
-            authzid,
-            since,
-            limit,
-            extractors,
-            target,
-            artifacts,
-            trackers,
-            firefly,
-            dry_run,
-            watch,
-        } => {
+        Command::ImapScan(args) => {
+            let ImapScanArgs {
+                url,
+                password_file,
+                oauth2_token_file,
+                oauth2_credentials_file,
+                oauth2_refresh_token_file,
+                oauth2_client_id,
+                oauth2_client_secret_file,
+                oauth2_provider,
+                oauth2_token_endpoint,
+                // Consumed only by the IMAP GSSAPI path, which is commented out on
+                // the release branch (see imap_scan.rs).
+                #[allow(unused_variables)]
+                authzid,
+                since,
+                before,
+                limit,
+                extractors,
+                only,
+                target,
+                artifacts,
+                trackers,
+                firefly,
+                dry_run,
+                no_stats,
+                no_dedup,
+                watch,
+                rescan,
+            } = *args;
             let sink = target.build_sink(&config, runtime.handle())?;
+            let seen = scan_seen_store(&sink, no_dedup, dry_run);
             let extractors_dir = resolve_extractors(extractors, &config);
-            let extractors = mailsift::extractor::discover(&extractors_dir).with_context(|| {
-                format!(
-                    "discovering extractors in {}",
-                    render_paths(&extractors_dir)
-                )
-            })?;
+            let extractors = discover_required(&extractors_dir)?;
+            let extractors = select_extractors(extractors, &only)?;
             let dirs = artifacts.resolve(&config, runtime.handle())?;
             let trackers = build_trackers(&trackers, &config, runtime.handle())?;
             let firefly = build_firefly(&firefly, &config, runtime.handle())?;
@@ -977,29 +1529,46 @@ fn main() -> Result<()> {
                 .as_deref()
                 .map(read_secret_file)
                 .transpose()?;
+            // Both XOAUTH2 paths feed a `&dyn TokenSource`: a fixed token
+            // wraps in a StaticTokenProvider, a refresh token (or a
+            // credential bundle) in the minting TokenProvider. Bind both
+            // here so they outlive the borrowed AuthMethod.
+            let static_token_provider = oauth2_token
+                .clone()
+                .map(mailsift::oauth2::StaticTokenProvider::new);
+            let refresh_token_provider = build_token_provider(
+                &OAuth2ScanFlags {
+                    credentials_file: oauth2_credentials_file.as_deref(),
+                    refresh_token_file: oauth2_refresh_token_file.as_deref(),
+                    client_id: oauth2_client_id.as_deref(),
+                    client_secret_file: oauth2_client_secret_file.as_deref(),
+                    provider_name: oauth2_provider.as_deref(),
+                    token_endpoint: oauth2_token_endpoint.as_deref(),
+                },
+                &target_imap.host,
+                runtime.handle(),
+            )?;
+            let xoauth2_tokens: Option<&dyn mailsift::oauth2::TokenSource> =
+                match (&static_token_provider, &refresh_token_provider) {
+                    (Some(s), _) => Some(s),
+                    (None, Some(r)) => Some(r),
+                    (None, None) => None,
+                };
             let resolved_user = target_imap.user.clone().or_else(current_username);
-            let auth_method = match (&password, &oauth2_token) {
+            let auth_method = match (&password, xoauth2_tokens) {
                 (Some(pw), _) => {
                     let user = resolved_user.as_deref().ok_or_else(|| {
-                        anyhow!(
+                        usage_error!(
                             "no username in URL and could not look up the current user; \
                              include one in the URL (imaps://user@host/...)"
                         )
                     })?;
                     imap_scan::AuthMethod::Login { user, password: pw }
                 }
-                (None, Some(tok)) => {
-                    let user = resolved_user.as_deref().ok_or_else(|| {
-                        anyhow!(
-                            "XOAUTH2 requires a username; include one in the URL \
-                             (imaps://you@imap.gmail.com/INBOX)"
-                        )
-                    })?;
-                    imap_scan::AuthMethod::XOAuth2 {
-                        user,
-                        access_token: tok,
-                    }
-                }
+                (None, Some(tokens)) => imap_scan::AuthMethod::XOAuth2 {
+                    user: xoauth2_user(resolved_user.as_deref())?,
+                    tokens,
+                },
                 // IMAP GSSAPI needs the jelmer/rust-imap fork; commented out on
                 // the release branch (see imap_scan.rs) so the crate can build
                 // against the upstream imap crate.
@@ -1009,10 +1578,38 @@ fn main() -> Result<()> {
                 // },
                 (None, None) => {
                     anyhow::bail!(
-                        "no --password-file or --oauth2-token-file given, and this build has \
-                         no GSSAPI support"
+                        "no --password-file, --oauth2-token-file or \
+                         --oauth2-refresh-token-file given, and this build has no GSSAPI support"
                     )
                 }
+            };
+            // Log per-extractor stats by default. `--no-stats` opts
+            // out for one-off bulk imports whose skew you don't want
+            // reflected in the dashboard.
+            let recorder = if no_stats {
+                mailsift::stats::Recorder::Disabled
+            } else {
+                mailsift::stats::Recorder::default_file()
+            };
+            let keeps_position =
+                watch && !dry_run && since.is_none() && before.is_none() && limit.is_none();
+            let cursor_file = if keeps_position {
+                let mailbox = format!(
+                    "{}@{}:{}/{}",
+                    resolved_user.as_deref().unwrap_or(""),
+                    target_imap.host,
+                    target_imap.port,
+                    target_imap.mailbox
+                );
+                let file = mailsift::imap_state::CursorFile::for_mailbox(&mailbox);
+                if file.is_none() {
+                    tracing::warn!(
+                        "neither XDG_STATE_HOME nor HOME is set; the scan position won't be saved"
+                    );
+                }
+                file
+            } else {
+                None
             };
             imap_scan::run(imap_scan::ImapScanConfig {
                 host: &target_imap.host,
@@ -1020,6 +1617,7 @@ fn main() -> Result<()> {
                 auth: auth_method,
                 mailbox: &target_imap.mailbox,
                 since: since.as_deref(),
+                before: before.as_deref(),
                 limit,
                 extractors: &extractors,
                 targets: pipeline::PipelineTargets {
@@ -1027,19 +1625,87 @@ fn main() -> Result<()> {
                     bills_dir: dirs.bills.as_deref(),
                     parcels_dir: dirs.parcels.as_deref(),
                     subscriptions_dir: dirs.subscriptions.as_deref(),
+                    reservations_dir: dirs.reservations.as_deref(),
                     receipts: dirs.receipts.as_ref(),
                     tickets: dirs.tickets.as_ref(),
                     firefly: firefly.as_ref(),
                     trackers: (!trackers.is_empty()).then_some(&trackers),
                     trusted_forwarders: &config.trusted_forwarders,
-                    // Bulk import: don't skew the milter's stats, and
-                    // bypass the dedup store so every event is re-PUT.
-                    recorder: &mailsift::stats::Recorder::Disabled,
-                    seen: None,
+                    recorder: &recorder,
+                    seen: seen.as_ref(),
                 },
                 dry_run,
                 watch,
+                cursor_file: cursor_file.as_ref(),
+                rescan,
             })
+        }
+        Command::ImapAuth(args) => run_imap_auth(args, runtime.handle()),
+        Command::MaildirScan {
+            path,
+            recurse,
+            since,
+            limit,
+            extractors,
+            only,
+            target,
+            artifacts,
+            trackers,
+            firefly,
+            dry_run,
+            no_stats,
+            no_dedup,
+        } => {
+            let sink = target.build_sink(&config, runtime.handle())?;
+            let seen = scan_seen_store(&sink, no_dedup, dry_run);
+            let extractors_dir = resolve_extractors(extractors, &config);
+            let extractors = discover_required(&extractors_dir)?;
+            let extractors = select_extractors(extractors, &only)?;
+            let dirs = artifacts.resolve(&config, runtime.handle())?;
+            let trackers = build_trackers(&trackers, &config, runtime.handle())?;
+            let firefly = build_firefly(&firefly, &config, runtime.handle())?;
+            let since = since.as_deref().map(parse_since_date).transpose()?;
+            // Log per-extractor stats by default. `--no-stats` opts
+            // out for one-off bulk imports whose skew you don't want
+            // reflected in the dashboard.
+            let recorder = if no_stats {
+                mailsift::stats::Recorder::Disabled
+            } else {
+                mailsift::stats::Recorder::default_file()
+            };
+            mailsift::maildir_scan::run(mailsift::maildir_scan::MaildirScanConfig {
+                root: &path,
+                recurse,
+                since,
+                limit,
+                extractors: &extractors,
+                targets: pipeline::PipelineTargets {
+                    event_sink: &sink,
+                    bills_dir: dirs.bills.as_deref(),
+                    parcels_dir: dirs.parcels.as_deref(),
+                    subscriptions_dir: dirs.subscriptions.as_deref(),
+                    reservations_dir: dirs.reservations.as_deref(),
+                    receipts: dirs.receipts.as_ref(),
+                    tickets: dirs.tickets.as_ref(),
+                    firefly: firefly.as_ref(),
+                    trackers: (!trackers.is_empty()).then_some(&trackers),
+                    trusted_forwarders: &config.trusted_forwarders,
+                    recorder: &recorder,
+                    seen: seen.as_ref(),
+                },
+                dry_run,
+            })
+        }
+        #[cfg(feature = "web")]
+        Command::Web {
+            listen,
+            socket_mode,
+            base_path,
+        } => {
+            let listen = mailsift::web::Listen::parse(&listen)?;
+            let base_path = mailsift::web::normalise_base_path(&base_path);
+            let config = std::sync::Arc::new(config);
+            runtime.block_on(mailsift::web::serve(listen, config, base_path, socket_mode))
         }
         Command::Milter {
             socket,
@@ -1052,12 +1718,7 @@ fn main() -> Result<()> {
         } => {
             let sink = target.build_sink(&config, runtime.handle())?;
             let extractors_dir = resolve_extractors(extractors, &config);
-            let extractors = mailsift::extractor::discover(&extractors_dir).with_context(|| {
-                format!(
-                    "discovering extractors in {}",
-                    render_paths(&extractors_dir)
-                )
-            })?;
+            let extractors = discover_required(&extractors_dir)?;
             let dirs = artifacts.resolve(&config, runtime.handle())?;
             let tickets_sink = dirs.tickets.map(std::sync::Arc::new);
             let trackers = build_trackers(&trackers, &config, runtime.handle())?;
@@ -1071,6 +1732,7 @@ fn main() -> Result<()> {
                     bills_dir: dirs.bills,
                     parcels_dir: dirs.parcels,
                     subscriptions_dir: dirs.subscriptions,
+                    reservations_dir: dirs.reservations,
                     receipts: receipts_sink,
                     tickets: tickets_sink,
                     firefly: firefly_sink,
@@ -1079,23 +1741,7 @@ fn main() -> Result<()> {
                     // Long-running daemon: record every extractor
                     // decision so `mailsift stats` has useful data.
                     recorder: mailsift::stats::Recorder::default_file(),
-                    // Open seen.db best-effort; if it can't be
-                    // opened we warn and fall back to no dedup
-                    // (server-side replace handles correctness, we
-                    // just pay the network cost).
-                    seen: mailsift::seen::Store::default_path().and_then(|p| {
-                        match mailsift::seen::Store::open(&p) {
-                            Ok(s) => Some(s),
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = format!("{e:#}"),
-                                    path = %p.display(),
-                                    "seen.db open failed; running without dedup"
-                                );
-                                None
-                            }
-                        }
-                    }),
+                    seen: open_seen_store(),
                 },
                 deadline: Duration::from_secs(deadline_secs),
             };

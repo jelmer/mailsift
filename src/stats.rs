@@ -68,7 +68,37 @@ pub struct Event {
     /// of extractors that match more than one sender domain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_domain: Option<String>,
+    /// Short error snippet for `Failed` outcomes; unset otherwise.
+    /// Truncated by the caller to keep the whole log line under
+    /// `PIPE_BUF` (4 KiB) so concurrent appends stay atomic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
+
+/// Cap on the `error` string a caller should include in a `Failed`
+/// event. Chosen so a log line stays well under `PIPE_BUF`.
+pub const MAX_ERROR_SNIPPET: usize = 500;
+
+/// Cap on how many recent failure records `aggregate_recent_failures`
+/// returns. Bounded so the memory used by the dashboard stays sane
+/// even on a huge log.
+pub const RECENT_FAILURES_KEEP: usize = 50;
+
+/// How long an event stays in the log before [`prune`] drops it.
+/// The dashboard only ever reports on recent activity, so keeping
+/// more than this costs read time without telling anyone anything.
+pub const RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Only consider pruning once the log is at least this big. Stat-ing
+/// the file is cheap; rewriting it is not, so small logs never pay
+/// for retention at all.
+const PRUNE_MIN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Minimum gap between prune attempts, tracked by the mtime of a
+/// stamp file beside the log. Without this, a log that is over
+/// [`PRUNE_MIN_BYTES`] but has nothing expired yet would be rewritten
+/// on *every* append -- the size check alone says "big", not "stale".
+const PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Where (if anywhere) per-run events get appended. Wired into
 /// [`crate::pipeline::PipelineTargets`] so every callpath that runs
@@ -112,7 +142,11 @@ impl Recorder {
 
 /// Default log path: `$XDG_STATE_HOME/mailsift/events.ndjson` or
 /// `$HOME/.local/state/mailsift/events.ndjson`.
-fn default_log_path() -> Option<PathBuf> {
+/// XDG state path the milter (and any scan invoked without
+/// `--no-stats`) appends per-extractor events to. `None` if neither
+/// `$XDG_STATE_HOME` nor `$HOME` is set; that shouldn't happen in
+/// practice but the daemon shouldn't crash if it does.
+pub fn default_log_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
@@ -131,6 +165,7 @@ fn append_event(path: &Path, event: &Event) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
+    maybe_prune(path, event.ts)?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -140,6 +175,98 @@ fn append_event(path: &Path, event: &Event) -> Result<()> {
     line.push('\n');
     file.write_all(line.as_bytes())
         .with_context(|| format!("appending to {}", path.display()))?;
+    Ok(())
+}
+
+/// Rewrite `path` in place, keeping only events newer than
+/// [`RETENTION`] relative to `now_ts`. Returns the number of events
+/// dropped.
+///
+/// The rewrite goes via a temporary file in the same directory and is
+/// swapped in with `rename(2)`, so a concurrent reader sees either the
+/// old log or the new one, never a half-written file. Concurrent
+/// *writers* holding an `O_APPEND` fd on the old inode will keep
+/// appending to it and lose those events when the rename lands; that
+/// is an acceptable trade for events we were about to discard anyway,
+/// and stats are explicitly best-effort (see [`Recorder::record`]).
+pub fn prune(path: &Path, now_ts: i64) -> Result<u64> {
+    let cutoff = now_ts - RETENTION.as_secs() as i64;
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let reader = BufReader::new(file);
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating temp file in {}", parent.display()))?;
+
+    let mut dropped = 0u64;
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("reading {}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Keep lines we can't parse: they're already counted as parse
+        // errors on read, and silently dropping them here would hide
+        // a writer that's emitting malformed events.
+        if let Ok(event) = serde_json::from_str::<Event>(&line)
+            && event.ts < cutoff
+        {
+            dropped += 1;
+            continue;
+        }
+        writeln!(tmp, "{line}").context("writing pruned log")?;
+    }
+
+    tmp.as_file()
+        .sync_all()
+        .context("flushing pruned log to disk")?;
+    tmp.persist(path)
+        .with_context(|| format!("replacing {}", path.display()))?;
+    Ok(dropped)
+}
+
+/// Path of the stamp file recording when we last pruned `path`.
+fn prune_stamp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".pruned");
+    path.with_file_name(name)
+}
+
+/// Prune `path` if it has grown past [`PRUNE_MIN_BYTES`] and we
+/// haven't pruned within [`PRUNE_INTERVAL`]. Called on every append,
+/// so the common case is one or two `stat(2)` calls and no I/O.
+fn maybe_prune(path: &Path, now_ts: i64) -> Result<()> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() >= PRUNE_MIN_BYTES => {}
+        // Not there yet, or too small to bother.
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("stat-ing {}", path.display()));
+        }
+    }
+
+    let stamp = prune_stamp_path(path);
+    if let Ok(m) = std::fs::metadata(&stamp)
+        && let Ok(modified) = m.modified()
+        && let Ok(age) = modified.elapsed()
+        && age < PRUNE_INTERVAL
+    {
+        return Ok(());
+    }
+    // Stamp first: a prune that fails halfway shouldn't make every
+    // subsequent append retry the same expensive rewrite.
+    File::create(&stamp).with_context(|| format!("creating {}", stamp.display()))?;
+
+    let dropped = prune(path, now_ts)?;
+    if dropped > 0 {
+        tracing::info!(
+            dropped,
+            path = %path.display(),
+            "pruned stats events older than retention"
+        );
+    }
     Ok(())
 }
 
@@ -156,9 +283,13 @@ pub struct ExtractorStats {
     pub skipped_dkim: u64,
     /// Mean wall-clock runtime in milliseconds across runs that
     /// actually forked the extractor (`produced + empty + failed`).
-    /// `None` when there were no such runs.
+    /// `None` when there were no such runs; skipped in JSON so
+    /// consumers don't need to special-case `null` alongside a
+    /// numeric value.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mean_duration_ms: Option<f64>,
     /// Last (most recent) `ts` we saw for this extractor.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_ts: Option<i64>,
     /// Up to N most recent distinct `From:` domains for this
     /// extractor, oldest-first. Bounded to keep the table compact.
@@ -208,6 +339,64 @@ pub fn aggregate(path: &Path) -> Result<Vec<ExtractorStats>> {
         .collect();
     stats.sort_by(|a, b| b.runs.cmp(&a.runs).then_with(|| a.name.cmp(&b.name)));
     Ok(stats)
+}
+
+/// One extractor-failure record surfaced to the dashboard. Includes
+/// everything a human needs to triage: when, which extractor, which
+/// sender domain, and the (truncated) error the pipeline logged.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentFailure {
+    pub ts: i64,
+    pub extractor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Scan the event log and return the most recent [`RECENT_FAILURES_KEEP`]
+/// `Failed` records, newest first. Bounded memory: we only keep the
+/// tail while streaming.
+pub fn aggregate_recent_failures(path: &Path) -> Result<Vec<RecentFailure>> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut out: Vec<RecentFailure> = Vec::new();
+    let mut parse_errors = 0u64;
+
+    for (lineno, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("reading line {}", lineno + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: Event = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(_) => {
+                parse_errors += 1;
+                continue;
+            }
+        };
+        if event.outcome != Outcome::Failed {
+            continue;
+        }
+        out.push(RecentFailure {
+            ts: event.ts,
+            extractor: event.extractor,
+            from_domain: event.from_domain,
+            error: event.error,
+        });
+    }
+
+    if parse_errors > 0 {
+        warn!(
+            count = parse_errors,
+            "skipped malformed event lines while aggregating recent failures"
+        );
+    }
+
+    // Sort descending by ts; ties broken by extractor for stable output.
+    out.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.extractor.cmp(&b.extractor)));
+    out.truncate(RECENT_FAILURES_KEEP);
+    Ok(out)
 }
 
 /// Running sums + capped recent-domains list, one per extractor.
@@ -303,7 +492,110 @@ mod tests {
             outcome,
             duration_ms,
             from_domain: None,
+            error: None,
         }
+    }
+
+    #[test]
+    fn prune_drops_events_older_than_retention() {
+        let now = 2_000_000_000i64;
+        let old = now - RETENTION.as_secs() as i64 - 1;
+        let (_d, path) = write_events(&[
+            event("stale", Outcome::Produced, old, Some(10)),
+            event("fresh", Outcome::Produced, now, Some(20)),
+        ]);
+        assert_eq!(prune(&path, now).unwrap(), 1);
+        let stats = aggregate(&path).unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].name, "fresh");
+    }
+
+    #[test]
+    fn prune_keeps_events_exactly_on_the_cutoff() {
+        let now = 2_000_000_000i64;
+        let cutoff = now - RETENTION.as_secs() as i64;
+        let (_d, path) = write_events(&[event("edge", Outcome::Produced, cutoff, Some(10))]);
+        assert_eq!(prune(&path, now).unwrap(), 0);
+        assert_eq!(aggregate(&path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_keeps_unparseable_lines() {
+        let now = 2_000_000_000i64;
+        let (_d, path) = write_events(&[event("fresh", Outcome::Produced, now, Some(10))]);
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f, "not json at all").unwrap();
+        }
+        assert_eq!(prune(&path, now).unwrap(), 0);
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(kept.lines().filter(|l| *l == "not json at all").count(), 1);
+    }
+
+    #[test]
+    fn small_log_is_not_pruned_on_append() {
+        let now = 2_000_000_000i64;
+        let old = now - RETENTION.as_secs() as i64 - 1;
+        let (_d, path) = write_events(&[event("stale", Outcome::Produced, old, Some(10))]);
+        // Under PRUNE_MIN_BYTES, so the stale event survives: retention
+        // only kicks in once the log is actually costing something.
+        append_event(&path, &event("fresh", Outcome::Produced, now, Some(20))).unwrap();
+        assert_eq!(aggregate(&path).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn append_prunes_once_the_log_is_large_enough() {
+        let now = 2_000_000_000i64;
+        let old = now - RETENTION.as_secs() as i64 - 1;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("events.ndjson");
+        // Pad past PRUNE_MIN_BYTES with expired events so the next
+        // append triggers a prune.
+        let mut stale = event("stale", Outcome::Produced, old, Some(10));
+        stale.error = Some("x".repeat(MAX_ERROR_SNIPPET));
+        let per_line = serde_json::to_string(&stale).unwrap().len() as u64 + 1;
+        for _ in 0..(PRUNE_MIN_BYTES / per_line + 1) {
+            append_event(&path, &stale).unwrap();
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() >= PRUNE_MIN_BYTES);
+
+        append_event(&path, &event("fresh", Outcome::Produced, now, Some(20))).unwrap();
+
+        let stats = aggregate(&path).unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].name, "fresh");
+    }
+
+    /// A log over PRUNE_MIN_BYTES but with nothing expired must not
+    /// be rewritten on every append -- that was the whole cost we set
+    /// out to remove.
+    #[test]
+    fn large_log_with_nothing_expired_is_not_rewritten_repeatedly() {
+        let now = 2_000_000_000i64;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("events.ndjson");
+        let mut fresh = event("fresh", Outcome::Produced, now, Some(10));
+        fresh.error = Some("x".repeat(MAX_ERROR_SNIPPET));
+        let per_line = serde_json::to_string(&fresh).unwrap().len() as u64 + 1;
+        for _ in 0..(PRUNE_MIN_BYTES / per_line + 1) {
+            append_event(&path, &fresh).unwrap();
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() >= PRUNE_MIN_BYTES);
+
+        // maybe_prune runs before the write, so the first append that
+        // *sees* an oversized log is the next one. It stamps; the one
+        // after that must find the stamp fresh and skip the rewrite.
+        let stamp = prune_stamp_path(&path);
+        append_event(&path, &fresh).unwrap();
+        assert!(stamp.exists(), "prune should have stamped");
+        let stamped_at = std::fs::metadata(&stamp).unwrap().modified().unwrap();
+
+        append_event(&path, &fresh).unwrap();
+        assert_eq!(
+            std::fs::metadata(&stamp).unwrap().modified().unwrap(),
+            stamped_at,
+            "second append must not re-run prune"
+        );
     }
 
     #[test]
@@ -365,6 +657,7 @@ mod tests {
                 outcome: Outcome::Produced,
                 duration_ms: Some(10),
                 from_domain: Some((*dom).into()),
+                error: None,
             });
         }
         let (_d, path) = write_events(&events);
@@ -387,6 +680,45 @@ mod tests {
         assert_eq!(stats[0].runs, 2);
         assert_eq!(stats[0].produced, 1);
         assert_eq!(stats[0].failed, 1);
+    }
+
+    fn failure(extractor: &str, ts: i64, error: &str, domain: Option<&str>) -> Event {
+        Event {
+            ts,
+            extractor: extractor.into(),
+            outcome: Outcome::Failed,
+            duration_ms: Some(5),
+            from_domain: domain.map(String::from),
+            error: Some(error.into()),
+        }
+    }
+
+    #[test]
+    fn recent_failures_returns_only_failed_events_newest_first() {
+        let (_d, path) = write_events(&[
+            failure("a", 10, "boom-a", Some("a.example")),
+            event("a", Outcome::Produced, 11, Some(1)),
+            failure("b", 20, "boom-b", Some("b.example")),
+            event("a", Outcome::SkippedHeaders, 12, None),
+            failure("c", 15, "boom-c", None),
+        ]);
+        let fails = aggregate_recent_failures(&path).unwrap();
+        let names: Vec<&str> = fails.iter().map(|f| f.extractor.as_str()).collect();
+        assert_eq!(names, vec!["b", "c", "a"]);
+        assert_eq!(fails[0].error.as_deref(), Some("boom-b"));
+        assert_eq!(fails[2].from_domain.as_deref(), Some("a.example"));
+    }
+
+    #[test]
+    fn recent_failures_are_bounded() {
+        let events: Vec<Event> = (0..(RECENT_FAILURES_KEEP as i64 + 10))
+            .map(|i| failure("x", i, "e", None))
+            .collect();
+        let (_d, path) = write_events(&events);
+        let fails = aggregate_recent_failures(&path).unwrap();
+        assert_eq!(fails.len(), RECENT_FAILURES_KEEP);
+        // Newest ts first.
+        assert_eq!(fails[0].ts, (RECENT_FAILURES_KEEP as i64) + 9);
     }
 
     #[test]

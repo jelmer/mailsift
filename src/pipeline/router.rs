@@ -17,8 +17,8 @@ use crate::artifacts::{Artifact, Kind};
 use crate::reservation;
 use crate::seen::{self, Store as SeenStore};
 use crate::targets::{
-    EventSink, EventSinkKind, FileOutcome, SingleEvent, bills, parcels, receipts, split_calendar,
-    subscriptions, tickets,
+    EventSink, EventSinkKind, FileOutcome, SingleEvent, bills, json_target, parcels, receipts,
+    reservations, split_calendar, subscriptions, tickets,
 };
 
 pub(super) const KIND_EVENT: usize = 0;
@@ -27,6 +27,7 @@ pub(super) const KIND_PARCEL: usize = 2;
 pub(super) const KIND_RECEIPT: usize = 3;
 pub(super) const KIND_TICKET: usize = 4;
 pub(super) const KIND_SUBSCRIPTION: usize = 5;
+pub(super) const KIND_RESERVATION: usize = 6;
 
 /// Per-`pipeline::run` tally of successful artifact filings. Used to
 /// emit one compact INFO line per source message instead of one per
@@ -36,10 +37,22 @@ pub(super) struct Summary {
     /// `extractor name -> per-kind counts` (indexed by the `KIND_*`
     /// constants). `BTreeMap` so the rendered string is stable across
     /// invocations.
-    counts: BTreeMap<String, [u32; 6]>,
+    counts: BTreeMap<String, [u32; 7]>,
+    /// When set, the filer functions skip the actual target write
+    /// (disk / CalDAV / SMTP / Firefly / trackers) but still bump the
+    /// summary as if the write had succeeded. Reports what `--dry-run`
+    /// would do.
+    pub(super) dry_run: bool,
 }
 
 impl Summary {
+    pub(super) fn new(dry_run: bool) -> Self {
+        Self {
+            counts: BTreeMap::new(),
+            dry_run,
+        }
+    }
+
     pub(super) fn bump(&mut self, extractor: &str, kind_index: usize) {
         // Avoid allocating a new `String` on every bump — only allocate
         // when this is the first sighting of the extractor. `BTreeMap`
@@ -47,7 +60,7 @@ impl Summary {
         if let Some(counts) = self.counts.get_mut(extractor) {
             counts[kind_index] += 1;
         } else {
-            let mut counts = [0u32; 6];
+            let mut counts = [0u32; 7];
             counts[kind_index] = 1;
             self.counts.insert(extractor.to_string(), counts);
         }
@@ -73,6 +86,7 @@ impl Summary {
                 (counts[KIND_RECEIPT], "receipt", "receipts"),
                 (counts[KIND_TICKET], "ticket", "tickets"),
                 (counts[KIND_SUBSCRIPTION], "subscription", "subscriptions"),
+                (counts[KIND_RESERVATION], "reservation", "reservations"),
             ] {
                 if count == 0 {
                     continue;
@@ -94,6 +108,7 @@ pub(super) fn file_event_artifact(
     artifact: &Artifact,
     event_sink: &EventSinkKind,
     seen: Option<&SeenStore>,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
     let body = match fs::read_to_string(&artifact.path) {
@@ -132,7 +147,52 @@ pub(super) fn file_event_artifact(
     }
 
     for event in &singles {
-        file_single(extractor, event, event_sink, seen, summary);
+        file_single(
+            extractor,
+            event,
+            event_sink,
+            seen,
+            received_at_epoch,
+            summary,
+        );
+    }
+}
+
+/// File the raw `.reservation.json` payload under `reservations_dir`.
+///
+/// Separate from the calendar conversion below: the VEVENT keeps only
+/// what iCalendar can express, so the booking reference, passenger and
+/// price survive only in the JSON. A reservation we can't render as an
+/// event is still worth archiving, and vice versa.
+pub(super) fn file_reservation_json(
+    extractor: &str,
+    artifact: &Artifact,
+    reservations_dir: &Path,
+    received_at_epoch: Option<i64>,
+    summary: &mut Summary,
+) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_RESERVATION);
+        return;
+    }
+    match reservations::file_reservation(&artifact.path, reservations_dir, received_at_epoch) {
+        // One bump per record written, matching the event side, where
+        // a multi-leg itinerary counts as several events.
+        Ok(outcomes) => {
+            for outcome in outcomes {
+                if !matches!(outcome, FileOutcome::Kept(_)) {
+                    summary.bump(extractor, KIND_RESERVATION);
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %artifact.path.display(),
+                error = format!("{e:#}"),
+                "failed to file reservation"
+            );
+        }
     }
 }
 
@@ -141,6 +201,7 @@ pub(super) fn file_reservation_artifact(
     artifact: &Artifact,
     event_sink: &EventSinkKind,
     seen: Option<&SeenStore>,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
     let singles = match reservation::convert_file(&artifact.path) {
@@ -164,7 +225,14 @@ pub(super) fn file_reservation_artifact(
         return;
     }
     for single in &singles {
-        file_single(extractor, single, event_sink, seen, summary);
+        file_single(
+            extractor,
+            single,
+            event_sink,
+            seen,
+            received_at_epoch,
+            summary,
+        );
     }
 }
 
@@ -173,12 +241,18 @@ pub(super) fn file_bill_artifact(
     artifact: &Artifact,
     bills_dir: &Path,
     firefly: Option<&crate::targets::firefly::FireflySink>,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
-    match bills::file_bill(&artifact.path, bills_dir, firefly) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_BILL);
+        return;
+    }
+    match bills::file_bill(&artifact.path, bills_dir, firefly, received_at_epoch) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_BILL);
         }
+        Ok(FileOutcome::Kept(_)) => {}
         Err(e) => {
             warn!(
                 extractor,
@@ -190,17 +264,76 @@ pub(super) fn file_bill_artifact(
     }
 }
 
+/// File a bill companion blob (`<slug>.bill.pdf`, etc.) alongside its
+/// same-slug `.bill.json` sibling in the same run. An orphan blob (no
+/// sibling, or a sibling that fails to yield a paired name) is dropped
+/// with a warning: the extractor should have emitted the structured
+/// record too.
+pub(super) fn file_bill_blob_artifact(
+    extractor: &str,
+    artifact: &Artifact,
+    all_artifacts: &[Artifact],
+    bills_dir: &Path,
+    received_at_epoch: Option<i64>,
+    summary: &mut Summary,
+) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_BILL);
+        return;
+    }
+    let Some((pair, received_at)) = sibling_json_body(all_artifacts, Kind::Bill, &artifact.slug)
+        .and_then(|body| {
+            let pair = bills::paired_name_from_json(&body)?;
+            Some((pair, sibling_received_at(&body, received_at_epoch)))
+        })
+    else {
+        warn!(
+            extractor,
+            path = %artifact.path.display(),
+            slug = %artifact.slug,
+            "bill blob has no same-slug .bill.json sibling; dropping"
+        );
+        return;
+    };
+    match bills::file_bill_blob(
+        &artifact.path,
+        &artifact.ext,
+        (pair.0.as_str(), pair.1.as_str(), pair.2),
+        bills_dir,
+        received_at,
+    ) {
+        Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
+            summary.bump(extractor, KIND_BILL);
+        }
+        Ok(FileOutcome::Kept(_)) => {}
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %artifact.path.display(),
+                error = format!("{e:#}"),
+                "failed to file bill blob"
+            );
+        }
+    }
+}
+
 pub(super) fn file_parcel_artifact(
     extractor: &str,
     artifact: &Artifact,
     parcels_dir: &Path,
     trackers: Option<&crate::targets::trackers::Trackers>,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
-    match parcels::file_parcel(&artifact.path, parcels_dir, trackers) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_PARCEL);
+        return;
+    }
+    match parcels::file_parcel(&artifact.path, parcels_dir, trackers, received_at_epoch) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_PARCEL);
         }
+        Ok(FileOutcome::Kept(_)) => {}
         Err(e) => {
             warn!(
                 extractor,
@@ -217,8 +350,35 @@ fn file_single(
     event: &SingleEvent,
     event_sink: &EventSinkKind,
     seen: Option<&SeenStore>,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_EVENT);
+        return;
+    }
+    // An event whose source didn't say when it was created is dated by
+    // the message it arrived in. That lets the sink order it against
+    // other takes on the same UID, and makes its body the same every
+    // time the message is processed.
+    let dated = match received_at_epoch
+        .and_then(|epoch| chrono::DateTime::from_timestamp(epoch, 0))
+        .filter(|_| event.dtstamp.is_none())
+        .map(|message_date| event.with_dtstamp(message_date))
+        .transpose()
+    {
+        Ok(dated) => dated,
+        Err(e) => {
+            warn!(
+                extractor,
+                uid = %event.uid,
+                error = format!("{e:#}"),
+                "failed to date event by its message"
+            );
+            return;
+        }
+    };
+    let event = dated.as_ref().unwrap_or(event);
     // Skip the network round-trip when (a) we have a seen.db, (b) the
     // sink is CalDAV (local-dir rewrites are cheap, no point gating),
     // and (c) we've already PUT this exact body for this UID. Local
@@ -243,6 +403,7 @@ fn file_single(
                 store.mark(seen::Kind::Event, &event.uid, h);
             }
         }
+        Ok(FileOutcome::Kept(_)) => {}
         Err(e) => {
             warn!(
                 extractor,
@@ -254,17 +415,26 @@ fn file_single(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn file_receipt_artifact(
     extractor: &str,
     artifact: &Artifact,
     raw_message: &[u8],
     sink: &receipts::ReceiptSink,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
+    recorder: &crate::stats::Recorder,
+    now_ts: i64,
 ) {
-    match sink.file_receipt(&artifact.path, raw_message) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_RECEIPT);
+        return;
+    }
+    match sink.file_receipt(&artifact.path, raw_message, received_at_epoch) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_RECEIPT);
         }
+        Ok(FileOutcome::Kept(_)) => {}
         Err(e) => {
             warn!(
                 extractor,
@@ -272,20 +442,132 @@ pub(super) fn file_receipt_artifact(
                 error = format!("{e:#}"),
                 "failed to file receipt"
             );
+            // The forward sink is the only receipt variant that talks
+            // to the network (SMTP or a sendmail pipe). Its failures
+            // are the ones a human might want to see on the dashboard,
+            // so we record them under a synthetic extractor name.
+            if matches!(sink, receipts::ReceiptSink::Forward(_)) {
+                let mut err_snippet = format!("{e:#}");
+                if err_snippet.len() > crate::stats::MAX_ERROR_SNIPPET {
+                    err_snippet.truncate(crate::stats::MAX_ERROR_SNIPPET);
+                }
+                recorder.record(&crate::stats::Event {
+                    ts: now_ts,
+                    extractor: RECEIPTS_FORWARD_SINK_NAME.to_string(),
+                    outcome: crate::stats::Outcome::Failed,
+                    duration_ms: None,
+                    from_domain: None,
+                    error: Some(err_snippet),
+                });
+            }
         }
     }
+}
+
+/// Synthetic "extractor" identifier used for sink-side receipts-forward
+/// failures so they show up in the aggregated stats alongside real
+/// extractor runs. The angle-brackets keep the name from ever
+/// colliding with a real extractor slug.
+pub(super) const RECEIPTS_FORWARD_SINK_NAME: &str = "<sink:receipts-forward>";
+
+/// File a receipt companion blob (`<slug>.receipt.pdf`, etc.) alongside
+/// its same-slug `.receipt.json` sibling in the same run. An orphan
+/// blob (no sibling, or a sibling that fails to yield a paired name)
+/// is dropped with a warning: the extractor should have emitted the
+/// structured record too. The [`receipts::ReceiptSink::Forward`]
+/// variant is a no-op here: the original RFC822 was already forwarded
+/// on the JSON receipt.
+pub(super) fn file_receipt_blob_artifact(
+    extractor: &str,
+    artifact: &Artifact,
+    all_artifacts: &[Artifact],
+    sink: &receipts::ReceiptSink,
+    received_at_epoch: Option<i64>,
+    summary: &mut Summary,
+) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_RECEIPT);
+        return;
+    }
+    let Some((pair, received_at)) = sibling_json_body(all_artifacts, Kind::Receipt, &artifact.slug)
+        .and_then(|body| {
+            let pair = receipts::paired_name_from_json(&body)?;
+            Some((pair, sibling_received_at(&body, received_at_epoch)))
+        })
+    else {
+        warn!(
+            extractor,
+            path = %artifact.path.display(),
+            slug = %artifact.slug,
+            "receipt blob has no same-slug .receipt.json sibling; dropping"
+        );
+        return;
+    };
+    match sink.file_receipt_blob(
+        &artifact.path,
+        &artifact.ext,
+        (pair.0.as_str(), pair.1.as_str(), pair.2),
+        received_at,
+    ) {
+        Ok(Some(FileOutcome::Created(_) | FileOutcome::Updated(_))) => {
+            summary.bump(extractor, KIND_RECEIPT);
+        }
+        Ok(Some(FileOutcome::Kept(_))) => {}
+        Ok(None) => {
+            // Forward-sink no-op: nothing to record.
+        }
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %artifact.path.display(),
+                error = format!("{e:#}"),
+                "failed to file receipt blob"
+            );
+        }
+    }
+}
+
+/// Find a same-slug JSON sibling of `kind` in the extractor run and
+/// return its body. Used to look up the merchant/order (or
+/// payee/invoice) that a companion blob should be paired under.
+fn sibling_json_body(all_artifacts: &[Artifact], kind: Kind, slug: &str) -> Option<String> {
+    let sibling = all_artifacts
+        .iter()
+        .find(|a| a.kind == kind && a.ext == "json" && a.slug == slug)?;
+    fs::read_to_string(&sibling.path).ok()
+}
+
+/// The date a sibling JSON record is filed under: its own `receivedAt`
+/// when the extractor set one, the message date otherwise. Mirrors the
+/// stamping the JSON sinks do, so a companion blob is ordered exactly
+/// like the record it belongs to.
+fn sibling_received_at(
+    body: &str,
+    received_at_epoch: Option<i64>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    // `body` already parsed as a bill or receipt, so this can't fail.
+    json_target::received_at_in(
+        json_target::body_with_received_at(body, received_at_epoch).as_bytes(),
+    )
+    .expect("sibling JSON parsed a moment ago")
 }
 
 pub(super) fn file_subscription_artifact(
     extractor: &str,
     artifact: &Artifact,
     subscriptions_dir: &Path,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
-    match subscriptions::file_subscription(&artifact.path, subscriptions_dir) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_SUBSCRIPTION);
+        return;
+    }
+    match subscriptions::file_subscription(&artifact.path, subscriptions_dir, received_at_epoch) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_SUBSCRIPTION);
         }
+        Ok(FileOutcome::Kept(_)) => {}
         Err(e) => {
             warn!(
                 extractor,
@@ -302,12 +584,26 @@ pub(super) fn file_ticket_artifact(
     artifact: &Artifact,
     year: i32,
     sink: &tickets::TicketSink,
+    meta: &tickets::TicketMeta,
+    received_at_epoch: Option<i64>,
     summary: &mut Summary,
 ) {
-    match sink.file_ticket(&artifact.path, &artifact.slug, &artifact.ext, year) {
+    if summary.dry_run {
+        summary.bump(extractor, KIND_TICKET);
+        return;
+    }
+    match sink.file_ticket(
+        &artifact.path,
+        &artifact.slug,
+        &artifact.ext,
+        year,
+        meta,
+        received_at_epoch,
+    ) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_TICKET);
         }
+        Ok(FileOutcome::Kept(_)) => {}
         Err(e) => {
             warn!(
                 extractor,
@@ -383,8 +679,12 @@ fn year_from_event_artifact(path: &Path) -> Option<i32> {
 struct ReservationDates {
     #[serde(default, rename = "checkinTime")]
     checkin_time: Option<String>,
+    #[serde(default, rename = "checkinDate")]
+    checkin_date: Option<String>,
     #[serde(default, rename = "startTime")]
     start_time: Option<String>,
+    #[serde(default, rename = "pickupTime")]
+    pickup_time: Option<String>,
     #[serde(default, rename = "reservationFor")]
     reservation_for: Option<NestedDates>,
 }
@@ -417,6 +717,30 @@ impl ReservationDatesDoc {
     }
 }
 
+/// Collect identifying fields from this run's sibling
+/// `.reservation.json` artifacts for the ticket sidecar. A boarding
+/// pass carries none of this itself, but the reservation filed in the
+/// same extractor run does.
+///
+/// Takes the first reservation that yields each field; a multi-leg
+/// itinerary shares its booking reference and passenger across legs,
+/// so the first one is representative.
+pub(super) fn sibling_ticket_meta(artifacts: &[Artifact]) -> tickets::TicketMeta {
+    let mut meta = tickets::TicketMeta::default();
+    for a in artifacts {
+        if a.kind != Kind::Reservation {
+            continue;
+        }
+        let Some(fields) = reservations::identifying_fields(&a.path) else {
+            continue;
+        };
+        meta.reservation_number = meta.reservation_number.or(fields.reservation_number);
+        meta.under_name = meta.under_name.or(fields.under_name);
+        meta.provider = meta.provider.or(fields.provider);
+    }
+    meta
+}
+
 /// Read a `.reservation.json` file and return the year of its earliest
 /// schema.org date field we recognise.
 fn year_from_reservation_artifact(path: &Path) -> Option<i32> {
@@ -433,7 +757,9 @@ fn year_from_reservation_artifact(path: &Path) -> Option<i32> {
             });
             [
                 r.checkin_time,
+                r.checkin_date,
                 r.start_time,
+                r.pickup_time,
                 nested.departure_time,
                 nested.start_date,
                 nested.door_time,
@@ -576,6 +902,13 @@ END:VCALENDAR\r
     }
 
     #[test]
+    fn reservation_artifact_year_from_checkin_date() {
+        let json = r#"{"@type":"LodgingReservation","checkinDate":"2015-08-01T15:00:00+09:00"}"#;
+        let (_d, path) = write_temp(json, ".reservation.json");
+        assert_eq!(year_from_reservation_artifact(&path), Some(2015));
+    }
+
+    #[test]
     fn reservation_artifact_year_from_nested_departure() {
         let json = r#"{
             "@type":"FlightReservation",
@@ -654,6 +987,228 @@ END:VCALENDAR\r
         assert_eq!(earliest_sibling_year(&arts), None);
     }
 
+    fn event_about(summary: &str) -> SingleEvent {
+        SingleEvent {
+            uid: "evt-1@example.com".to_string(),
+            body: format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+                BEGIN:VEVENT\r\nUID:evt-1@example.com\r\n\
+                DTSTART:20260201T100000Z\r\n\
+                SUMMARY:{summary}\r\n\
+                END:VEVENT\r\nEND:VCALENDAR\r\n"
+            ),
+            method: None,
+            dtstamp: None,
+        }
+    }
+
+    fn filed_summary(dir: &Path) -> String {
+        let body = fs::read_to_string(dir.join("evt-1@example.ics")).unwrap();
+        let line = body.lines().find(|l| l.starts_with("SUMMARY:")).unwrap();
+        line.to_string()
+    }
+
+    /// An event that doesn't say when it was created is ordered by
+    /// its message: one from an older message must not replace what a
+    /// newer one filed under the same UID.
+    #[test]
+    fn file_single_keeps_event_from_newer_message() {
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let sink = EventSinkKind::LocalDir(out_dir.path().to_path_buf());
+        let mut summary = Summary::default();
+
+        // Sent 2026-01-28 and 2026-01-20 respectively.
+        let rebooked = (event_about("Rebooked"), Some(1769594400));
+        let original = (event_about("Original"), Some(1768903200));
+
+        file_single("ex", &rebooked.0, &sink, None, rebooked.1, &mut summary);
+        file_single("ex", &original.0, &sink, None, original.1, &mut summary);
+        assert_eq!(filed_summary(out_dir.path()), "SUMMARY:Rebooked");
+        assert_eq!(summary.render(), "ex=1 event");
+
+        file_single("ex", &rebooked.0, &sink, None, rebooked.1, &mut summary);
+        assert_eq!(filed_summary(out_dir.path()), "SUMMARY:Rebooked");
+        assert_eq!(summary.render(), "ex=2 events");
+    }
+
+    fn caldav_sink(server: &crate::targets::fake_dav::FakeDav) -> EventSinkKind {
+        EventSinkKind::Caldav(
+            crate::targets::caldav::CaldavSink::new(
+                server.base_url.clone(),
+                Some("u".into()),
+                Some("p".into()),
+                crate::targets::fake_dav::runtime_handle(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// An event the server has a newer take on was not filed, so the
+    /// dedup store must not record it as filed, nor the summary count
+    /// it.
+    #[test]
+    fn file_single_does_not_mark_a_kept_event_as_seen() {
+        let server = crate::targets::fake_dav::FakeDav::start();
+        let sink = caldav_sink(&server);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = SeenStore::open(&store_dir.path().join("seen.db")).unwrap();
+        let mut summary = Summary::default();
+
+        // Sent 2026-01-28, filed without the store; then one sent 2026-01-20.
+        file_single(
+            "ex",
+            &event_about("Rebooked"),
+            &sink,
+            None,
+            Some(1769594400),
+            &mut summary,
+        );
+        let mut summary = Summary::default();
+        file_single(
+            "ex",
+            &event_about("Original"),
+            &sink,
+            Some(&store),
+            Some(1768903200),
+            &mut summary,
+        );
+        assert_eq!(store.len().unwrap(), 0);
+        assert!(summary.is_empty());
+    }
+
+    /// A record left alone in favour of a newer one wasn't filed, so
+    /// it doesn't show up in the per-message summary.
+    #[test]
+    fn kept_subscription_is_not_counted() {
+        let out = tempfile::TempDir::new().unwrap();
+        let (_d, path) = write_temp(r#"{"name":"Fixture Music"}"#, ".subscription.json");
+        let art = artifact(Kind::Subscription, path);
+        let mut summary = Summary::default();
+
+        file_subscription_artifact("ex", &art, out.path(), Some(1769594400), &mut summary);
+        assert_eq!(summary.render(), "ex=1 subscription");
+        file_subscription_artifact("ex", &art, out.path(), Some(1768903200), &mut summary);
+        assert_eq!(summary.render(), "ex=1 subscription");
+    }
+
+    /// An extractor may date a bill itself. Its blob has to be ordered
+    /// by that same date; ordered by the message date instead, it
+    /// would look older than the record just filed and never land.
+    #[test]
+    fn bill_blob_is_filed_beside_a_bill_dated_by_the_extractor() {
+        let out = tempfile::TempDir::new().unwrap();
+        let src = tempfile::TempDir::new().unwrap();
+        let json = src.path().join("acme.bill.json");
+        let pdf = src.path().join("acme.bill.pdf");
+        fs::write(
+            &json,
+            r#"{"payee":"Acme","invoiceNumber":"INV1","dueDate":"2024-12-05",
+                "receivedAt":"2030-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        fs::write(&pdf, b"%PDF").unwrap();
+        let arts = vec![
+            Artifact {
+                kind: Kind::Bill,
+                path: json,
+                slug: "acme".into(),
+                ext: "json".into(),
+            },
+            Artifact {
+                kind: Kind::Bill,
+                path: pdf,
+                slug: "acme".into(),
+                ext: "pdf".into(),
+            },
+        ];
+        let mut summary = Summary::default();
+        // The message itself was sent 2024-11-01.
+        let sent = Some(1730419200);
+
+        file_bill_artifact("ex", &arts[0], out.path(), None, sent, &mut summary);
+        file_bill_blob_artifact("ex", &arts[1], &arts, out.path(), sent, &mut summary);
+
+        assert_eq!(
+            fs::read(out.path().join("2024/acme-inv1.pdf")).unwrap(),
+            b"%PDF"
+        );
+        assert_eq!(summary.render(), "ex=2 bills");
+    }
+
+    /// With a dedup store, an event CalDAV already has unchanged
+    /// costs no request at all; a changed one is sent.
+    #[test]
+    fn file_single_skips_caldav_for_an_event_already_filed() {
+        let server = crate::targets::fake_dav::FakeDav::start();
+        let sink = caldav_sink(&server);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = SeenStore::open(&store_dir.path().join("seen.db")).unwrap();
+        let mut summary = Summary::default();
+        let sent = Some(1769594400);
+
+        file_single(
+            "ex",
+            &event_about("Booked"),
+            &sink,
+            Some(&store),
+            sent,
+            &mut summary,
+        );
+        let after_first = server.requests().len();
+        file_single(
+            "ex",
+            &event_about("Booked"),
+            &sink,
+            Some(&store),
+            sent,
+            &mut summary,
+        );
+        assert_eq!(server.requests().len(), after_first);
+        assert_eq!(summary.render(), "ex=2 events");
+
+        file_single(
+            "ex",
+            &event_about("Rebooked"),
+            &sink,
+            Some(&store),
+            sent,
+            &mut summary,
+        );
+        assert_eq!(
+            server.requests()[after_first..],
+            [
+                "GET /calendar/evt-1%40example.com.ics",
+                "PUT /calendar/evt-1%40example.com.ics"
+            ]
+        );
+    }
+
+    #[test]
+    fn file_single_replaces_event_from_older_message() {
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let sink = EventSinkKind::LocalDir(out_dir.path().to_path_buf());
+        let mut summary = Summary::default();
+
+        file_single(
+            "ex",
+            &event_about("Original"),
+            &sink,
+            None,
+            Some(1768903200),
+            &mut summary,
+        );
+        file_single(
+            "ex",
+            &event_about("Rebooked"),
+            &sink,
+            None,
+            Some(1769594400),
+            &mut summary,
+        );
+        assert_eq!(filed_summary(out_dir.path()), "SUMMARY:Rebooked");
+        assert_eq!(summary.render(), "ex=2 events");
+    }
+
     /// LocalDir sinks must NOT consult or update seen.db; rewriting
     /// a tiny .ics file is cheaper than the lookup, and gating it
     /// would mean a deleted file (user reorganising on disk) stays
@@ -675,10 +1230,11 @@ END:VCALENDAR\r
                 END:VEVENT\r\nEND:VCALENDAR\r\n"
                 .to_string(),
             method: None,
+            dtstamp: None,
         };
 
         let mut summary = Summary::default();
-        file_single("ex", &event, &sink, Some(&store), &mut summary);
+        file_single("ex", &event, &sink, Some(&store), None, &mut summary);
 
         assert_eq!(store.len().unwrap(), 0, "LocalDir must not mark seen.db");
         // local_events::file_single sanitises the UID into a
@@ -693,5 +1249,68 @@ END:VCALENDAR\r
             1,
             "expected exactly one event file, got {entries:?}"
         );
+    }
+
+    /// Point Sendmail at a binary that does not exist; the forward
+    /// call must fail and the router must record a Failed stats event
+    /// under the synthetic sink name so the dashboard can surface it.
+    #[test]
+    fn receipts_forward_failure_records_stats_event() {
+        use crate::artifacts::{Artifact, Kind};
+        use crate::stats::{self, Recorder};
+        use crate::targets::mail_forward::MailForwarder;
+        use crate::targets::receipts::ReceiptSink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("events.ndjson");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let fwd = MailForwarder::sendmail(
+            "mailsift@example.org",
+            vec!["receipts@example.org".to_string()],
+            Some("/nonexistent/mailsift-test-sendmail".to_string()),
+            runtime.handle().clone(),
+        )
+        .unwrap();
+        let sink = ReceiptSink::Forward(fwd);
+
+        // A minimal receipt JSON on disk so file_receipt has something
+        // to hand to the forwarder before it tries to spawn sendmail.
+        let receipt_path = dir.path().join("dummy.receipt.json");
+        std::fs::write(
+            &receipt_path,
+            r#"{"merchant":{"name":"m"},"orderNumber":"1"}"#,
+        )
+        .unwrap();
+        let artifact = Artifact {
+            path: receipt_path,
+            kind: Kind::Receipt,
+            slug: "dummy".to_string(),
+            ext: "json".to_string(),
+        };
+
+        let mut summary = Summary::new(false);
+        let recorder = Recorder::File(log.clone());
+
+        file_receipt_artifact(
+            "test-extractor",
+            &artifact,
+            b"From: sender@example.com\r\nSubject: t\r\n\r\nbody\r\n",
+            &sink,
+            None,
+            &mut summary,
+            &recorder,
+            42,
+        );
+
+        let contents = std::fs::read_to_string(&log).expect("stats file should exist");
+        let event: stats::Event =
+            serde_json::from_str(contents.trim()).expect("one event was written");
+        assert_eq!(event.extractor, RECEIPTS_FORWARD_SINK_NAME);
+        assert_eq!(event.outcome, stats::Outcome::Failed);
+        assert_eq!(event.ts, 42);
     }
 }

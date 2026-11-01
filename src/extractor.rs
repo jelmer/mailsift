@@ -53,17 +53,30 @@ pub struct Manifest {
     /// notifications are DKIM-signed under a shared parent zone.
     #[serde(default)]
     pub require_dkim: Vec<String>,
+    /// Date (`YYYY-MM-DD`, UTC) the vendor started signing. Mail that
+    /// fails `require_dkim` is still accepted if we received it before
+    /// this date. "Received" is taken from the mail source (IMAP
+    /// INTERNALDATE, the Maildir delivery timestamp), never from
+    /// headers the sender wrote; without one, unsigned mail is refused.
+    #[serde(default)]
+    pub unsigned_before: Option<String>,
 }
 
 fn default_order() -> i32 {
     100
 }
 
+#[derive(Clone)]
 pub struct Extractor {
     pub name: String,
     pub script: PathBuf,
     pub order: i32,
     pub require_dkim: Vec<String>,
+    /// `unsigned_before`, as a unix timestamp (midnight UTC).
+    pub unsigned_before: Option<i64>,
+    /// Hash of the manifest and script, so a scan can tell which
+    /// extractors changed since it last ran.
+    pub fingerprint: String,
     /// Compiled `from_domains` patterns (lowercased). Empty means
     /// "match any sender".
     from_domains: Vec<FromDomainPattern>,
@@ -79,6 +92,7 @@ pub struct Extractor {
 /// IMAP prefilter to decide, from a `BODYSTRUCTURE` response alone
 /// (without fetching the body), whether the extractor could possibly
 /// match the message.
+#[derive(Clone)]
 pub enum BodyRequirement {
     /// `requires: html`: needs a `text/html` part anywhere in the tree.
     Html,
@@ -99,6 +113,7 @@ pub enum BodyRequirement {
 /// Deliberately minimal; only the wildcard forms actually used in
 /// extractor manifests are supported, so we don't drag in a
 /// general-purpose glob crate.
+#[derive(Clone)]
 pub enum FilenamePattern {
     /// Exact (case-insensitive) match.
     Exact(String),
@@ -169,6 +184,7 @@ fn parse_body_requirement(raw: &str) -> Result<BodyRequirement> {
 }
 
 /// Compiled form of a single `from_domains` entry.
+#[derive(Clone)]
 enum FromDomainPattern {
     /// Exact match against the (lowercased) sender domain.
     Exact(String),
@@ -201,6 +217,23 @@ fn parse_from_domain(raw: &str) -> FromDomainPattern {
 }
 
 impl Extractor {
+    /// A bare extractor with no dispatch hints, for tests elsewhere in
+    /// the crate that can't reach the private fields.
+    #[cfg(test)]
+    pub(crate) fn for_tests(name: &str, fingerprint: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            script: PathBuf::from(format!("/nonexistent/{name}.py")),
+            order: 100,
+            require_dkim: Vec::new(),
+            unsigned_before: None,
+            fingerprint: fingerprint.to_string(),
+            from_domains: Vec::new(),
+            subject_regex: None,
+            body_requirements: Vec::new(),
+        }
+    }
+
     /// Return `true` when the manifest's `from_domains` /
     /// `subject_regex` hints don't rule this extractor out for the
     /// given message.
@@ -234,6 +267,39 @@ impl Extractor {
             }
         }
         true
+    }
+
+    /// The base domain of each `from_domains` entry, for callers that
+    /// want to push the hint into a coarser upstream filter (the IMAP
+    /// `UID SEARCH`).
+    ///
+    /// Both pattern forms collapse to the same string: `example.com`
+    /// and `*.example.com` alike yield `example.com`. That is a
+    /// deliberate over-match -- as an IMAP `HEADER FROM` substring
+    /// test it admits `notexample.com` and any subdomain -- because
+    /// the upstream filter only has to be a superset. Every surviving
+    /// message is still put through [`matches_headers`], which applies
+    /// the real per-pattern semantics.
+    ///
+    /// [`matches_headers`]: Self::matches_headers
+    pub fn from_domain_roots(&self) -> Vec<&str> {
+        self.from_domains
+            .iter()
+            .map(|p| match p {
+                FromDomainPattern::Exact(d) | FromDomainPattern::Wildcard(d) => d.as_str(),
+            })
+            .collect()
+    }
+
+    /// Return `true` when this extractor declares any `from_domains`
+    /// or `subject_regex` hint, i.e. [`matches_headers`] can rule it
+    /// out from headers alone. An extractor without hints matches
+    /// every message, so a scan including it can't narrow anything
+    /// down from headers.
+    ///
+    /// [`matches_headers`]: Self::matches_headers
+    pub fn constrains_headers(&self) -> bool {
+        !self.from_domains.is_empty() || self.subject_regex.is_some()
     }
 
     /// Return `true` when the manifest's `requires:` body constraints
@@ -475,6 +541,13 @@ fn lint_one(
         }
     }
 
+    if let Err(e) = parse_unsigned_before(&manifest) {
+        issues.push(LintIssue {
+            source: manifest_path.to_path_buf(),
+            message: format!("{e:#}"),
+        });
+    }
+
     if let Some(re) = manifest.subject_regex.as_deref()
         && let Err(e) = regex::Regex::new(re)
     {
@@ -587,6 +660,11 @@ fn discover_into(dir: &Path, out: &mut Vec<Extractor>) -> Result<()> {
             })
             .transpose()?;
 
+        let unsigned_before = parse_unsigned_before(&manifest)?;
+        let script_body =
+            fs::read(&script_path).with_context(|| format!("reading {}", script_path.display()))?;
+        let fingerprint = fingerprint(body.as_bytes(), &script_body);
+
         // Lowercase `require_dkim` once at load time so the hot-path
         // `dkim::satisfies` comparison doesn't have to.
         let require_dkim = manifest
@@ -619,12 +697,65 @@ fn discover_into(dir: &Path, out: &mut Vec<Extractor>) -> Result<()> {
             script: script_path,
             order: manifest.order,
             require_dkim,
+            unsigned_before,
+            fingerprint,
             from_domains,
             subject_regex,
             body_requirements,
         });
     }
     Ok(())
+}
+
+/// Hex SHA-256 over the manifest and the script, length-prefixed so
+/// bytes can't move from one into the other unnoticed. Helpers the
+/// script imports aren't covered; `imap-scan --rescan` is for those.
+fn fingerprint(manifest: &[u8], script: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for part in [manifest, script] {
+        h.update((part.len() as u64).to_be_bytes());
+        h.update(part);
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Parse `unsigned_before` into a timestamp. It only relaxes
+/// `require_dkim`, so declaring it without one is an error rather than
+/// a no-op.
+fn parse_unsigned_before(manifest: &Manifest) -> Result<Option<i64>> {
+    let Some(raw) = manifest.unsigned_before.as_deref() else {
+        return Ok(None);
+    };
+    if manifest.require_dkim.is_empty() {
+        return Err(anyhow!(
+            "extractor {}: unsigned_before needs require_dkim",
+            manifest.name
+        ));
+    }
+    let date = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").with_context(|| {
+        format!(
+            "extractor {}: unsigned_before {raw:?} is not a YYYY-MM-DD date",
+            manifest.name
+        )
+    })?;
+    Ok(Some(
+        date.and_time(chrono::NaiveTime::MIN).and_utc().timestamp(),
+    ))
+}
+
+/// Truncate `line` so the emitted log record can't be flooded by a huge
+/// blob (a JSON dump, a stack trace with embedded payload, etc.). Cuts on
+/// a char boundary and appends an ellipsis marker.
+fn cap_log_line(line: &str, max: usize) -> String {
+    if line.len() <= max {
+        return line.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &line[..end])
 }
 
 /// Run one extractor with the raw RFC822 on stdin and a fresh tempdir as
@@ -641,13 +772,36 @@ pub fn run_one(extractor: &Extractor, raw: &[u8], timeout: Duration) -> Result<E
         .spawn()
         .with_context(|| format!("spawning extractor {}", extractor.name))?;
 
-    {
-        let mut stdin = child.stdin.take().expect("piped stdin");
-        // Best-effort: if the extractor exits before reading all of stdin
-        // we don't want to crash the parent on the resulting EPIPE.
-        let _ = stdin.write_all(raw);
+    // Feed stdin and drain both output pipes on their own threads.
+    // All three have to happen concurrently with the wait: pipes hold
+    // only a bounded amount (64KiB on Linux), so an extractor that
+    // writes a large report to stdout blocks in write() until we read,
+    // and one that never reads stdin blocks us in write_all(). Doing
+    // any of it inline deadlocks until the timeout kills a child that
+    // was working fine.
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let raw_owned = raw.to_vec();
+    let writer = std::thread::spawn(move || {
+        // Best-effort: if the extractor exits before reading all of
+        // stdin we don't want to crash the parent on the resulting
+        // EPIPE.
+        let _ = stdin.write_all(&raw_owned);
         drop(stdin);
-    }
+    });
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let stdout_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stderr_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
 
     // `wait_timeout` is a real blocking wait with a deadline, so the
     // happy path returns the moment the extractor finishes; no more
@@ -665,30 +819,39 @@ pub fn run_one(extractor: &Extractor, raw: &[u8], timeout: Duration) -> Result<E
         }
     };
 
-    // Drain stdout / stderr now that the child has exited. The pipes
-    // are bounded; if an extractor wrote enough that the OS-level
-    // buffer filled, it would have blocked before exit, so by the
-    // time we reach here both streams have either been drained or
-    // are small enough to read in full.
-    let mut stderr_buf = Vec::new();
-    let mut stdout_buf = Vec::new();
-    if let Some(mut s) = child.stderr.take() {
-        use std::io::Read;
-        let _ = s.read_to_end(&mut stderr_buf);
-    }
-    if let Some(mut s) = child.stdout.take() {
-        use std::io::Read;
-        let _ = s.read_to_end(&mut stdout_buf);
-    }
+    // The child has exited, so every pipe is at EOF and the helper
+    // threads are finishing or done. A panicked helper just means we
+    // lose that stream's contents, not the run.
+    //
+    // Extractors communicate through artifact files rather than
+    // stdout, so its contents are discarded; we drain it only to keep
+    // a chatty extractor from blocking on a full pipe.
+    drop(stdout_reader.join());
+    let stderr_buf = stderr_reader.join().unwrap_or_default();
+    let _ = writer.join();
 
     let stderr = String::from_utf8_lossy(&stderr_buf);
-    if !stderr.trim().is_empty() {
+    let trimmed_stderr = stderr.trim();
+    if !trimmed_stderr.is_empty() {
         for line in stderr.lines() {
-            info!(extractor = %extractor.name, "stderr: {line}");
+            let capped = cap_log_line(line, 500);
+            if status.success() {
+                info!(extractor = %extractor.name, "stderr: {capped}");
+            } else {
+                warn!(extractor = %extractor.name, "stderr: {capped}");
+            }
         }
     }
     if !status.success() {
-        bail!("extractor {} exited with status {}", extractor.name, status);
+        if trimmed_stderr.is_empty() {
+            bail!("extractor {} exited with status {}", extractor.name, status);
+        }
+        bail!(
+            "extractor {} exited with status {}: {}",
+            extractor.name,
+            status,
+            trimmed_stderr
+        );
     }
 
     let (result, unknown) = scan(tempdir.path())?;
@@ -726,6 +889,8 @@ mod tests {
             script: PathBuf::from("/bin/true"),
             order: 100,
             require_dkim: Vec::new(),
+            unsigned_before: None,
+            fingerprint: String::new(),
             from_domains: from_domains.into_iter().map(parse_from_domain).collect(),
             subject_regex: subject_regex.map(|s| regex::Regex::new(s).unwrap()),
             body_requirements,
@@ -937,6 +1102,38 @@ mod tests {
         assert!(!e.body_could_match(&parts(false, false, &[("text", "calendar")], &[])));
     }
 
+    /// An [`Extractor`] backed by a checked-in script from
+    /// `tests/fixtures/scripts`.
+    ///
+    /// These are committed rather than written into a tempdir per test
+    /// on purpose: `execve` fails with `ETXTBSY` while any process
+    /// holds the file open for writing, and under `cargo test`'s
+    /// thread pool a `fork` in one thread inherits the write fd
+    /// another thread has open between its own write and close. With
+    /// nothing writing them, there is no window to lose.
+    #[cfg(unix)]
+    fn script_fixture(name: &str) -> Extractor {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/scripts")
+            .join(name);
+        assert!(
+            script.exists(),
+            "missing fixture script: {}",
+            script.display()
+        );
+        Extractor {
+            name: name.trim_end_matches(".py").into(),
+            script,
+            order: 100,
+            require_dkim: Vec::new(),
+            unsigned_before: None,
+            fingerprint: String::new(),
+            from_domains: Vec::new(),
+            subject_regex: None,
+            body_requirements: Vec::new(),
+        }
+    }
+
     /// Build a temporary extractors directory with one manifest +
     /// executable script. Returns the directory (kept alive) so the
     /// caller can run `discover` on it.
@@ -950,6 +1147,24 @@ mod tests {
         let mode = if executable { 0o755 } else { 0o644 };
         fs::set_permissions(&script, fs::Permissions::from_mode(mode)).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_follows_the_script() {
+        let dir = fixture("a", "name: a\n", true);
+        let before = discover(&[dir.path().to_path_buf()]).unwrap()[0]
+            .fingerprint
+            .clone();
+        assert_eq!(
+            discover(&[dir.path().to_path_buf()]).unwrap()[0].fingerprint,
+            before
+        );
+        fs::write(dir.path().join("a.py"), "#!/bin/sh\nexit 1\n").unwrap();
+        assert_ne!(
+            discover(&[dir.path().to_path_buf()]).unwrap()[0].fingerprint,
+            before
+        );
     }
 
     #[cfg(unix)]
@@ -1055,6 +1270,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lint_reports_unsigned_before_without_require_dkim() {
+        let dir = fixture(
+            "no-dkim",
+            "name: no-dkim\nunsigned_before: \"2019-01-01\"\n",
+            true,
+        );
+        let issues = lint(&[dir.path().to_path_buf()]);
+        let messages: Vec<&str> = issues.iter().map(|i| i.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            ["extractor no-dkim: unsigned_before needs require_dkim"]
+        );
+    }
+
+    #[test]
+    fn lint_reports_unsigned_before_that_is_not_a_date() {
+        let dir = fixture(
+            "bad-date",
+            "name: bad-date\nrequire_dkim: [example.com]\nunsigned_before: \"Jan 2019\"\n",
+            true,
+        );
+        let issues = lint(&[dir.path().to_path_buf()]);
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].message.starts_with(
+                "extractor bad-date: unsigned_before \"Jan 2019\" is not a YYYY-MM-DD date"
+            ),
+            "got: {:?}",
+            issues[0].message
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn lint_reports_bad_requires() {
@@ -1152,5 +1400,79 @@ mod tests {
             "got: {:?}",
             issues[0].message
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_one_handles_extractor_writing_more_than_a_pipe_buffer() {
+        // An extractor that writes far more to stdout than a pipe
+        // buffer holds (64KiB on Linux) must not wedge the parent:
+        // the child blocks in write() until someone drains the pipe.
+        let ex = script_fixture("noisy-stdout.py");
+        let run = run_one(&ex, b"From: x\r\n\r\n", Duration::from_secs(10))
+            .expect("extractor writing a lot to stdout should not deadlock");
+        assert_eq!(run.result.artifacts.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_one_handles_extractor_that_never_reads_stdin() {
+        // A large message fed to an extractor that exits without
+        // reading stdin must not block the parent in write_all().
+        let ex = script_fixture("ignores-stdin.py");
+        let big = vec![b'x'; 4 * 1024 * 1024];
+        let run = run_one(&ex, &big, Duration::from_secs(10))
+            .expect("large stdin to a non-reading extractor should not deadlock");
+        assert_eq!(run.result.artifacts.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_one_success_with_stderr_output_does_not_fail() {
+        let ex = script_fixture("noisy-stderr.py");
+        let run = run_one(&ex, b"From: x\r\n\r\n", Duration::from_secs(10))
+            .expect("stderr on a successful run must not turn into an error");
+        assert_eq!(run.result.artifacts.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_one_failure_surfaces_stderr_in_error() {
+        let ex = script_fixture("fails-with-stderr.py");
+        let err = match run_one(&ex, b"From: x\r\n\r\n", Duration::from_secs(10)) {
+            Err(e) => e,
+            Ok(_) => panic!("non-zero exit must be an error"),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("kaboom detail line"), "got: {msg}");
+        assert!(msg.contains("fails-with-stderr"), "got: {msg}");
+    }
+
+    #[test]
+    fn cap_log_line_leaves_short_lines_untouched() {
+        assert_eq!(cap_log_line("hello", 500), "hello");
+        assert_eq!(cap_log_line(&"x".repeat(500), 500), "x".repeat(500));
+    }
+
+    #[test]
+    fn cap_log_line_truncates_long_lines_and_marks_them() {
+        let s = "x".repeat(600);
+        let out = cap_log_line(&s, 500);
+        assert_eq!(out.len(), 503);
+        assert!(out.ends_with("..."));
+        assert!(out.starts_with(&"x".repeat(500)));
+    }
+
+    #[test]
+    fn cap_log_line_respects_char_boundaries() {
+        // Multi-byte chars right at the cutoff must not be split.
+        let mut s = "a".repeat(499);
+        s.push('\u{1F600}'); // 4-byte codepoint straddling byte 500
+        s.push_str(&"b".repeat(100));
+        let out = cap_log_line(&s, 500);
+        assert!(out.ends_with("..."));
+        // The truncated prefix must still be valid UTF-8 (implicit: it's a String).
+        // The 4-byte emoji starts at byte 499, so cap at 500 should back off to 499.
+        assert_eq!(&out[..out.len() - 3], &"a".repeat(499));
     }
 }
