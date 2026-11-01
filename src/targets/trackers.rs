@@ -59,7 +59,7 @@ impl Trackers {
                     sink = sink.name(),
                     tracking = %tracking_number,
                     carrier = %carrier_id,
-                    error = %e,
+                    error = format!("{e:#}"),
                     "tracker registration failed; on-disk parcel record is unaffected"
                 );
             }

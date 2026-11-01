@@ -265,7 +265,7 @@ pub fn run(config: MaildirScanConfig<'_>) -> Result<()> {
             None,
         );
         if let Err(e) = result {
-            warn!(path = %path.display(), error = %e, "pipeline failed");
+            warn!(path = %path.display(), error = format!("{e:#}"), "pipeline failed");
         }
         pb.inc(1);
     });
