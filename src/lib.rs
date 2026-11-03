@@ -1,3 +1,4 @@
+mod airports;
 pub mod artifacts;
 pub mod cli;
 pub mod config;
