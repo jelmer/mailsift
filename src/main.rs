@@ -286,6 +286,105 @@ impl EventTargetArgs {
     }
 }
 
+/// Flags shared by the commands that walk a mail source and run the
+/// pipeline over each message.
+#[derive(Args)]
+struct ScanArgs {
+    /// Directory containing extractor scripts.
+    #[arg(long)]
+    extractors: Option<PathBuf>,
+    #[command(flatten)]
+    target: EventTargetArgs,
+    #[command(flatten)]
+    artifacts: ArtifactDirArgs,
+    #[command(flatten)]
+    trackers: TrackerArgs,
+    #[command(flatten)]
+    firefly: FireflyArgs,
+    /// Don't actually file artifacts; just report what would happen.
+    #[arg(long)]
+    dry_run: bool,
+    /// Skip appending per-extractor events to the stats log
+    /// (`$XDG_STATE_HOME/mailsift/events.ndjson`). Enable for one-off
+    /// bulk imports whose skew you don't want reflected in the
+    /// dashboard.
+    #[arg(long)]
+    no_stats: bool,
+    /// Send every event to CalDAV again, even those the dedup store
+    /// (`$XDG_STATE_HOME/mailsift/seen.db`) says were filed unchanged
+    /// before. Use it to restore events that were edited or deleted
+    /// on the server.
+    #[arg(long)]
+    no_dedup: bool,
+}
+
+/// [`ScanArgs`] resolved against the config: everything a scan needs to
+/// run the pipeline.
+struct ScanSetup {
+    sink: EventSinkKind,
+    seen: Option<mailsift::seen::Store>,
+    extractors: Vec<mailsift::extractor::Extractor>,
+    dirs: ResolvedArtifactTargets,
+    trackers: mailsift::targets::trackers::Trackers,
+    firefly: Option<mailsift::targets::firefly::FireflySink>,
+    recorder: mailsift::stats::Recorder,
+}
+
+impl ScanArgs {
+    /// Build the sinks and discover the extractors, narrowed to `only`
+    /// when it is non-empty.
+    fn resolve(
+        &self,
+        only: &[String],
+        config: &Config,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<ScanSetup> {
+        let sink = self.target.build_sink(config, runtime)?;
+        let seen = scan_seen_store(&sink, self.no_dedup, self.dry_run);
+        let extractors_dir = resolve_extractors(self.extractors.clone(), config);
+        let extractors = select_extractors(discover_required(&extractors_dir)?, only)?;
+        let dirs = self.artifacts.resolve(config, runtime)?;
+        let trackers = build_trackers(&self.trackers, config, runtime)?;
+        let firefly = build_firefly(&self.firefly, config, runtime)?;
+        // Log per-extractor stats by default. `--no-stats` opts out for
+        // one-off bulk imports whose skew you don't want reflected in
+        // the dashboard.
+        let recorder = if self.no_stats {
+            mailsift::stats::Recorder::Disabled
+        } else {
+            mailsift::stats::Recorder::default_file()
+        };
+        Ok(ScanSetup {
+            sink,
+            seen,
+            extractors,
+            dirs,
+            trackers,
+            firefly,
+            recorder,
+        })
+    }
+}
+
+impl ScanSetup {
+    fn targets<'a>(&'a self, config: &'a Config) -> pipeline::PipelineTargets<'a> {
+        pipeline::PipelineTargets {
+            event_sink: &self.sink,
+            bills_dir: self.dirs.bills.as_deref(),
+            parcels_dir: self.dirs.parcels.as_deref(),
+            subscriptions_dir: self.dirs.subscriptions.as_deref(),
+            reservations_dir: self.dirs.reservations.as_deref(),
+            receipts: self.dirs.receipts.as_ref(),
+            tickets: self.dirs.tickets.as_ref(),
+            firefly: self.firefly.as_ref(),
+            trackers: (!self.trackers.is_empty()).then_some(&self.trackers),
+            trusted_forwarders: &config.trusted_forwarders,
+            recorder: &self.recorder,
+            seen: self.seen.as_ref(),
+        }
+    }
+}
+
 /// Arguments for the `imap-scan` subcommand. Split out of the
 /// [`Command`] enum (and boxed there) because its flag set is far larger
 /// than any other variant's.
@@ -372,9 +471,6 @@ struct ImapScanArgs {
     /// pass; messages arriving while watching are not counted.
     #[arg(long)]
     limit: Option<usize>,
-    /// Directory containing extractor scripts.
-    #[arg(long)]
-    extractors: Option<PathBuf>,
     /// Only run the named extractor. Repeat to select several.
     ///
     /// When every selected extractor declares `from_domains`, the
@@ -384,28 +480,7 @@ struct ImapScanArgs {
     #[arg(long = "extractor", value_name = "NAME")]
     only: Vec<String>,
     #[command(flatten)]
-    target: EventTargetArgs,
-    #[command(flatten)]
-    artifacts: ArtifactDirArgs,
-    #[command(flatten)]
-    trackers: TrackerArgs,
-    #[command(flatten)]
-    firefly: FireflyArgs,
-    /// Don't actually file artifacts; just report what would happen.
-    #[arg(long)]
-    dry_run: bool,
-    /// Skip appending per-extractor events to the stats log
-    /// (`$XDG_STATE_HOME/mailsift/events.ndjson`). Enable for one-off
-    /// bulk imports whose skew you don't want reflected in the
-    /// dashboard.
-    #[arg(long)]
-    no_stats: bool,
-    /// Send every event to CalDAV again, even those the dedup store
-    /// (`$XDG_STATE_HOME/mailsift/seen.db`) says were filed unchanged
-    /// before. Use it to restore events that were edited or deleted
-    /// on the server.
-    #[arg(long)]
-    no_dedup: bool,
+    scan: ScanArgs,
     /// After the initial scan, stay connected and process new
     /// messages as they arrive (IMAP IDLE, RFC 2177). Runs until
     /// interrupted (Ctrl-C). On transport errors the connection is
@@ -511,9 +586,6 @@ enum Command {
         /// Cap on the number of messages to process.
         #[arg(long)]
         limit: Option<usize>,
-        /// Directory containing extractor scripts.
-        #[arg(long)]
-        extractors: Option<PathBuf>,
         /// Only run the named extractor. Repeat to select several.
         ///
         /// When every selected extractor declares `from_domains` or
@@ -523,28 +595,7 @@ enum Command {
         #[arg(long = "extractor", value_name = "NAME")]
         only: Vec<String>,
         #[command(flatten)]
-        target: EventTargetArgs,
-        #[command(flatten)]
-        artifacts: ArtifactDirArgs,
-        #[command(flatten)]
-        trackers: TrackerArgs,
-        #[command(flatten)]
-        firefly: FireflyArgs,
-        /// Don't actually file artifacts; just report what would happen.
-        #[arg(long)]
-        dry_run: bool,
-        /// Skip appending per-extractor events to the stats log
-        /// (`$XDG_STATE_HOME/mailsift/events.ndjson`). Enable for
-        /// one-off bulk imports whose skew you don't want reflected
-        /// in the dashboard.
-        #[arg(long)]
-        no_stats: bool,
-        /// Send every event to CalDAV again, even those the dedup
-        /// store (`$XDG_STATE_HOME/mailsift/seen.db`) says were filed
-        /// unchanged before. Use it to restore events that were
-        /// edited or deleted on the server.
-        #[arg(long)]
-        no_dedup: bool,
+        scan: ScanArgs,
     },
     /// Validate every discoverable extractor manifest. Parses each
     /// `<name>.yaml`, compiles the `subject_regex`, parses `requires:`
@@ -1498,26 +1549,13 @@ fn run() -> Result<()> {
                 since,
                 before,
                 limit,
-                extractors,
                 only,
-                target,
-                artifacts,
-                trackers,
-                firefly,
-                dry_run,
-                no_stats,
-                no_dedup,
+                scan,
                 watch,
                 rescan,
             } = *args;
-            let sink = target.build_sink(&config, runtime.handle())?;
-            let seen = scan_seen_store(&sink, no_dedup, dry_run);
-            let extractors_dir = resolve_extractors(extractors, &config);
-            let extractors = discover_required(&extractors_dir)?;
-            let extractors = select_extractors(extractors, &only)?;
-            let dirs = artifacts.resolve(&config, runtime.handle())?;
-            let trackers = build_trackers(&trackers, &config, runtime.handle())?;
-            let firefly = build_firefly(&firefly, &config, runtime.handle())?;
+            let setup = scan.resolve(&only, &config, runtime.handle())?;
+            let dry_run = scan.dry_run;
 
             let target_imap = parse_imap_url(&url)?;
             // Read credentials up-front so their lifetimes outlive the
@@ -1579,14 +1617,6 @@ fn run() -> Result<()> {
                     )
                 }
             };
-            // Log per-extractor stats by default. `--no-stats` opts
-            // out for one-off bulk imports whose skew you don't want
-            // reflected in the dashboard.
-            let recorder = if no_stats {
-                mailsift::stats::Recorder::Disabled
-            } else {
-                mailsift::stats::Recorder::default_file()
-            };
             let keeps_position =
                 watch && !dry_run && since.is_none() && before.is_none() && limit.is_none();
             let cursor_file = if keeps_position {
@@ -1615,21 +1645,8 @@ fn run() -> Result<()> {
                 since: since.as_deref(),
                 before: before.as_deref(),
                 limit,
-                extractors: &extractors,
-                targets: pipeline::PipelineTargets {
-                    event_sink: &sink,
-                    bills_dir: dirs.bills.as_deref(),
-                    parcels_dir: dirs.parcels.as_deref(),
-                    subscriptions_dir: dirs.subscriptions.as_deref(),
-                    reservations_dir: dirs.reservations.as_deref(),
-                    receipts: dirs.receipts.as_ref(),
-                    tickets: dirs.tickets.as_ref(),
-                    firefly: firefly.as_ref(),
-                    trackers: (!trackers.is_empty()).then_some(&trackers),
-                    trusted_forwarders: &config.trusted_forwarders,
-                    recorder: &recorder,
-                    seen: seen.as_ref(),
-                },
+                extractors: &setup.extractors,
+                targets: setup.targets(&config),
                 dry_run,
                 watch,
                 cursor_file: cursor_file.as_ref(),
@@ -1642,54 +1659,19 @@ fn run() -> Result<()> {
             recurse,
             since,
             limit,
-            extractors,
             only,
-            target,
-            artifacts,
-            trackers,
-            firefly,
-            dry_run,
-            no_stats,
-            no_dedup,
+            scan,
         } => {
-            let sink = target.build_sink(&config, runtime.handle())?;
-            let seen = scan_seen_store(&sink, no_dedup, dry_run);
-            let extractors_dir = resolve_extractors(extractors, &config);
-            let extractors = discover_required(&extractors_dir)?;
-            let extractors = select_extractors(extractors, &only)?;
-            let dirs = artifacts.resolve(&config, runtime.handle())?;
-            let trackers = build_trackers(&trackers, &config, runtime.handle())?;
-            let firefly = build_firefly(&firefly, &config, runtime.handle())?;
+            let setup = scan.resolve(&only, &config, runtime.handle())?;
             let since = since.as_deref().map(parse_since_date).transpose()?;
-            // Log per-extractor stats by default. `--no-stats` opts
-            // out for one-off bulk imports whose skew you don't want
-            // reflected in the dashboard.
-            let recorder = if no_stats {
-                mailsift::stats::Recorder::Disabled
-            } else {
-                mailsift::stats::Recorder::default_file()
-            };
             mailsift::maildir_scan::run(mailsift::maildir_scan::MaildirScanConfig {
                 root: &path,
                 recurse,
                 since,
                 limit,
-                extractors: &extractors,
-                targets: pipeline::PipelineTargets {
-                    event_sink: &sink,
-                    bills_dir: dirs.bills.as_deref(),
-                    parcels_dir: dirs.parcels.as_deref(),
-                    subscriptions_dir: dirs.subscriptions.as_deref(),
-                    reservations_dir: dirs.reservations.as_deref(),
-                    receipts: dirs.receipts.as_ref(),
-                    tickets: dirs.tickets.as_ref(),
-                    firefly: firefly.as_ref(),
-                    trackers: (!trackers.is_empty()).then_some(&trackers),
-                    trusted_forwarders: &config.trusted_forwarders,
-                    recorder: &recorder,
-                    seen: seen.as_ref(),
-                },
-                dry_run,
+                extractors: &setup.extractors,
+                targets: setup.targets(&config),
+                dry_run: scan.dry_run,
             })
         }
         #[cfg(feature = "web")]
