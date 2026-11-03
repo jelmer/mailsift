@@ -202,15 +202,18 @@ fn merge(mut existing: Value, incoming: Value) -> Value {
     let incoming_date = received_at_of(&incoming_obj);
     let newest_known = newest_received_at(&existing_obj);
     let is_older = supersedes(newest_known, incoming_date);
-    // Undated mail can't be ordered by date. Fall back on the one
-    // thing we know regardless: a parcel that has been delivered or
-    // returned does not go back to being in transit. Not every
-    // extractor sets `receivedAt`, and those records hit this path
-    // exclusively.
+    // A parcel that has been delivered or returned does not go back to
+    // being in transit, unless the mail saying so is dated after it got
+    // there. Not every extractor sets `receivedAt`, and a carrier poll
+    // records the delivery without a mail date, so the date it got
+    // there may be all we can order by.
     let is_stale = is_older
-        || ((incoming_date.is_none() || newest_known.is_none())
-            && is_final_status(&existing_obj)
-            && !is_final_status(&incoming_obj));
+        || (is_final_status(&existing_obj)
+            && !is_final_status(&incoming_obj)
+            && !matches!(
+                (incoming_date, final_since(&existing_obj)),
+                (Some(incoming), Some(since)) if incoming > since
+            ));
 
     for (k, v) in incoming_obj {
         if k == "history" {
@@ -294,6 +297,28 @@ fn is_final_status(obj: &Map<String, Value>) -> bool {
         .and_then(Value::as_str)
         .map(ParcelStatus::from_raw)
         .is_some_and(|s| s.is_terminal())
+}
+
+/// When a record in a terminal state got there: its delivery time, or
+/// else the date of the first mail that reported the terminal status.
+/// `None` when nothing dates it, as with a carrier poll that recorded
+/// no time.
+fn final_since(obj: &Map<String, Value>) -> Option<DateTime<Utc>> {
+    let delivered = obj
+        .get("actualDeliveryTime")
+        .and_then(Value::as_str)
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    delivered.or_else(|| {
+        obj.get("history")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .filter(|entry| is_final_status(entry))
+            .filter_map(received_at_of)
+            .min()
+    })
 }
 
 /// The newest mail date already merged into a record: the top-level
@@ -610,6 +635,54 @@ mod tests {
         assert_eq!(
             merged.as_object().unwrap().get("deliveryStatus").unwrap(),
             "Delivered"
+        );
+    }
+
+    #[test]
+    fn replayed_mail_cannot_undo_a_polled_delivery() {
+        // mailroom records a carrier poll without a mail date. A rescan
+        // replaying the out-for-delivery mail, which is no older than
+        // any dated entry, must not walk the delivery back.
+        let existing = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "Delivered",
+            "actualDeliveryTime": "2026-10-08T09:51:00+00:00",
+            "receivedAt": "2026-10-06T15:28:09Z",
+            "history": [
+                {"receivedAt": "2026-10-06T15:28:09Z", "deliveryStatus": "Scheduled"},
+                {"receivedAt": "2026-10-08T06:58:05Z", "deliveryStatus": "OutForDelivery"},
+                {"deliveryStatus": "Delivered", "source": "dpd"}
+            ]
+        });
+        let incoming = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "OutForDelivery",
+            "receivedAt": "2026-10-08T06:58:05Z"
+        });
+        let merged = merge(existing, incoming);
+        assert_eq!(
+            merged.as_object().unwrap().get("deliveryStatus").unwrap(),
+            "Delivered"
+        );
+    }
+
+    #[test]
+    fn mail_after_a_delivery_still_applies() {
+        let existing = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "Delivered",
+            "actualDeliveryTime": "2026-10-08T09:51:00+00:00",
+            "history": [{"deliveryStatus": "Delivered", "source": "dpd"}]
+        });
+        let incoming = serde_json::json!({
+            "trackingNumber": "X",
+            "deliveryStatus": "OutForDelivery",
+            "receivedAt": "2026-10-09T07:00:00Z"
+        });
+        let merged = merge(existing, incoming);
+        assert_eq!(
+            merged.as_object().unwrap().get("deliveryStatus").unwrap(),
+            "OutForDelivery"
         );
     }
 
