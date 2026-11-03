@@ -1224,11 +1224,6 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
 
     if let Some(dir) = state.reservations_dir() {
         for (year, slug, value) in walk_year_json(dir)? {
-            let raw_date = reservation_date(&value);
-            let date = raw_date
-                .as_deref()
-                .and_then(parse_any_date)
-                .unwrap_or_else(|| mtime_date(&dir.join(&year).join(format!("{slug}.json"))));
             // Flights / trains / coaches carry a departure time we
             // don't want to strip in the feed; hotels and everything
             // else stick with the default date-only cell.
@@ -1237,10 +1232,16 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 .and_then(|f| f.get("@type"))
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
-            let date_display = if matches!(for_kind, "Flight" | "TrainTrip" | "BusTrip") {
-                raw_date.map(|s| short_datetime(&s))
-            } else {
-                None
+            let (date, date_display) = match reservation_listed_date(&value) {
+                Some((date, false)) if matches!(for_kind, "Flight" | "TrainTrip" | "BusTrip") => {
+                    (date, reservation_date(&value).map(|s| short_datetime(&s)))
+                }
+                Some((date, false)) => (date, None),
+                Some((date, true)) => (date, Some(format!("received {date}"))),
+                None => {
+                    let date = mtime_date(&dir.join(&year).join(format!("{slug}.json")));
+                    (date, Some(format!("filed {date}")))
+                }
             };
             items.push(FeedItem {
                 date,
@@ -2325,7 +2326,20 @@ fn reservation_number(value: &Value) -> Option<String> {
 fn reservation_date(value: &Value) -> Option<String> {
     let for_ = value.get("reservationFor");
     for_.and_then(|f| pick_str(f, &["departureTime", "startDate", "doorTime"]))
-        .or_else(|| pick_str(value, &["checkinTime", "startTime", "receivedAt"]))
+        .or_else(|| pick_str(value, &["checkinTime", "startTime"]))
+}
+
+/// When a reservation is listed: the date it is for, or failing that
+/// (missing or unparseable) the date its mail was received, in which
+/// case the second element is true so callers can say so.
+fn reservation_listed_date(value: &Value) -> Option<(NaiveDate, bool)> {
+    if let Some(date) = reservation_date(value).as_deref().and_then(parse_any_date) {
+        return Some((date, false));
+    }
+    pick_str(value, &["receivedAt"])
+        .as_deref()
+        .and_then(parse_any_date)
+        .map(|date| (date, true))
 }
 
 async fn list_reservations(
@@ -2346,7 +2360,8 @@ async fn list_reservations(
         let number = reservation_number(&value).unwrap_or_default();
         let under = value.get("underName").and_then(named).unwrap_or_default();
         let date_raw = reservation_date(&value).unwrap_or_default();
-        let sort_date = parse_any_date(&date_raw);
+        let listed = reservation_listed_date(&value);
+        let sort_date = listed.map(|(date, _)| date);
         let route = reservation_route(&value).unwrap_or_default();
         // Flights, trains and coaches have a meaningful time-of-day
         // component (departure at 17:10); hotel check-ins and event
@@ -2356,10 +2371,13 @@ async fn list_reservations(
             .and_then(|f| f.get("@type"))
             .and_then(|t| t.as_str())
             .unwrap_or("");
-        let date_display = if matches!(for_kind, "Flight" | "TrainTrip" | "BusTrip") {
-            short_datetime(&date_raw)
-        } else {
-            short_date(&date_raw)
+        let date_display = match listed {
+            Some((date, true)) => format!("received {date}"),
+            None => String::new(),
+            Some((_, false)) if matches!(for_kind, "Flight" | "TrainTrip" | "BusTrip") => {
+                short_datetime(&date_raw)
+            }
+            Some((_, false)) => short_date(&date_raw),
         };
         let haystack = format!("{provider} {number} {route} {under} {date_raw}");
         if !matches_search(&query, &haystack) {
@@ -5092,6 +5110,29 @@ tickets_dir = "/var/mailsift/tickets"
     }
 
     #[tokio::test]
+    async fn unparseable_start_is_shown_as_received() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("reservations/2026")).unwrap();
+        fs::write(
+            tmp.path().join("reservations/2026/bistro.json"),
+            br#"{"@type":"FoodEstablishmentReservation","reservationNumber":"B1",
+                 "receivedAt":"2026-03-12T11:13:00Z",
+                 "startTime":"InstantLocalizable(instant=2026-03-12T18:00:00Z)",
+                 "reservationFor":{"@type":"FoodEstablishment","name":"Bistro"}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            reservations_dir: Some(tmp.path().join("reservations")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, feed) = get(&app, "/all").await;
+        assert!(feed.contains("<td>received 2026-03-12</td>"), "{feed}");
+        let (_, list) = get(&app, "/reservations").await;
+        assert!(list.contains("<td>received 2026-03-12</td>"), "{list}");
+    }
+
+    #[tokio::test]
     async fn reservations_appear_in_feed() {
         let (_tmp, config) = fixture();
         let app = router(state_with(config, ""));
@@ -5182,6 +5223,19 @@ tickets_dir = "/var/mailsift/tickets"
         assert_eq!(
             reservation_date(&v).and_then(|d| parse_any_date(&d)),
             NaiveDate::from_ymd_opt(2026, 4, 10)
+        );
+    }
+
+    #[test]
+    fn unparseable_start_is_listed_by_received_date() {
+        let v: Value = serde_json::from_str(
+            r#"{"receivedAt":"2026-03-12T11:13:00Z",
+                "startTime":"InstantLocalizable(instant=2026-03-12T18:00:00Z)"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            reservation_listed_date(&v),
+            Some((NaiveDate::from_ymd_opt(2026, 3, 12).unwrap(), true))
         );
     }
 
