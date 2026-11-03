@@ -204,6 +204,60 @@ fn run_imap_auth(args: ImapAuthArgs, runtime: &tokio::runtime::Handle) -> Result
     Ok(())
 }
 
+/// Handle `mailsift jmap-watch`.
+#[cfg(feature = "jmap")]
+fn run_jmap_watch(
+    args: JmapWatchArgs,
+    config: &Config,
+    runtime: &tokio::runtime::Handle,
+) -> Result<()> {
+    use jmap_client::client::Credentials;
+    use mailsift::jmap_watch;
+
+    let setup = args.scan.resolve(&args.only, config, runtime)?;
+
+    let target = mailsift::cli::parse_jmap_url(&args.url)?;
+    let password = args
+        .password_file
+        .as_deref()
+        .map(read_secret_file)
+        .transpose()?;
+    let token = args
+        .token_file
+        .as_deref()
+        .map(read_secret_file)
+        .transpose()?;
+    let user = target.user.clone().or_else(current_username);
+    let credentials = match (&password, &token) {
+        (Some(password), _) => {
+            let user = user.as_deref().ok_or_else(|| {
+                usage_error!(
+                    "no username in URL and could not look up the current user; \
+                     include one in the URL (https://user@host)"
+                )
+            })?;
+            Credentials::basic(user, password)
+        }
+        (None, Some(token)) => Credentials::bearer(token.as_str()),
+        (None, None) => return Err(usage_error!("pass --password-file or --token-file")),
+    };
+
+    jmap_watch::run(
+        jmap_watch::JmapWatchConfig {
+            base_url: &target.base_url,
+            host: &target.host,
+            mailbox: args.mailbox.as_deref(),
+            seen_keyword: &args.seen_keyword,
+            extractors: &setup.extractors,
+            targets: setup.targets(config),
+            dry_run: args.scan.dry_run,
+            watch: !args.once,
+            runtime,
+        },
+        credentials,
+    )
+}
+
 #[derive(Parser)]
 #[command(name = "mailsift", version, about)]
 struct Cli {
@@ -499,6 +553,40 @@ struct ImapScanArgs {
     rescan: bool,
 }
 
+/// Arguments for the `jmap-watch` subcommand.
+#[cfg(feature = "jmap")]
+#[derive(Args)]
+struct JmapWatchArgs {
+    /// JMAP server: `https://[user@]host[:port]`. The session is
+    /// discovered at `/.well-known/jmap`. Without a user the current OS
+    /// user is used for `--password-file`.
+    url: String,
+    /// Mailbox to watch, as a `/`-separated path from the top level
+    /// (`Receipts/2026`). Defaults to the inbox.
+    #[arg(long)]
+    mailbox: Option<String>,
+    /// File containing the password for HTTP basic auth.
+    #[arg(long, conflicts_with = "token_file", help_heading = "Authentication")]
+    password_file: Option<PathBuf>,
+    /// File containing a bearer token (an API token).
+    #[arg(long, help_heading = "Authentication")]
+    token_file: Option<PathBuf>,
+    /// Keyword set on each message once the pipeline has run over it.
+    /// Messages carrying it are skipped, so the server remembers what
+    /// has been done.
+    #[arg(long, default_value = mailsift::jmap_watch::DEFAULT_SEEN_KEYWORD)]
+    seen_keyword: String,
+    /// Process the messages that are there and exit, rather than
+    /// staying connected and waiting for new mail.
+    #[arg(long)]
+    once: bool,
+    /// Only run the named extractor. Repeat to select several.
+    #[arg(long = "extractor", value_name = "NAME")]
+    only: Vec<String>,
+    #[command(flatten)]
+    scan: ScanArgs,
+}
+
 /// Arguments for the `imap-auth` subcommand.
 #[derive(Args)]
 struct ImapAuthArgs {
@@ -568,6 +656,13 @@ enum Command {
     /// Obtain an OAuth2 refresh token via the browser consent flow and
     /// write a credential bundle for `imap-scan --oauth2-credentials-file`.
     ImapAuth(ImapAuthArgs),
+    /// Watch a JMAP mailbox and run the pipeline over each message,
+    /// marking processed ones with a keyword.
+    ///
+    /// Stays connected and handles new mail as the server reports it;
+    /// pass `--once` to exit after the backlog.
+    #[cfg(feature = "jmap")]
+    JmapWatch(Box<JmapWatchArgs>),
     /// Walk a Maildir on disk and run the pipeline over each message.
     ///
     /// Useful for one-off backfills against archived mail. Reads
@@ -1654,6 +1749,8 @@ fn run() -> Result<()> {
             })
         }
         Command::ImapAuth(args) => run_imap_auth(args, runtime.handle()),
+        #[cfg(feature = "jmap")]
+        Command::JmapWatch(args) => run_jmap_watch(*args, &config, runtime.handle()),
         Command::MaildirScan {
             path,
             recurse,

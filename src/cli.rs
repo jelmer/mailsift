@@ -126,6 +126,38 @@ pub fn parse_caldav_url(input: &str) -> Result<CaldavTarget> {
     })
 }
 
+/// Connection parameters extracted from a JMAP server URL.
+#[derive(Debug, PartialEq, Eq)]
+pub struct JmapTarget {
+    /// The URL without userinfo or a trailing slash. The JMAP client
+    /// appends `/.well-known/jmap` to find the session.
+    pub base_url: String,
+    pub host: String,
+    pub user: Option<String>,
+}
+
+/// Parse a JMAP URL of the form `https://[user@]host[:port]`.
+pub fn parse_jmap_url(input: &str) -> Result<JmapTarget> {
+    let mut url = Url::parse(input).with_context(|| format!("parsing JMAP URL {input}"))?;
+    match url.scheme() {
+        "https" => {}
+        "http" => {
+            warn!("http:// JMAP URL uses plaintext; prefer https://");
+        }
+        other => bail!("unsupported JMAP scheme {other:?}: use https:// (or http://)"),
+    }
+    let user = take_userinfo(&mut url, "--password-file")?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("JMAP URL {input} has no host"))?
+        .to_string();
+    Ok(JmapTarget {
+        base_url: url.as_str().trim_end_matches('/').to_string(),
+        host,
+        user,
+    })
+}
+
 /// Look up the current effective UID's username via `getpwuid_r`.
 ///
 /// Returns `None` if the lookup fails (no entry, ENOMEM, etc.).
@@ -245,6 +277,41 @@ mod tests {
         assert!(
             err.to_string().contains("unsupported CalDAV scheme"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn jmap_url_with_user_and_port() {
+        let t = parse_jmap_url("https://jelmer@mail.example.org:8443/").unwrap();
+        assert_eq!(
+            t,
+            JmapTarget {
+                base_url: "https://mail.example.org:8443".to_string(),
+                host: "mail.example.org".to_string(),
+                user: Some("jelmer".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn jmap_url_without_user_or_slash() {
+        let t = parse_jmap_url("https://jmap.example.org").unwrap();
+        assert_eq!(
+            t,
+            JmapTarget {
+                base_url: "https://jmap.example.org".to_string(),
+                host: "jmap.example.org".to_string(),
+                user: None,
+            }
+        );
+    }
+
+    #[test]
+    fn jmap_url_rejects_password() {
+        let err = parse_jmap_url("https://u:pw@host/").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "password in URL is not supported; use --password-file"
         );
     }
 

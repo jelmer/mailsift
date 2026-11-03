@@ -7,6 +7,8 @@ pub mod extractor;
 pub mod gss;
 pub mod imap_scan;
 pub mod imap_state;
+#[cfg(feature = "jmap")]
+pub mod jmap_watch;
 pub mod maildir_scan;
 pub mod milter;
 pub mod oauth2;
