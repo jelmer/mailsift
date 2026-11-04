@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::artifacts::{Artifact, Kind};
 use crate::reservation;
@@ -191,6 +191,64 @@ pub(super) fn file_reservation_json(
                 path = %artifact.path.display(),
                 error = format!("{e:#}"),
                 "failed to file reservation"
+            );
+        }
+    }
+}
+
+/// Cancel the archived legs a complete itinerary no longer lists, and
+/// mark their calendar events cancelled. See
+/// [`reservations::cancel_superseded_legs`].
+pub(super) fn cancel_superseded_legs(
+    extractor: &str,
+    artifact: &Artifact,
+    reservations_dir: &Path,
+    event_sink: &EventSinkKind,
+    seen: Option<&SeenStore>,
+    received_at_epoch: Option<i64>,
+    summary: &mut Summary,
+) {
+    if summary.dry_run {
+        return;
+    }
+    let cancelled = match reservations::cancel_superseded_legs(
+        &artifact.path,
+        reservations_dir,
+        received_at_epoch,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %artifact.path.display(),
+                error = format!("{e:#}"),
+                "failed to cancel superseded legs"
+            );
+            return;
+        }
+    };
+    for (path, record) in cancelled {
+        info!(extractor, path = %path.display(), "leg no longer in the itinerary; marked cancelled");
+        let events = match reservation::convert(&record) {
+            Ok(events) => events,
+            Err(e) => {
+                warn!(
+                    extractor,
+                    path = %path.display(),
+                    error = format!("{e:#}"),
+                    "failed to convert cancelled leg"
+                );
+                continue;
+            }
+        };
+        for event in &events {
+            file_single(
+                extractor,
+                event,
+                event_sink,
+                seen,
+                received_at_epoch,
+                summary,
             );
         }
     }

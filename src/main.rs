@@ -711,6 +711,19 @@ enum Command {
         #[arg(long)]
         extractors: Option<PathBuf>,
     },
+    /// Rename archived flight and train legs to the name they are filed
+    /// under now (`<provider>-<reference>-<flight or train>.json`),
+    /// merging copies of one leg filed under several names and keeping
+    /// the one from the newest mail.
+    ReindexReservations {
+        /// The reservations archive. Defaults to `reservations_dir`
+        /// from the config file.
+        #[arg(long)]
+        reservations_dir: Option<PathBuf>,
+        /// Only print what would be moved.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Aggregate the milter's event log into a per-extractor summary
     /// (total runs, produced/empty/failed counts, mean wall-clock
     /// time, most-recent sender domains). Reads the NDJSON log the
@@ -1543,6 +1556,37 @@ fn run() -> Result<()> {
                 let noun = if n == 1 { "issue" } else { "issues" };
                 anyhow::bail!("{n} {noun} found")
             }
+        }
+        Command::ReindexReservations {
+            reservations_dir,
+            dry_run,
+        } => {
+            let dir = reservations_dir
+                .or_else(|| config.reservations_dir.clone())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no reservations_dir configured; pass --reservations-dir")
+                })?;
+            let done = mailsift::targets::reservations::reindex(&dir, dry_run)?;
+            for step in &done {
+                match step {
+                    mailsift::targets::reservations::Reindexed::Moved { from, to } => {
+                        println!("move  {} -> {}", from.display(), to.display())
+                    }
+                    mailsift::targets::reservations::Reindexed::Merged { from, to } => {
+                        println!("merge {} -> {}", from.display(), to.display())
+                    }
+                }
+            }
+            println!(
+                "{} {} legs",
+                if dry_run {
+                    "would reindex"
+                } else {
+                    "reindexed"
+                },
+                done.len()
+            );
+            Ok(())
         }
         Command::Stats { log } => {
             let log_path = match log {

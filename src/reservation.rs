@@ -634,6 +634,29 @@ fn flight_summary(f: &Flight) -> String {
 /// four legs of a return trip share the booking reference, so without
 /// this the UID would collapse and each leg's `.ics` file would clobber
 /// the last one written.
+/// The flight or train number that tells one leg of a booking from
+/// the others, as it appears in the leg's calendar UID. None for
+/// bookings that aren't journeys, and for legs without a number.
+pub fn leg_number(value: &serde_json::Value) -> Option<String> {
+    match serde_json::from_value(value.clone()).ok()? {
+        Reservation::Flight(f) => f
+            .reservation_for
+            .flight_number
+            .as_deref()
+            .is_some_and(|n| !n.trim().is_empty())
+            .then(|| flight_leg_code(&f.reservation_for))
+            .flatten(),
+        Reservation::Train(t) | Reservation::Bus(t) | Reservation::Boat(t) => t
+            .reservation_for
+            .train_number
+            .or(t.reservation_for.bus_number)
+            .or(t.reservation_for.vehicle_name)
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty()),
+        _ => None,
+    }
+}
+
 fn flight_leg_code(f: &Flight) -> Option<String> {
     let flight_no = f.flight_number.as_deref().unwrap_or("").trim();
     let airline_code = f

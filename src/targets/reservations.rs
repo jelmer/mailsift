@@ -14,8 +14,9 @@
 //! A follow-up mail about the same booking overwrites the record in
 //! place, matching the UID-based replacement the calendar side does.
 
+use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
@@ -23,9 +24,10 @@ use tracing::warn;
 
 use super::FileOutcome;
 use super::json_target::{
-    derive_year, first_non_empty, read_and_parse, write_unless_newer, year_from_iso_prefix,
+    derive_year, first_non_empty, format_received_at, read_and_parse, received_at_in,
+    received_at_of, write_unless_newer, year_from_iso_prefix,
 };
-use super::sink::slugify;
+use super::sink::{slugify, write_atomic};
 
 /// Identifying fields we pull out of a `.reservation.json` artifact.
 ///
@@ -326,12 +328,14 @@ pub fn file_reservation(
                 continue;
             }
         };
+        let leg_number = crate::reservation::leg_number(&leg);
         match file_one(
             src,
             dir,
             &reservation,
             &leg_body,
             received_at_epoch,
+            leg_number.as_deref(),
             multi_leg,
         ) {
             Ok(outcome) => outcomes.push(outcome),
@@ -360,32 +364,20 @@ fn file_one(
     reservation: &Reservation,
     body: &str,
     received_at_epoch: Option<i64>,
+    leg_number: Option<&str>,
     distinguish_by_day: bool,
 ) -> Result<FileOutcome> {
-    let number = reservation
-        .number()
-        .ok_or_else(|| anyhow!("{}: missing 'reservationNumber'", src.display()))?;
-    let year = reservation.year();
-
-    let number_slug = slugify(&number, false);
-    if number_slug.is_empty() {
-        bail!(
-            "{}: empty slug after sanitisation (reservationNumber={number:?})",
-            src.display()
-        );
-    }
-    // The provider is a nicety, not an identity: a booking reference
-    // is already vendor-unique, so a reservation without a recognised
-    // provider still files under the bare reference.
-    let mut stem = match reservation.provider().map(|p| slugify(&p, false)) {
-        Some(provider_slug) if !provider_slug.is_empty() => {
-            format!("{provider_slug}-{number_slug}")
-        }
-        _ => number_slug.clone(),
-    };
+    let (year, number_slug, mut stem) =
+        booking_stem(reservation).map_err(|e| anyhow!("{}: {e}", src.display()))?;
     // Legs of one itinerary share a booking reference and usually the
     // airline too, so the reference alone would file the return on top
-    // of the outbound. Append the leg's own date to keep them apart.
+    // of the outbound. A leg with a flight or train number is filed
+    // under it, as its calendar event is, whichever mail it came from;
+    // otherwise the leg's own date keeps them apart.
+    if let Some(target) = leg_target(dir, year, &stem, leg_number) {
+        let body_out = super::json_target::body_with_received_at(body, received_at_epoch);
+        return write_unless_newer(&target, &body_out, "reservation");
+    }
     if distinguish_by_day && let Some(day) = reservation.day() {
         stem = format!("{stem}-{day}");
     }
@@ -443,6 +435,228 @@ fn find_token(haystack: &str, needle: &str) -> Option<usize> {
         start = idx + 1;
     }
     None
+}
+
+/// The year a reservation is filed under, its slugged booking
+/// reference, and the `<provider>-<reference>` file stem.
+fn booking_stem(reservation: &Reservation) -> Result<(i32, String, String)> {
+    let number = reservation
+        .number()
+        .ok_or_else(|| anyhow!("missing 'reservationNumber'"))?;
+    let number_slug = slugify(&number, false);
+    if number_slug.is_empty() {
+        bail!("empty slug after sanitisation (reservationNumber={number:?})");
+    }
+    // The provider is a nicety, not an identity: a booking reference
+    // is already vendor-unique, so a reservation without a recognised
+    // provider still files under the bare reference.
+    let stem = match reservation.provider().map(|p| slugify(&p, false)) {
+        Some(provider_slug) if !provider_slug.is_empty() => {
+            format!("{provider_slug}-{number_slug}")
+        }
+        _ => number_slug.clone(),
+    };
+    Ok((reservation.year(), number_slug, stem))
+}
+
+/// Where a leg with a flight or train number is filed.
+fn leg_target(dir: &Path, year: i32, stem: &str, leg_number: Option<&str>) -> Option<PathBuf> {
+    let leg = slugify(leg_number?, false);
+    (!leg.is_empty()).then(|| {
+        dir.join(format!("{year:04}"))
+            .join(format!("{stem}-{leg}.json"))
+    })
+}
+
+/// What [`reindex`] did, or would do, with one archived leg.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reindexed {
+    Moved {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    /// Another copy of the same leg was there already; the one from the
+    /// newer mail is kept at `to`.
+    Merged {
+        from: PathBuf,
+        to: PathBuf,
+    },
+}
+
+/// Move archived legs filed before legs were named by their flight or
+/// train number to where they are filed now, merging the copies one
+/// leg collected under several names.
+pub fn reindex(dir: &Path, dry_run: bool) -> Result<Vec<Reindexed>> {
+    let mut done = Vec::new();
+    // Targets a dry run would have filled, so it reports the merges a
+    // real run would do.
+    let mut claimed = HashSet::new();
+    let mut paths = archived_records(dir)?;
+    paths.sort();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let body = fs::read(&path).map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| anyhow!("parsing {}: {e}", path.display()))?;
+        let Some(leg_number) = crate::reservation::leg_number(&value) else {
+            continue;
+        };
+        let reservation: Reservation = serde_json::from_value(value)
+            .map_err(|e| anyhow!("parsing {}: {e}", path.display()))?;
+        let (year, _, stem) =
+            booking_stem(&reservation).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+        let Some(target) = leg_target(dir, year, &stem, Some(&leg_number)) else {
+            continue;
+        };
+        if target == path {
+            continue;
+        }
+        let merged = target.exists() || !claimed.insert(target.clone());
+        if !dry_run {
+            let incoming = received_at_in(&body)?;
+            if !merged || !super::json_target::filed_from_newer(&target, incoming)? {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                write_atomic(&target, &body)?;
+            }
+            fs::remove_file(&path).map_err(|e| anyhow!("removing {}: {e}", path.display()))?;
+        }
+        let (from, to) = (path, target);
+        done.push(if merged {
+            Reindexed::Merged { from, to }
+        } else {
+            Reindexed::Moved { from, to }
+        });
+    }
+    Ok(done)
+}
+
+/// Set on every leg of a reservation artifact that lists a booking's
+/// whole itinerary, as a confirmation or a change confirmation does. A
+/// mail about one leg (a check-in reminder) leaves it out.
+pub const COMPLETE_ITINERARY_KEY: &str = "mailsift:itineraryComplete";
+
+/// Mark the archived legs of a booking that a complete itinerary no
+/// longer lists as cancelled.
+///
+/// A booking moved to another flight or train gets a new leg, because
+/// a leg is filed under its flight or train number; without this the
+/// leg it replaced would stay as if it were still booked. Only legs
+/// filed from older mail are touched, and only for the bookings whose
+/// legs in `src` all say they are the complete itinerary. Returns each
+/// cancelled leg's path and its new contents, so the caller can update
+/// its calendar event.
+pub fn cancel_superseded_legs(
+    src: &Path,
+    dir: &Path,
+    received_at_epoch: Option<i64>,
+) -> Result<Vec<(PathBuf, serde_json::Value)>> {
+    let (_body, doc) = read_and_parse::<serde_json::Value>(src, "reservation")?;
+    let legs = split_legs(doc);
+    let complete: HashSet<(String, String)> = legs
+        .iter()
+        .filter(|leg| leg.get(COMPLETE_ITINERARY_KEY) == Some(&serde_json::Value::Bool(true)))
+        .filter_map(booking_key)
+        .collect();
+    if complete.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(received_at) = received_at_epoch.and_then(|e| chrono::DateTime::from_timestamp(e, 0))
+    else {
+        warn!(
+            source = %src.display(),
+            "complete itinerary without a message date; not cancelling the legs it drops"
+        );
+        return Ok(Vec::new());
+    };
+    let mut current = HashSet::new();
+    for leg in &legs {
+        for event in crate::reservation::convert(leg)? {
+            current.insert(event.uid);
+        }
+    }
+
+    let mut cancelled = Vec::new();
+    for path in archived_records(dir)? {
+        let body = fs::read(&path).map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
+        let mut record: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "skipping unreadable reservation");
+                continue;
+            }
+        };
+        if !booking_key(&record).is_some_and(|key| complete.contains(&key)) {
+            continue;
+        }
+        let already_cancelled = record
+            .get("reservationStatus")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(crate::reservation::is_cancelled_status);
+        let filed_before = record
+            .as_object()
+            .and_then(received_at_of)
+            .is_some_and(|filed| filed < received_at);
+        if already_cancelled || !filed_before {
+            continue;
+        }
+        let uids: Vec<String> = crate::reservation::convert(&record)?
+            .into_iter()
+            .map(|event| event.uid)
+            .collect();
+        if uids.is_empty() || uids.iter().any(|uid| current.contains(uid)) {
+            continue;
+        }
+        let obj = record
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("{} is not a JSON object", path.display()))?;
+        obj.insert("reservationStatus".into(), "ReservationCancelled".into());
+        // Dated by the mail that dropped it, so replaying the original
+        // confirmation doesn't put the leg back.
+        if let Some(stamp) = format_received_at(received_at.timestamp()) {
+            obj.insert("receivedAt".into(), stamp.into());
+        }
+        write_atomic(&path, serde_json::to_string_pretty(&record)?.as_bytes())?;
+        cancelled.push((path, record));
+    }
+    Ok(cancelled)
+}
+
+/// The `@type` and booking reference a leg belongs to.
+fn booking_key(leg: &serde_json::Value) -> Option<(String, String)> {
+    let kind = leg.get("@type")?.as_str()?;
+    let number = ["reservationNumber", "reservationId", "identifier"]
+        .iter()
+        .find_map(|k| leg.get(*k).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|n| !n.is_empty())?;
+    Some((kind.to_string(), number.to_string()))
+}
+
+/// Every `<year>/<name>.json` under the reservations directory.
+fn archived_records(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let years = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => bail!("reading {}: {e}", dir.display()),
+    };
+    for year in years {
+        let year = year.map_err(|e| anyhow!("reading {}: {e}", dir.display()))?;
+        if !year.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(year.path())? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                out.push(path);
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -610,6 +824,204 @@ mod tests {
         let body = fs::read_to_string(dir.join("2026/klm-aaa-2026-03-08.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["reservationFor"]["airline"]["name"], "KLM");
+    }
+
+    fn flight(number: &str, departs: &str, complete: bool) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "@type": "FlightReservation",
+            "reservationNumber": "AAA111",
+            "reservationFor": {
+                "@type": "Flight",
+                "flightNumber": number,
+                "airline": {"iataCode": "BA", "name": "British Airways"},
+                "departureAirport": {"iataCode": "LHR"},
+                "arrivalAirport": {"iataCode": "GVA"},
+                "departureTime": departs
+            }
+        });
+        if complete {
+            v[COMPLETE_ITINERARY_KEY] = true.into();
+        }
+        v
+    }
+
+    /// Statuses of every archived leg, by flight number.
+    fn statuses(dir: &Path) -> Vec<(String, Option<String>)> {
+        let mut out: Vec<_> = archived_records(dir)
+            .unwrap()
+            .into_iter()
+            .map(|path| {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                (
+                    v["reservationFor"]["flightNumber"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                    v["reservationStatus"].as_str().map(str::to_string),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// File `legs` as one mail received at `epoch`, then run the
+    /// superseded-leg pass for it; returns how many legs it cancelled.
+    fn file_mail(tmp: &Path, dir: &Path, legs: &[serde_json::Value], epoch: i64) -> usize {
+        let src = tmp.join(format!("mail-{epoch}.reservation.json"));
+        fs::write(&src, serde_json::to_vec(legs).unwrap()).unwrap();
+        file_reservation(&src, dir, Some(epoch)).unwrap();
+        cancel_superseded_legs(&src, dir, Some(epoch))
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn complete_itinerary_cancels_the_leg_it_moved_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out");
+        let booked = [
+            flight("100", "2046-03-01T08:00:00Z", true),
+            flight("200", "2046-03-08T18:00:00Z", true),
+        ];
+        assert_eq!(file_mail(tmp.path(), &dir, &booked, 1_000), 0);
+        let changed = [
+            flight("100", "2046-03-01T08:00:00Z", true),
+            flight("300", "2046-03-08T20:00:00Z", true),
+        ];
+        assert_eq!(file_mail(tmp.path(), &dir, &changed, 2_000), 1);
+        assert_eq!(
+            statuses(&dir),
+            vec![
+                ("100".to_string(), None),
+                ("200".to_string(), Some("ReservationCancelled".to_string())),
+                ("300".to_string(), None),
+            ]
+        );
+        // Replaying the original confirmation doesn't revive the leg.
+        file_mail(tmp.path(), &dir, &booked, 1_000);
+        assert_eq!(statuses(&dir)[1].1.as_deref(), Some("ReservationCancelled"));
+    }
+
+    #[test]
+    fn a_leg_files_under_its_flight_whichever_mail_it_came_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out");
+        file_mail(
+            tmp.path(),
+            &dir,
+            &[
+                flight("100", "2046-03-01T08:00:00Z", true),
+                flight("200", "2046-03-01T18:00:00Z", true),
+            ],
+            1_000,
+        );
+        file_mail(
+            tmp.path(),
+            &dir,
+            &[flight("100", "2046-03-01T08:00:00Z", false)],
+            2_000,
+        );
+        let mut names: Vec<String> = archived_records(&dir)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "british-airways-aaa111-ba100.json".to_string(),
+                "british-airways-aaa111-ba200.json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn mail_about_one_leg_cancels_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out");
+        let booked = [
+            flight("100", "2046-03-01T08:00:00Z", true),
+            flight("200", "2046-03-08T18:00:00Z", true),
+        ];
+        file_mail(tmp.path(), &dir, &booked, 1_000);
+        let reminder = [flight("100", "2046-03-01T08:00:00Z", false)];
+        assert_eq!(file_mail(tmp.path(), &dir, &reminder, 2_000), 0);
+        assert_eq!(
+            statuses(&dir),
+            vec![("100".to_string(), None), ("200".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn older_itinerary_leaves_newer_legs_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out");
+        let changed = [
+            flight("100", "2046-03-01T08:00:00Z", true),
+            flight("300", "2046-03-08T20:00:00Z", true),
+        ];
+        file_mail(tmp.path(), &dir, &changed, 2_000);
+        // The original confirmation, processed later by a rescan.
+        let booked = [
+            flight("100", "2046-03-01T08:00:00Z", true),
+            flight("200", "2046-03-08T18:00:00Z", true),
+        ];
+        assert_eq!(file_mail(tmp.path(), &dir, &booked, 1_000), 0);
+        assert_eq!(
+            statuses(&dir),
+            vec![
+                ("100".to_string(), None),
+                ("200".to_string(), None),
+                ("300".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn reindex_moves_legs_to_their_flight_and_merges_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out");
+        fs::create_dir_all(dir.join("2046")).unwrap();
+        let mut old = flight("100", "2046-03-01T08:00:00Z", false);
+        old["receivedAt"] = "2046-01-01T00:00:00Z".into();
+        let mut newer = old.clone();
+        newer["receivedAt"] = "2046-02-01T00:00:00Z".into();
+        fs::write(
+            dir.join("2046/british-airways-aaa111.json"),
+            serde_json::to_vec(&newer).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("2046/british-airways-aaa111-2046-03-01.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let target = dir.join("2046/british-airways-aaa111-ba100.json");
+
+        let planned = reindex(&dir, true).unwrap();
+        assert_eq!(
+            planned,
+            vec![
+                Reindexed::Moved {
+                    from: dir.join("2046/british-airways-aaa111-2046-03-01.json"),
+                    to: target.clone(),
+                },
+                Reindexed::Merged {
+                    from: dir.join("2046/british-airways-aaa111.json"),
+                    to: target.clone(),
+                },
+            ]
+        );
+        assert_eq!(archived_records(&dir).unwrap().len(), 2);
+
+        assert_eq!(reindex(&dir, false).unwrap(), planned);
+        assert_eq!(archived_records(&dir).unwrap(), vec![target.clone()]);
+        let kept: serde_json::Value = serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
+        assert_eq!(kept["receivedAt"], "2046-02-01T00:00:00Z");
+        assert_eq!(reindex(&dir, false).unwrap(), vec![]);
     }
 
     /// The realistic return trip: same airline, same booking
