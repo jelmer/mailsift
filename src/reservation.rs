@@ -460,10 +460,15 @@ pub fn convert_file(path: &Path) -> Result<Vec<SingleEvent>> {
 /// `Unknown` types or for cases where the required date/time isn't
 /// parseable.
 fn render(r: Reservation) -> Option<SingleEvent> {
+    render_with(r, flight_leg_code)
+}
+
+/// [`render`], with the function that names a flight leg given.
+fn render_with(r: Reservation, leg_code: fn(&Flight) -> Option<String>) -> Option<SingleEvent> {
     let (prefix, summary, dtstart, dtend, location, id, leg) = match r {
         Reservation::Flight(f) => {
-            let leg = flight_leg_code(&f.reservation_for);
-            let summary = flight_summary(&f.reservation_for);
+            let leg = leg_code(&f.reservation_for);
+            let summary = flight_summary(&f.reservation_for, leg_code);
             let dep_label = airport_label(f.reservation_for.departure_airport.as_ref());
             (
                 "flight",
@@ -610,8 +615,8 @@ fn render(r: Reservation) -> Option<SingleEvent> {
     })
 }
 
-fn flight_summary(f: &Flight) -> String {
-    let code = flight_leg_code(f).unwrap_or_default();
+fn flight_summary(f: &Flight, leg_code: fn(&Flight) -> Option<String>) -> String {
+    let code = leg_code(f).unwrap_or_default();
     let dep = airport_label(f.departure_airport.as_ref());
     let arr = airport_label(f.arrival_airport.as_ref());
     if code.is_empty() {
@@ -675,6 +680,37 @@ fn flight_leg_code(f: &Flight) -> Option<String> {
         .to_ascii_uppercase();
     let code = format!("{airline}{}", canonical_flight_number(&airline, &number));
     (!code.is_empty()).then_some(code)
+}
+
+/// The leg code calendar UIDs used before [`flight_leg_code`] made
+/// flight numbers canonical: the two fields as written.
+fn legacy_flight_leg_code(f: &Flight) -> Option<String> {
+    let flight_no = f.flight_number.as_deref().unwrap_or("").trim();
+    let airline_code = f
+        .airline
+        .as_ref()
+        .and_then(|a| a.iata_code.as_deref())
+        .unwrap_or("")
+        .trim();
+    let code = format!("{airline_code}{flight_no}");
+    (!code.is_empty()).then_some(code)
+}
+
+/// The calendar UIDs a reservation document's events had before
+/// flight numbers were made canonical, paired with the ones they have
+/// now. Only UIDs that changed are listed.
+pub fn renamed_uids(json: &serde_json::Value) -> Result<Vec<(String, String)>> {
+    let old = deserialise_one_or_many(json.clone())?;
+    let new = deserialise_one_or_many(json.clone())?;
+    Ok(old
+        .into_iter()
+        .zip(new)
+        .filter_map(|(old, new)| {
+            let old = render_with(old, legacy_flight_leg_code)?.uid;
+            let new = render(new)?.uid;
+            (old != new).then_some((old, new))
+        })
+        .collect())
 }
 
 /// The flight number without the airline code some senders include in
@@ -1129,6 +1165,29 @@ mod tests {
         // Nothing to split off without the airline's code.
         assert_eq!(canonical_flight_number("", "BA0491"), "BA0491");
         assert_eq!(canonical_flight_number("", "0491"), "491");
+    }
+
+    #[test]
+    fn renamed_uids_lists_the_uids_canonical_flight_numbers_changed() {
+        let leg = |number: &str| {
+            json!({
+                "@type": "FlightReservation",
+                "reservationNumber": "ABC123",
+                "reservationFor": {
+                    "flightNumber": number,
+                    "airline": {"iataCode": "BA"},
+                    "departureTime": "2046-01-01T10:00:00Z"
+                }
+            })
+        };
+        assert_eq!(
+            renamed_uids(&json!([leg("0491"), leg("100")])).unwrap(),
+            vec![(
+                "flight-ABC123-BA0491@mailsift".to_string(),
+                "flight-ABC123-BA491@mailsift".to_string()
+            )]
+        );
+        assert_eq!(renamed_uids(&leg("491")).unwrap(), vec![]);
     }
 
     /// Without a flight number the UID stays at the bare reference.

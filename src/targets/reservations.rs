@@ -15,7 +15,7 @@
 //! A follow-up mail about the same booking overwrites the record in
 //! place, matching the UID-based replacement the calendar side does.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -514,55 +514,100 @@ pub enum Reindexed {
     },
 }
 
-/// Move archived legs filed before legs were named by their flight or
-/// train number to where they are filed now, merging the copies one
-/// leg collected under several names.
-pub fn reindex(dir: &Path, dry_run: bool) -> Result<Vec<Reindexed>> {
-    let mut done = Vec::new();
-    // Targets a dry run would have filled, so it reports the merges a
-    // real run would do.
-    let mut claimed = HashSet::new();
+/// What [`reindex`] did, or would do.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Reindex {
+    pub files: Vec<Reindexed>,
+    /// Calendar UIDs whose events now have another UID, as (old, new).
+    /// The events under the old UIDs are left for the caller to delete.
+    /// Worked out from the records, so a second run lists them again.
+    pub uids: Vec<(String, String)>,
+}
+
+/// Move archived records to the name they are filed under now, merging
+/// the copies one leg collected under several names, and list the
+/// calendar UIDs that changed with them.
+pub fn reindex(dir: &Path, dry_run: bool) -> Result<Reindex> {
     let mut paths = archived_records(dir)?;
     paths.sort();
+    let mut uids = BTreeSet::new();
+    let mut moves = Vec::new();
     for path in paths {
-        if !path.exists() {
-            continue;
-        }
         let body = fs::read(&path).map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
         let value: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| anyhow!("parsing {}: {e}", path.display()))?;
-        let Some(leg_number) = crate::reservation::leg_number(&value) else {
-            continue;
-        };
-        let reservation: Reservation = serde_json::from_value(value)
-            .map_err(|e| anyhow!("parsing {}: {e}", path.display()))?;
-        let (year, _, stem) =
-            booking_stem(&reservation).map_err(|e| anyhow!("{}: {e}", path.display()))?;
-        let Some(target) = leg_target(dir, year, &stem, Some(&leg_number)) else {
-            continue;
-        };
-        if target == path {
-            continue;
+        match crate::reservation::renamed_uids(&value) {
+            Ok(renamed) => uids.extend(renamed),
+            // Then it never had a calendar event to rename.
+            Err(e) => {
+                warn!(path = %path.display(), error = format!("{e:#}"), "not a calendar event")
+            }
         }
-        let merged = target.exists() || !claimed.insert(target.clone());
+        let target =
+            reindex_target(dir, &path, &value).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+        if let Some(target) = target.filter(|t| *t != path) {
+            moves.push((path, target));
+        }
+    }
+
+    let mut files = Vec::new();
+    // Targets a dry run would have filled, so it reports the merges a
+    // real run would do.
+    let mut claimed = HashSet::new();
+    for (from, to) in moves {
+        let merged = to.exists() || !claimed.insert(to.clone());
         if !dry_run {
+            // Read again: an earlier merge may have written to it.
+            let body = fs::read(&from).map_err(|e| anyhow!("reading {}: {e}", from.display()))?;
             let incoming = received_at_in(&body)?;
-            if !merged || !super::json_target::filed_from_newer(&target, incoming)? {
-                if let Some(parent) = target.parent() {
+            if !merged || !super::json_target::filed_from_newer(&to, incoming)? {
+                if let Some(parent) = to.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                write_atomic(&target, &body)?;
+                write_atomic(&to, &body)?;
             }
-            fs::remove_file(&path).map_err(|e| anyhow!("removing {}: {e}", path.display()))?;
+            fs::remove_file(&from).map_err(|e| anyhow!("removing {}: {e}", from.display()))?;
         }
-        let (from, to) = (path, target);
-        done.push(if merged {
+        files.push(if merged {
             Reindexed::Merged { from, to }
         } else {
             Reindexed::Moved { from, to }
         });
     }
-    Ok(done)
+    Ok(Reindex {
+        files,
+        uids: uids.into_iter().collect(),
+    })
+}
+
+/// Where an archived record at `path` is filed now, when that can be
+/// worked out from the record.
+fn reindex_target(dir: &Path, path: &Path, value: &serde_json::Value) -> Result<Option<PathBuf>> {
+    let reservation: Reservation = serde_json::from_value(value.clone())?;
+    let (year, number_slug, stem) = booking_stem(&reservation)?;
+    if let Some(leg_number) = crate::reservation::leg_number(value) {
+        return Ok(leg_target(dir, year, &stem, Some(&leg_number)));
+    }
+    // Without a leg number, the date or source filename suffix the
+    // record was filed with can't be rebuilt from it, so only the
+    // provider part of the name changes.
+    let Some(old_provider) = reservation
+        .provider()
+        .map(|p| slugify(&p, false))
+        .filter(|p| !p.is_empty())
+    else {
+        return Ok(None);
+    };
+    let old_stem = format!("{old_provider}-{number_slug}");
+    if old_stem == stem {
+        return Ok(None);
+    }
+    let tail = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|name| name.strip_prefix(&old_stem))
+        .filter(|tail| tail.is_empty() || tail.starts_with('-'));
+    Ok(tail.map(|tail| path.with_file_name(format!("{stem}{tail}.json"))))
 }
 
 /// Set on every leg of a reservation artifact that lists a booking's
@@ -1069,7 +1114,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("out");
         fs::create_dir_all(dir.join("2046")).unwrap();
-        let mut old = flight("100", "2046-03-01T08:00:00Z", false);
+        let mut old = flight("0100", "2046-03-01T08:00:00Z", false);
         old["receivedAt"] = "2046-01-01T00:00:00Z".into();
         let mut newer = old.clone();
         newer["receivedAt"] = "2046-02-01T00:00:00Z".into();
@@ -1088,16 +1133,22 @@ mod tests {
         let planned = reindex(&dir, true).unwrap();
         assert_eq!(
             planned,
-            vec![
-                Reindexed::Moved {
-                    from: dir.join("2046/british-airways-aaa111-2046-03-01.json"),
-                    to: target.clone(),
-                },
-                Reindexed::Merged {
-                    from: dir.join("2046/british-airways-aaa111.json"),
-                    to: target.clone(),
-                },
-            ]
+            Reindex {
+                files: vec![
+                    Reindexed::Moved {
+                        from: dir.join("2046/british-airways-aaa111-2046-03-01.json"),
+                        to: target.clone(),
+                    },
+                    Reindexed::Merged {
+                        from: dir.join("2046/british-airways-aaa111.json"),
+                        to: target.clone(),
+                    },
+                ],
+                uids: vec![(
+                    "flight-AAA111-BA0100@mailsift".to_string(),
+                    "flight-AAA111-BA100@mailsift".to_string()
+                )],
+            }
         );
         assert_eq!(archived_records(&dir).unwrap().len(), 2);
 
@@ -1105,7 +1156,53 @@ mod tests {
         assert_eq!(archived_records(&dir).unwrap(), vec![target.clone()]);
         let kept: serde_json::Value = serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
         assert_eq!(kept["receivedAt"], "2046-02-01T00:00:00Z");
-        assert_eq!(reindex(&dir, false).unwrap(), vec![]);
+        // The UIDs come from the records, which keep the flight number
+        // as the mail wrote it, so they are listed again.
+        assert_eq!(
+            reindex(&dir, false).unwrap(),
+            Reindex {
+                files: vec![],
+                uids: planned.uids
+            }
+        );
+    }
+
+    #[test]
+    fn reindex_renames_flights_without_a_number_by_their_airline_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out");
+        fs::create_dir_all(dir.join("2046")).unwrap();
+        let mut unnumbered = flight("100", "2046-03-01T08:00:00Z", false);
+        unnumbered["reservationFor"]
+            .as_object_mut()
+            .unwrap()
+            .remove("flightNumber");
+        let hotel = serde_json::json!({
+            "@type": "LodgingReservation",
+            "reservationNumber": "H1",
+            "reservationFor": {"name": "Example Inn"},
+            "checkinTime": "2046-03-01T15:00:00"
+        });
+        for (name, record) in [
+            ("british-airways-aaa111-2046-03-01.json", &unnumbered),
+            ("example-inn-h1.json", &hotel),
+        ] {
+            fs::write(
+                dir.join("2046").join(name),
+                serde_json::to_vec(record).unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            reindex(&dir, false).unwrap(),
+            Reindex {
+                files: vec![Reindexed::Moved {
+                    from: dir.join("2046/british-airways-aaa111-2046-03-01.json"),
+                    to: dir.join("2046/ba-aaa111-2046-03-01.json"),
+                }],
+                uids: vec![],
+            }
+        );
     }
 
     /// The realistic return trip: same airline, same booking

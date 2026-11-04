@@ -711,10 +711,12 @@ enum Command {
         #[arg(long)]
         extractors: Option<PathBuf>,
     },
-    /// Rename archived flight and train legs to the name they are filed
-    /// under now (`<provider>-<reference>-<flight or train>.json`),
-    /// merging copies of one leg filed under several names and keeping
-    /// the one from the newest mail.
+    /// Rename archived reservations to the name they are filed under
+    /// now (`<provider>-<reference>-<flight or train>.json`, with a
+    /// flight's provider its airline's IATA code), merging copies of
+    /// one leg filed under several names and keeping the one from the
+    /// newest mail. Also lists the calendar UIDs that changed; the
+    /// events under the old UIDs are not deleted.
     ReindexReservations {
         /// The reservations archive. Defaults to `reservations_dir`
         /// from the config file.
@@ -723,6 +725,12 @@ enum Command {
         /// Only print what would be moved.
         #[arg(long)]
         dry_run: bool,
+        /// Write what changed as JSON lines: `{"kind": "moved" or
+        /// "merged", "from": ..., "to": ...}` with paths relative to the
+        /// archive, and `{"kind": "uid", "from": ..., "to": ...}` for
+        /// each calendar UID that changed. Written on a dry run too.
+        #[arg(long)]
+        mapping_out: Option<PathBuf>,
     },
     /// Aggregate the milter's event log into a per-extractor summary
     /// (total runs, produced/empty/failed counts, mean wall-clock
@@ -1560,31 +1568,55 @@ fn run() -> Result<()> {
         Command::ReindexReservations {
             reservations_dir,
             dry_run,
+            mapping_out,
         } => {
+            use mailsift::targets::reservations::Reindexed;
             let dir = reservations_dir
                 .or_else(|| config.reservations_dir.clone())
                 .ok_or_else(|| {
                     anyhow::anyhow!("no reservations_dir configured; pass --reservations-dir")
                 })?;
             let done = mailsift::targets::reservations::reindex(&dir, dry_run)?;
-            for step in &done {
-                match step {
-                    mailsift::targets::reservations::Reindexed::Moved { from, to } => {
-                        println!("move  {} -> {}", from.display(), to.display())
-                    }
-                    mailsift::targets::reservations::Reindexed::Merged { from, to } => {
-                        println!("merge {} -> {}", from.display(), to.display())
-                    }
+            let relative = |p: &Path| -> anyhow::Result<String> {
+                Ok(p.strip_prefix(&dir)
+                    .with_context(|| format!("{} is outside {}", p.display(), dir.display()))?
+                    .to_string_lossy()
+                    .into_owned())
+            };
+            let mut mapping = Vec::new();
+            for step in &done.files {
+                let (kind, from, to) = match step {
+                    Reindexed::Moved { from, to } => ("moved", from, to),
+                    Reindexed::Merged { from, to } => ("merged", from, to),
+                };
+                println!("{kind:<6} {} -> {}", from.display(), to.display());
+                mapping.push(serde_json::json!({
+                    "kind": kind,
+                    "from": relative(from)?,
+                    "to": relative(to)?,
+                }));
+            }
+            for (from, to) in &done.uids {
+                println!("uid    {from} -> {to}");
+                mapping.push(serde_json::json!({"kind": "uid", "from": from, "to": to}));
+            }
+            if let Some(out) = mapping_out {
+                let mut body = String::new();
+                for line in &mapping {
+                    body.push_str(&serde_json::to_string(line)?);
+                    body.push('\n');
                 }
+                std::fs::write(&out, body).with_context(|| format!("writing {}", out.display()))?;
             }
             println!(
-                "{} {} legs",
+                "{} {} records, {} calendar UIDs changed",
                 if dry_run {
                     "would reindex"
                 } else {
                     "reindexed"
                 },
-                done.len()
+                done.files.len(),
+                done.uids.len()
             );
             Ok(())
         }
