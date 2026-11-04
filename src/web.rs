@@ -368,6 +368,8 @@ th { background: #f2f4f8; font-weight: 600; }
 th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
 tr:hover td { background: #fbfcff; }
 pre { background: #f5f5f7; padding: 1rem; overflow: auto; }
+details.failure pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: .5rem 0 0; }
+details.failure summary { cursor: pointer; }
 .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.8rem; background: #e8eef7; color: #2a3f5f; }
 .badge.bill { background: #fbe6d4; color: #7a3d00; }
 .badge.parcel { background: #d9ebd2; color: #274d1f; }
@@ -3136,6 +3138,22 @@ async fn show_stats(State(state): State<Arc<AppState>>) -> Result<Html<String>, 
     Ok(Html(page(&state, "Stats", &body)))
 }
 
+/// The exception line of an error, with the whole text folded away.
+///
+/// Extractor failures carry a Python traceback whose last line names
+/// the exception; a one-line error is shown as is.
+fn render_failure_error(err: &str) -> String {
+    let err = err.trim_end();
+    let Some((_, last)) = err.rsplit_once('\n') else {
+        return format!("<code>{}</code>", esc(err));
+    };
+    format!(
+        "<details class=\"failure\"><summary><code>{}</code></summary><pre>{}</pre></details>",
+        esc(last.trim()),
+        esc(err),
+    )
+}
+
 /// Render the most-recent failures as a table, or an empty-state note
 /// when there are none. Timestamps are shown as ISO-8601 UTC so a
 /// browser without JS still gets a sortable string.
@@ -3152,13 +3170,12 @@ fn render_recent_failures(failures: &[crate::stats::RecentFailure]) -> String {
                 .map(|d| d.format("%Y-%m-%d %H:%M:%SZ").to_string())
                 .unwrap_or_else(|| f.ts.to_string());
             let domain = f.from_domain.as_deref().unwrap_or("-");
-            let err = f.error.as_deref().unwrap_or("");
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 esc(&when),
                 esc(&f.extractor),
                 esc(domain),
-                esc(err),
+                render_failure_error(f.error.as_deref().unwrap_or("")),
             )
         })
         .collect::<Vec<_>>()
@@ -5303,6 +5320,16 @@ tickets_dir = "/var/mailsift/tickets"
     }
 
     /// The /stats page is always in the nav, even for a config with
+    #[test]
+    fn failure_error_folds_a_traceback_under_its_last_line() {
+        assert_eq!(
+            render_failure_error("Traceback:\n  File \"x.py\"\nValueError: <bad>\n"),
+            "<details class=\"failure\"><summary><code>ValueError: &lt;bad&gt;</code></summary>\
+             <pre>Traceback:\n  File &quot;x.py&quot;\nValueError: &lt;bad&gt;</pre></details>"
+        );
+        assert_eq!(render_failure_error("timed out"), "<code>timed out</code>");
+    }
+
     /// no artifact directories. The empty-state message is rendered
     /// when the log file doesn't exist yet.
     #[tokio::test]

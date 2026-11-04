@@ -365,10 +365,7 @@ pub fn run(
                         },
                     });
                 }
-                let mut err_snippet = format!("{e:#}");
-                if err_snippet.len() > stats::MAX_ERROR_SNIPPET {
-                    err_snippet.truncate(stats::MAX_ERROR_SNIPPET);
-                }
+                let err_snippet = stats::error_snippet(&format!("{e:#}"));
                 recorder.record(&stats::Event {
                     ts: now_ts,
                     extractor: ex.name.clone(),

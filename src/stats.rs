@@ -79,6 +79,40 @@ pub struct Event {
 /// event. Chosen so a log line stays well under `PIPE_BUF`.
 pub const MAX_ERROR_SNIPPET: usize = 500;
 
+/// Shorten an error to at most [`MAX_ERROR_SNIPPET`] bytes for the log.
+///
+/// Keeps the first line, which says what failed, and as much of the
+/// end as fits: a Python traceback names the exception on its last
+/// line, and that is the part worth reading.
+pub fn error_snippet(err: &str) -> String {
+    if err.len() <= MAX_ERROR_SNIPPET {
+        return err.to_string();
+    }
+    const GAP: &str = "\n...\n";
+    let first = err.lines().next().unwrap_or_default();
+    let head = &first[..floor_char_boundary(first, MAX_ERROR_SNIPPET / 4)];
+    let budget = MAX_ERROR_SNIPPET - head.len() - GAP.len();
+    let mut start = err.len() - budget;
+    while !err.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &err[start..];
+    // Start on a whole line when there is one to start on.
+    let tail = match tail.find('\n') {
+        Some(i) if i + 1 < tail.len() => &tail[i + 1..],
+        _ => tail,
+    };
+    format!("{head}{GAP}{tail}")
+}
+
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    let mut end = max.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// Cap on how many recent failure records `aggregate_recent_failures`
 /// returns. Bounded so the memory used by the dashboard stays sane
 /// even on a huge log.
@@ -474,6 +508,38 @@ pub fn duration_to_ms(d: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::{MAX_ERROR_SNIPPET, error_snippet};
+
+    #[test]
+    fn short_errors_are_kept_whole() {
+        assert_eq!(error_snippet("boom"), "boom");
+    }
+
+    #[test]
+    fn long_traceback_keeps_the_first_and_last_lines() {
+        let frames: String = (0..40)
+            .map(|i| format!("  File \"x.py\", line {i}, in main\n"))
+            .collect();
+        let err = format!(
+            "extractor x failed (exit status: 1): Traceback (most recent call last):\n\
+             {frames}StopIteration: no check-in line"
+        );
+        let snippet = error_snippet(&err);
+        assert!(snippet.len() <= MAX_ERROR_SNIPPET, "{}", snippet.len());
+        assert!(snippet.starts_with("extractor x failed (exit status: 1): Traceback"));
+        assert!(snippet.contains("\n...\n  File"));
+        assert!(snippet.ends_with("\nStopIteration: no check-in line"));
+    }
+
+    #[test]
+    fn snippet_never_splits_a_character() {
+        for pad in 0..4 {
+            let err = format!("{}{}", "x".repeat(pad), "\u{e9}".repeat(MAX_ERROR_SNIPPET));
+            let snippet = error_snippet(&err);
+            assert!(snippet.len() <= MAX_ERROR_SNIPPET);
+        }
+    }
+
     use super::*;
 
     fn write_events(events: &[Event]) -> (tempfile::TempDir, PathBuf) {

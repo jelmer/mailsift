@@ -844,10 +844,10 @@ pub fn run_one(extractor: &Extractor, raw: &[u8], timeout: Duration) -> Result<E
     }
     if !status.success() {
         if trimmed_stderr.is_empty() {
-            bail!("extractor {} exited with status {}", extractor.name, status);
+            bail!("extractor {} failed ({})", extractor.name, status);
         }
         bail!(
-            "extractor {} exited with status {}: {}",
+            "extractor {} failed ({}): {}",
             extractor.name,
             status,
             trimmed_stderr
