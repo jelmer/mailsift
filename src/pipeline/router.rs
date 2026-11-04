@@ -196,8 +196,9 @@ pub(super) fn file_reservation_json(
     }
 }
 
-/// Cancel the archived legs a complete itinerary no longer lists, and
-/// mark their calendar events cancelled. See
+/// Cancel the archived legs a complete itinerary no longer lists or a
+/// booking cancellation names, and mark their calendar events
+/// cancelled. See
 /// [`reservations::cancel_superseded_legs`].
 pub(super) fn cancel_superseded_legs(
     extractor: &str,
@@ -228,7 +229,7 @@ pub(super) fn cancel_superseded_legs(
         }
     };
     for (path, record) in cancelled {
-        info!(extractor, path = %path.display(), "leg no longer in the itinerary; marked cancelled");
+        info!(extractor, path = %path.display(), "leg dropped from its booking; marked cancelled");
         let events = match reservation::convert(&record) {
             Ok(events) => events,
             Err(e) => {

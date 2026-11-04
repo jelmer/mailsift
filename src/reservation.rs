@@ -425,16 +425,39 @@ impl From<&DateTimeField> for DatePerhapsTime {
 /// Many(Vec<Reservation>)`; `Reservation` is several hundred bytes
 /// while `Vec` is 24, and boxing would just trade one indirection for
 /// another with no real benefit.
+///
+/// Booking cancellations (see [`is_booking_cancellation`]) are left
+/// out: they name no leg to render.
 fn deserialise_one_or_many(json: serde_json::Value) -> Result<Vec<Reservation>> {
-    if json.is_array() {
-        let rs: Vec<Reservation> = serde_json::from_value(json)
+    if let serde_json::Value::Array(items) = json {
+        let items = items
+            .into_iter()
+            .filter(|item| !is_booking_cancellation(item))
+            .collect();
+        let rs: Vec<Reservation> = serde_json::from_value(serde_json::Value::Array(items))
             .context("schema.org reservation array didn't match the expected shape")?;
         Ok(rs)
+    } else if is_booking_cancellation(&json) {
+        Ok(Vec::new())
     } else {
         let r: Reservation = serde_json::from_value(json)
             .context("schema.org reservation JSON didn't match the expected shape")?;
         Ok(vec![r])
     }
+}
+
+/// Whether a reservation object cancels a whole booking by its
+/// reference: a cancelled status and no `reservationFor`, as a refund
+/// confirmation that names no flights or dates is written.
+pub fn is_booking_cancellation(value: &serde_json::Value) -> bool {
+    let cancelled = value
+        .get("reservationStatus")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_cancelled_status);
+    let no_leg = value
+        .get("reservationFor")
+        .is_none_or(serde_json::Value::is_null);
+    cancelled && no_leg
 }
 
 /// Convert a parsed reservation document into zero or more VEVENT
@@ -460,10 +483,15 @@ pub fn convert_file(path: &Path) -> Result<Vec<SingleEvent>> {
 /// `Unknown` types or for cases where the required date/time isn't
 /// parseable.
 fn render(r: Reservation) -> Option<SingleEvent> {
+    render_with(r, flight_leg_code)
+}
+
+/// [`render`], with the function that names a flight leg given.
+fn render_with(r: Reservation, leg_code: fn(&Flight) -> Option<String>) -> Option<SingleEvent> {
     let (prefix, summary, dtstart, dtend, location, id, leg) = match r {
         Reservation::Flight(f) => {
-            let leg = flight_leg_code(&f.reservation_for);
-            let summary = flight_summary(&f.reservation_for);
+            let leg = leg_code(&f.reservation_for);
+            let summary = flight_summary(&f.reservation_for, leg_code);
             let dep_label = airport_label(f.reservation_for.departure_airport.as_ref());
             (
                 "flight",
@@ -610,8 +638,8 @@ fn render(r: Reservation) -> Option<SingleEvent> {
     })
 }
 
-fn flight_summary(f: &Flight) -> String {
-    let code = flight_leg_code(f).unwrap_or_default();
+fn flight_summary(f: &Flight, leg_code: fn(&Flight) -> Option<String>) -> String {
+    let code = leg_code(f).unwrap_or_default();
     let dep = airport_label(f.departure_airport.as_ref());
     let arr = airport_label(f.arrival_airport.as_ref());
     if code.is_empty() {
@@ -629,11 +657,6 @@ fn flight_summary(f: &Flight) -> String {
     }
 }
 
-/// The airline + flight number pair (`KL1012`) used to keep the legs of
-/// one booking apart in both the summary line and the calendar UID. All
-/// four legs of a return trip share the booking reference, so without
-/// this the UID would collapse and each leg's `.ics` file would clobber
-/// the last one written.
 /// The flight or train number that tells one leg of a booking from
 /// the others, as it appears in the leg's calendar UID. None for
 /// bookings that aren't journeys, and for legs without a number.
@@ -657,7 +680,34 @@ pub fn leg_number(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// The airline + flight number pair (`KL1012`) used to keep the legs of
+/// one booking apart in both the summary line and the calendar UID. All
+/// four legs of a return trip share the booking reference, so without
+/// this the UID would collapse and each leg's `.ics` file would clobber
+/// the last one written.
 fn flight_leg_code(f: &Flight) -> Option<String> {
+    let airline = f
+        .airline
+        .as_ref()
+        .and_then(|a| a.iata_code.as_deref())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
+    let number: String = f
+        .flight_number
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    let code = format!("{airline}{}", canonical_flight_number(&airline, &number));
+    (!code.is_empty()).then_some(code)
+}
+
+/// The leg code calendar UIDs used before [`flight_leg_code`] made
+/// flight numbers canonical: the two fields as written.
+fn legacy_flight_leg_code(f: &Flight) -> Option<String> {
     let flight_no = f.flight_number.as_deref().unwrap_or("").trim();
     let airline_code = f
         .airline
@@ -667,6 +717,43 @@ fn flight_leg_code(f: &Flight) -> Option<String> {
         .trim();
     let code = format!("{airline_code}{flight_no}");
     (!code.is_empty()).then_some(code)
+}
+
+/// The calendar UIDs a reservation document's events had before
+/// flight numbers were made canonical, paired with the ones they have
+/// now. Only UIDs that changed are listed.
+pub fn renamed_uids(json: &serde_json::Value) -> Result<Vec<(String, String)>> {
+    let old = deserialise_one_or_many(json.clone())?;
+    let new = deserialise_one_or_many(json.clone())?;
+    Ok(old
+        .into_iter()
+        .zip(new)
+        .filter_map(|(old, new)| {
+            let old = render_with(old, legacy_flight_leg_code)?.uid;
+            let new = render(new)?.uid;
+            (old != new).then_some((old, new))
+        })
+        .collect())
+}
+
+/// The flight number without the airline code some senders include in
+/// it and without leading zeros, so that `0491`, `491` and `BA0491` on
+/// a `BA` flight are all `491`. IATA flight numbers are one to four
+/// digits and the zeros carry no meaning. A number without an airline
+/// code to split off is left alone apart from that.
+fn canonical_flight_number<'a>(airline: &str, number: &'a str) -> &'a str {
+    let starts_with_digit = |s: &str| s.starts_with(|c: char| c.is_ascii_digit());
+    let number = number
+        .strip_prefix(airline)
+        .filter(|rest| starts_with_digit(rest))
+        .unwrap_or(number);
+    let stripped = number.trim_start_matches('0');
+    if number.len() > stripped.len() && !starts_with_digit(stripped) {
+        // All zeros (or zeros and a suffix): keep one.
+        &number[number.len() - stripped.len() - 1..]
+    } else {
+        stripped
+    }
 }
 
 fn line_event(
@@ -1057,6 +1144,94 @@ mod tests {
                 "flight-Y9ZO6Z-KL1017@mailsift",
             ]
         );
+    }
+
+    fn flight_uid(airline: &str, number: &str) -> String {
+        let v = json!({
+            "@type": "FlightReservation",
+            "reservationNumber": "ABC123",
+            "reservationFor": {
+                "flightNumber": number,
+                "airline": {"iataCode": airline},
+                "departureTime": "2046-01-01T10:00:00Z"
+            }
+        });
+        first(convert(&v).unwrap()).uid
+    }
+
+    #[test]
+    fn flight_number_spellings_share_a_uid() {
+        for (airline, number) in [
+            ("BA", "491"),
+            ("BA", "0491"),
+            ("BA", "BA491"),
+            ("BA", "BA0491"),
+            ("BA", "BA 0491"),
+            ("ba", "ba491"),
+        ] {
+            assert_eq!(
+                flight_uid(airline, number),
+                "flight-ABC123-BA491@mailsift",
+                "{airline} {number}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_flight_number_keeps_what_carries_meaning() {
+        assert_eq!(canonical_flight_number("BA", "0"), "0");
+        assert_eq!(canonical_flight_number("BA", "000"), "0");
+        assert_eq!(canonical_flight_number("BA", "0491A"), "491A");
+        assert_eq!(canonical_flight_number("U2", "U20123"), "123");
+        // An airline code that only looks like the start of the number.
+        assert_eq!(canonical_flight_number("BA", "BAX1"), "BAX1");
+        // Nothing to split off without the airline's code.
+        assert_eq!(canonical_flight_number("", "BA0491"), "BA0491");
+        assert_eq!(canonical_flight_number("", "0491"), "491");
+    }
+
+    #[test]
+    fn renamed_uids_lists_the_uids_canonical_flight_numbers_changed() {
+        let leg = |number: &str| {
+            json!({
+                "@type": "FlightReservation",
+                "reservationNumber": "ABC123",
+                "reservationFor": {
+                    "flightNumber": number,
+                    "airline": {"iataCode": "BA"},
+                    "departureTime": "2046-01-01T10:00:00Z"
+                }
+            })
+        };
+        assert_eq!(
+            renamed_uids(&json!([leg("0491"), leg("100")])).unwrap(),
+            vec![(
+                "flight-ABC123-BA0491@mailsift".to_string(),
+                "flight-ABC123-BA491@mailsift".to_string()
+            )]
+        );
+        assert_eq!(renamed_uids(&leg("491")).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn booking_cancellation_renders_no_event() {
+        let cancellation = json!({
+            "@type": "FlightReservation",
+            "reservationNumber": "ABC123",
+            "reservationStatus": "ReservationCancelled"
+        });
+        assert_eq!(convert(&cancellation).unwrap().len(), 0);
+        let leg = json!({
+            "@type": "FlightReservation",
+            "reservationNumber": "XYZ789",
+            "reservationFor": {"departureTime": "2046-01-01T10:00:00Z"}
+        });
+        let uids: Vec<String> = convert(&json!([cancellation, leg]))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.uid)
+            .collect();
+        assert_eq!(uids, vec!["flight-XYZ789@mailsift".to_string()]);
     }
 
     /// Without a flight number the UID stays at the bare reference.
