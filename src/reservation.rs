@@ -629,11 +629,6 @@ fn flight_summary(f: &Flight) -> String {
     }
 }
 
-/// The airline + flight number pair (`KL1012`) used to keep the legs of
-/// one booking apart in both the summary line and the calendar UID. All
-/// four legs of a return trip share the booking reference, so without
-/// this the UID would collapse and each leg's `.ics` file would clobber
-/// the last one written.
 /// The flight or train number that tells one leg of a booking from
 /// the others, as it appears in the leg's calendar UID. None for
 /// bookings that aren't journeys, and for legs without a number.
@@ -657,16 +652,49 @@ pub fn leg_number(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// The airline + flight number pair (`KL1012`) used to keep the legs of
+/// one booking apart in both the summary line and the calendar UID. All
+/// four legs of a return trip share the booking reference, so without
+/// this the UID would collapse and each leg's `.ics` file would clobber
+/// the last one written.
 fn flight_leg_code(f: &Flight) -> Option<String> {
-    let flight_no = f.flight_number.as_deref().unwrap_or("").trim();
-    let airline_code = f
+    let airline = f
         .airline
         .as_ref()
         .and_then(|a| a.iata_code.as_deref())
         .unwrap_or("")
-        .trim();
-    let code = format!("{airline_code}{flight_no}");
+        .trim()
+        .to_ascii_uppercase();
+    let number: String = f
+        .flight_number
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    let code = format!("{airline}{}", canonical_flight_number(&airline, &number));
     (!code.is_empty()).then_some(code)
+}
+
+/// The flight number without the airline code some senders include in
+/// it and without leading zeros, so that `0491`, `491` and `BA0491` on
+/// a `BA` flight are all `491`. IATA flight numbers are one to four
+/// digits and the zeros carry no meaning. A number without an airline
+/// code to split off is left alone apart from that.
+fn canonical_flight_number<'a>(airline: &str, number: &'a str) -> &'a str {
+    let starts_with_digit = |s: &str| s.starts_with(|c: char| c.is_ascii_digit());
+    let number = number
+        .strip_prefix(airline)
+        .filter(|rest| starts_with_digit(rest))
+        .unwrap_or(number);
+    let stripped = number.trim_start_matches('0');
+    if number.len() > stripped.len() && !starts_with_digit(stripped) {
+        // All zeros (or zeros and a suffix): keep one.
+        &number[number.len() - stripped.len() - 1..]
+    } else {
+        stripped
+    }
 }
 
 fn line_event(
@@ -1057,6 +1085,50 @@ mod tests {
                 "flight-Y9ZO6Z-KL1017@mailsift",
             ]
         );
+    }
+
+    fn flight_uid(airline: &str, number: &str) -> String {
+        let v = json!({
+            "@type": "FlightReservation",
+            "reservationNumber": "ABC123",
+            "reservationFor": {
+                "flightNumber": number,
+                "airline": {"iataCode": airline},
+                "departureTime": "2046-01-01T10:00:00Z"
+            }
+        });
+        first(convert(&v).unwrap()).uid
+    }
+
+    #[test]
+    fn flight_number_spellings_share_a_uid() {
+        for (airline, number) in [
+            ("BA", "491"),
+            ("BA", "0491"),
+            ("BA", "BA491"),
+            ("BA", "BA0491"),
+            ("BA", "BA 0491"),
+            ("ba", "ba491"),
+        ] {
+            assert_eq!(
+                flight_uid(airline, number),
+                "flight-ABC123-BA491@mailsift",
+                "{airline} {number}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_flight_number_keeps_what_carries_meaning() {
+        assert_eq!(canonical_flight_number("BA", "0"), "0");
+        assert_eq!(canonical_flight_number("BA", "000"), "0");
+        assert_eq!(canonical_flight_number("BA", "0491A"), "491A");
+        assert_eq!(canonical_flight_number("U2", "U20123"), "123");
+        // An airline code that only looks like the start of the number.
+        assert_eq!(canonical_flight_number("BA", "BAX1"), "BAX1");
+        // Nothing to split off without the airline's code.
+        assert_eq!(canonical_flight_number("", "BA0491"), "BA0491");
+        assert_eq!(canonical_flight_number("", "0491"), "491");
     }
 
     /// Without a flight number the UID stays at the bare reference.

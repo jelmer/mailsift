@@ -939,6 +939,24 @@ mod tests {
     }
 
     #[test]
+    fn a_leg_files_once_however_its_flight_number_is_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out");
+        for (number, epoch) in [("0100", 1_000), ("BA100", 2_000), ("100", 3_000)] {
+            file_mail(
+                tmp.path(),
+                &dir,
+                &[flight(number, "2046-03-01T08:00:00Z", false)],
+                epoch,
+            );
+        }
+        assert_eq!(
+            archived_records(&dir).unwrap(),
+            vec![dir.join("2046/british-airways-aaa111-ba100.json")]
+        );
+    }
+
+    #[test]
     fn mail_about_one_leg_cancels_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("out");
