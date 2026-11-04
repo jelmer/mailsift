@@ -44,6 +44,12 @@ back to basic auth. To build without Kerberos:
 cargo install --path . --no-default-features
 ```
 
+`jmap-watch` needs the `jmap` feature, which is off by default:
+
+```sh
+cargo install --path . --features jmap
+```
+
 ## Configure
 
 mailsift reads `$XDG_CONFIG_HOME/mailsift/config.toml` (typically
@@ -210,6 +216,30 @@ its `from_domains` when it has them, and then carries on. A changed
 catch-all extractor such as `schema-ld` still means a full pass, but
 only for that extractor. Shared helpers under `_lib/` aren't
 fingerprinted; use `--rescan` after changing those.
+
+### `jmap-watch`: watch a JMAP mailbox
+
+```sh
+mailsift jmap-watch https://jmap.example.org \
+    --token-file ~/.config/mailsift/jmap.token --mailbox Receipts
+```
+
+Scans a JMAP mailbox and then watches it for new mail. Every message in
+it is run through the pipeline, oldest first, and then gets the keyword
+`$mailsift-seen` (change it with `--seen-keyword`). Messages with the
+keyword are skipped, so the server keeps track of what has been done
+and nothing is stored locally. A message whose pipeline run fails is
+left without the keyword and is retried on the next start.
+
+The URL is just the server; the session is found at `/.well-known/jmap`.
+Authenticate with a bearer token (`--token-file`) or with basic auth
+(`--password-file`, with the user in the URL or the current OS user).
+`--mailbox` takes a `/`-separated path from the top level and defaults
+to the inbox.
+
+After the existing mail, the command stays connected and handles new
+mail as the server's event source reports it. Pass `--once` to exit
+after the backlog instead. `--dry-run` sets no keywords.
 
 ### `maildir-scan`: walk a Maildir on disk
 
