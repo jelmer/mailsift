@@ -10,7 +10,8 @@
 //! Each artifact is filed under
 //! `<dir>/<year>/<provider-slug>-<reservation-number>.json`. The year
 //! comes from the first date field we recognise (departure, check-in,
-//! event start); the provider from the airline / hotel / venue name.
+//! event start); the provider from the airline / hotel / venue name,
+//! or for a flight from the airline's IATA code.
 //! A follow-up mail about the same booking overwrites the record in
 //! place, matching the UID-based replacement the calendar side does.
 
@@ -40,6 +41,8 @@ use super::sink::{slugify, write_atomic};
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Reservation {
+    #[serde(default, rename = "@type")]
+    kind: Option<Scalar>,
     #[serde(default)]
     reservation_number: Option<Scalar>,
     #[serde(default)]
@@ -156,6 +159,13 @@ impl Named {
             Named::Other(_) => None,
         }
     }
+
+    fn iata_code(&self) -> Option<&str> {
+        match self {
+            Named::Object { iata_code, .. } => first_non_empty([iata_code.as_deref()]),
+            Named::Text(_) | Named::Other(_) => None,
+        }
+    }
 }
 
 /// Deserialise `reservationFor`, falling back to an empty struct for
@@ -192,6 +202,27 @@ impl Reservation {
         ])
         .map(str::to_string)
         .or_else(|| for_.name.as_ref().and_then(Scalar::non_empty))
+    }
+
+    /// The provider part of the archive name. A flight goes by its
+    /// airline's IATA code when it has one, so extractors spelling the
+    /// airline's name differently still file a flight once.
+    fn archive_provider(&self) -> Option<String> {
+        let is_flight = self
+            .kind
+            .as_ref()
+            .and_then(Scalar::as_str)
+            .is_some_and(|k| k == "FlightReservation");
+        is_flight
+            .then(|| {
+                self.reservation_for
+                    .airline
+                    .as_ref()
+                    .and_then(Named::iata_code)
+            })
+            .flatten()
+            .map(str::to_string)
+            .or_else(|| self.provider())
     }
 
     /// The `YYYY-MM-DD` prefix of this leg's own date, when it has
@@ -450,7 +481,7 @@ fn booking_stem(reservation: &Reservation) -> Result<(i32, String, String)> {
     // The provider is a nicety, not an identity: a booking reference
     // is already vendor-unique, so a reservation without a recognised
     // provider still files under the bare reference.
-    let stem = match reservation.provider().map(|p| slugify(&p, false)) {
+    let stem = match reservation.archive_provider().map(|p| slugify(&p, false)) {
         Some(provider_slug) if !provider_slug.is_empty() => {
             format!("{provider_slug}-{number_slug}")
         }
@@ -777,7 +808,7 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert!(matches!(outcomes[0], FileOutcome::Created(_)));
 
-        let body = fs::read_to_string(dir.join("2026/easyjet-abc123.json")).unwrap();
+        let body = fs::read_to_string(dir.join("2026/u2-abc123.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["reservationNumber"], "ABC123");
     }
@@ -932,8 +963,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "british-airways-aaa111-ba100.json".to_string(),
-                "british-airways-aaa111-ba200.json".to_string(),
+                "ba-aaa111-ba100.json".to_string(),
+                "ba-aaa111-ba200.json".to_string(),
             ]
         );
     }
@@ -952,8 +983,43 @@ mod tests {
         }
         assert_eq!(
             archived_records(&dir).unwrap(),
-            vec![dir.join("2046/british-airways-aaa111-ba100.json")]
+            vec![dir.join("2046/ba-aaa111-ba100.json")]
         );
+    }
+
+    #[test]
+    fn a_flight_files_under_its_airline_code_however_the_airline_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out");
+        let mut renamed = flight("100", "2046-03-01T08:00:00Z", false);
+        renamed["reservationFor"]["airline"]["name"] = "BRITISH AIRWAYS PLC".into();
+        file_mail(
+            tmp.path(),
+            &dir,
+            &[flight("100", "2046-03-01T08:00:00Z", false)],
+            1_000,
+        );
+        file_mail(tmp.path(), &dir, &[renamed], 2_000);
+        assert_eq!(
+            archived_records(&dir).unwrap(),
+            vec![dir.join("2046/ba-aaa111-ba100.json")]
+        );
+    }
+
+    #[test]
+    fn only_flights_file_under_an_airline_code() {
+        let r = parse(serde_json::json!({
+            "@type": "TrainReservation",
+            "reservationNumber": "ABC123",
+            "reservationFor": {"airline": {"iataCode": "BA", "name": "British Airways"}},
+        }));
+        assert_eq!(r.archive_provider().as_deref(), Some("British Airways"));
+        let r = parse(serde_json::json!({
+            "@type": "FlightReservation",
+            "reservationNumber": "ABC123",
+            "reservationFor": {"airline": {"name": "British Airways"}},
+        }));
+        assert_eq!(r.archive_provider().as_deref(), Some("British Airways"));
     }
 
     #[test]
@@ -1017,7 +1083,7 @@ mod tests {
             serde_json::to_vec(&old).unwrap(),
         )
         .unwrap();
-        let target = dir.join("2046/british-airways-aaa111-ba100.json");
+        let target = dir.join("2046/ba-aaa111-ba100.json");
 
         let planned = reindex(&dir, true).unwrap();
         assert_eq!(
