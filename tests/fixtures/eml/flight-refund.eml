@@ -1,0 +1,10 @@
+From: bookings@flight.fixture.test
+To: jelmer@example.org
+Subject: fixture-refund for booking FX7QT2
+Date: Wed, 4 Mar 2026 09:00:00 +0000
+Message-ID: <fixture-refund-1@flight.fixture.test>
+Authentication-Results: example.org; dkim=pass header.d=flight.fixture.test header.i=@flight.fixture.test
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Your booking FX7QT2 has been refunded.

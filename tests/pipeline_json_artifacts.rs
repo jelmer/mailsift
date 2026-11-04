@@ -224,3 +224,47 @@ fn booking_mails_out_of_order_leave_the_newest() {
         dates("2026-03-03T09:00:00Z", "20260303T090000Z")
     );
 }
+
+/// A refund mail names only the booking: it cancels the archived leg
+/// and its event, and files nothing of its own.
+#[test]
+fn booking_cancellation_cancels_the_legs_filed_before_it() {
+    let manifest = manifest_dir();
+    let out = tempfile::tempdir().expect("tempdir");
+    replay_into(
+        &manifest.join("tests/fixtures/eml/flight-confirmation.eml"),
+        out.path(),
+    );
+    replay_into(
+        &manifest.join("tests/fixtures/eml/flight-refund.eml"),
+        out.path(),
+    );
+
+    let names = |dir: PathBuf| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        names(out.path().join("reservations/2026")),
+        vec!["fx-fx7qt2-fx123.json".to_string()]
+    );
+    assert_eq!(
+        names(out.path().join("events")),
+        vec!["flight-FX7QT2-FX123@mailsift.ics".to_string()]
+    );
+    let body = std::fs::read_to_string(out.path().join("reservations/2026/fx-fx7qt2-fx123.json"))
+        .expect("read reservation");
+    let record: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(record["reservationStatus"], "ReservationCancelled");
+    assert_eq!(record["receivedAt"], "2026-03-04T09:00:00Z");
+    let event = std::fs::read_to_string(out.path().join("events/flight-FX7QT2-FX123@mailsift.ics"))
+        .expect("read event");
+    assert_eq!(
+        event.lines().find(|l| l.starts_with("STATUS:")),
+        Some("STATUS:CANCELLED")
+    );
+}

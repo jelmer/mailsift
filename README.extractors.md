@@ -178,6 +178,26 @@ chronologically.
 | `<slug>.subscription.json` | `subscription` | schema.org-ish JSON carrying at least `subscriptionDuration`. Downstream tooling synthesises renewal reminders from it. |
 | `<slug>.ticket.<ext>`      | `ticket`       | Any binary blob (PDF, pkpass, image, ...). Dedup is by content hash; `<ext>` is taken literally as the on-disk extension. The slug is the filed name, so make it specific: `ryanair-fr1234-2026-04-10.ticket.pdf`. |
 
+Some cancellation mails name only the booking, not its legs: an
+airline's refund confirmation, a rail operator cancelling an order.
+Emit a reservation with just its `@type`, the booking reference and a
+cancelled status, and no `reservationFor`:
+
+```json
+{
+  "@type": "FlightReservation",
+  "reservationNumber": "ABC123",
+  "reservationStatus": "ReservationCancelled"
+}
+```
+
+Every archived leg of that booking (same `@type` and
+`reservationNumber`) filed from older mail is then marked cancelled,
+along with its calendar event. The record itself is not archived and
+makes no event. The `@type` has to be the specific one the legs were
+filed with: a bare `Reservation`, or none, is ignored, since booking
+references are only unique per vendor.
+
 Dotfiles and other `_*` files are skipped silently; any other
 unrecognised filename in cwd is logged with a warning. Emit as many
 artifacts as the message warrants - one boarding-pass email can produce

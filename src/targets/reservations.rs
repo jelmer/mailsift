@@ -334,7 +334,12 @@ pub fn file_reservation(
     // Each leg is kept as generic JSON so it can be written back out
     // with its own fields intact; the typed view below is only for
     // picking a filename, and is deliberately lossy.
-    let raw_legs = split_legs(doc);
+    // A booking cancellation names no leg of its own to file; it is
+    // applied to the archived legs by [`cancel_superseded_legs`].
+    let raw_legs: Vec<_> = split_legs(doc)
+        .into_iter()
+        .filter(|leg| !crate::reservation::is_booking_cancellation(leg))
+        .collect();
 
     // Legs are filed independently: one leg missing its booking
     // reference shouldn't discard the rest of the itinerary, and
@@ -615,16 +620,20 @@ fn reindex_target(dir: &Path, path: &Path, value: &serde_json::Value) -> Result<
 /// mail about one leg (a check-in reminder) leaves it out.
 pub const COMPLETE_ITINERARY_KEY: &str = "mailsift:itineraryComplete";
 
-/// Mark the archived legs of a booking that a complete itinerary no
-/// longer lists as cancelled.
+/// Mark the archived legs of a booking that a mail drops as cancelled.
 ///
 /// A booking moved to another flight or train gets a new leg, because
 /// a leg is filed under its flight or train number; without this the
-/// leg it replaced would stay as if it were still booked. Only legs
-/// filed from older mail are touched, and only for the bookings whose
-/// legs in `src` all say they are the complete itinerary. Returns each
-/// cancelled leg's path and its new contents, so the caller can update
-/// its calendar event.
+/// leg it replaced would stay as if it were still booked. So for the
+/// bookings whose legs in `src` all say they are the complete
+/// itinerary, the archived legs it doesn't list are cancelled. A
+/// booking cancellation in `src` (see
+/// [`crate::reservation::is_booking_cancellation`]) cancels every
+/// archived leg of its booking.
+///
+/// Only legs filed from older mail are touched. Returns each cancelled
+/// leg's path and its new contents, so the caller can update its
+/// calendar event.
 pub fn cancel_superseded_legs(
     src: &Path,
     dir: &Path,
@@ -637,14 +646,15 @@ pub fn cancel_superseded_legs(
         .filter(|leg| leg.get(COMPLETE_ITINERARY_KEY) == Some(&serde_json::Value::Bool(true)))
         .filter_map(booking_key)
         .collect();
-    if complete.is_empty() {
+    let cancelled_bookings = cancelled_bookings(src, &legs);
+    if complete.is_empty() && cancelled_bookings.is_empty() {
         return Ok(Vec::new());
     }
     let Some(received_at) = received_at_epoch.and_then(|e| chrono::DateTime::from_timestamp(e, 0))
     else {
         warn!(
             source = %src.display(),
-            "complete itinerary without a message date; not cancelling the legs it drops"
+            "itinerary or cancellation without a message date; not cancelling the legs it drops"
         );
         return Ok(Vec::new());
     };
@@ -665,7 +675,11 @@ pub fn cancel_superseded_legs(
                 continue;
             }
         };
-        if !booking_key(&record).is_some_and(|key| complete.contains(&key)) {
+        let Some(key) = booking_key(&record) else {
+            continue;
+        };
+        let booking_cancelled = cancelled_bookings.contains(&key);
+        if !booking_cancelled && !complete.contains(&key) {
             continue;
         }
         let already_cancelled = record
@@ -679,12 +693,14 @@ pub fn cancel_superseded_legs(
         if already_cancelled || !filed_before {
             continue;
         }
-        let uids: Vec<String> = crate::reservation::convert(&record)?
-            .into_iter()
-            .map(|event| event.uid)
-            .collect();
-        if uids.is_empty() || uids.iter().any(|uid| current.contains(uid)) {
-            continue;
+        if !booking_cancelled {
+            let uids: Vec<String> = crate::reservation::convert(&record)?
+                .into_iter()
+                .map(|event| event.uid)
+                .collect();
+            if uids.is_empty() || uids.iter().any(|uid| current.contains(uid)) {
+                continue;
+            }
         }
         let obj = record
             .as_object_mut()
@@ -699,6 +715,28 @@ pub fn cancel_superseded_legs(
         cancelled.push((path, record));
     }
     Ok(cancelled)
+}
+
+/// The bookings the booking cancellations among `legs` cancel.
+///
+/// Matched on `@type` as well as the reference: references are only
+/// unique per vendor, and a hotel and an airline can hand out the same
+/// one. A cancellation without a specific `@type` would have to match
+/// any booking with that reference, so it is not applied.
+fn cancelled_bookings(src: &Path, legs: &[serde_json::Value]) -> HashSet<(String, String)> {
+    legs.iter()
+        .filter(|leg| crate::reservation::is_booking_cancellation(leg))
+        .filter_map(|leg| {
+            let key = booking_key(leg).filter(|(kind, _)| kind != "Reservation");
+            if key.is_none() {
+                warn!(
+                    source = %src.display(),
+                    "booking cancellation without a reservation type and reference; ignoring"
+                );
+            }
+            key
+        })
+        .collect()
 }
 
 /// The `@type` and booking reference a leg belongs to.
@@ -1065,6 +1103,68 @@ mod tests {
             "reservationFor": {"airline": {"name": "British Airways"}},
         }));
         assert_eq!(r.archive_provider().as_deref(), Some("British Airways"));
+    }
+
+    fn booking_cancellation(kind: Option<&str>, number: &str) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "reservationNumber": number,
+            "reservationStatus": "ReservationCancelled"
+        });
+        if let Some(kind) = kind {
+            v["@type"] = kind.into();
+        }
+        v
+    }
+
+    #[test]
+    fn booking_cancellation_cancels_older_legs_of_that_booking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out");
+        let mut other_booking = flight("300", "2046-03-02T08:00:00Z", false);
+        other_booking["reservationNumber"] = "BBB222".into();
+        let mut train = flight("400", "2046-03-03T08:00:00Z", false);
+        train["@type"] = "TrainReservation".into();
+        let booked = [
+            flight("100", "2046-03-01T08:00:00Z", false),
+            other_booking,
+            train,
+        ];
+        file_mail(tmp.path(), &dir, &booked, 1_000);
+        // Filed from mail sent after the cancellation.
+        file_mail(
+            tmp.path(),
+            &dir,
+            &[flight("200", "2046-03-08T18:00:00Z", false)],
+            3_000,
+        );
+        let cancellation = [booking_cancellation(Some("FlightReservation"), "AAA111")];
+        assert_eq!(file_mail(tmp.path(), &dir, &cancellation, 2_000), 1);
+        assert_eq!(
+            statuses(&dir),
+            vec![
+                ("100".to_string(), Some("ReservationCancelled".to_string())),
+                ("200".to_string(), None),
+                ("300".to_string(), None),
+                ("400".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn booking_cancellation_without_a_specific_type_cancels_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out");
+        file_mail(
+            tmp.path(),
+            &dir,
+            &[flight("100", "2046-03-01T08:00:00Z", false)],
+            1_000,
+        );
+        for kind in [None, Some("Reservation")] {
+            let cancellation = [booking_cancellation(kind, "AAA111")];
+            assert_eq!(file_mail(tmp.path(), &dir, &cancellation, 2_000), 0);
+        }
+        assert_eq!(statuses(&dir), vec![("100".to_string(), None)]);
     }
 
     #[test]

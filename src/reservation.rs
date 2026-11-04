@@ -425,16 +425,39 @@ impl From<&DateTimeField> for DatePerhapsTime {
 /// Many(Vec<Reservation>)`; `Reservation` is several hundred bytes
 /// while `Vec` is 24, and boxing would just trade one indirection for
 /// another with no real benefit.
+///
+/// Booking cancellations (see [`is_booking_cancellation`]) are left
+/// out: they name no leg to render.
 fn deserialise_one_or_many(json: serde_json::Value) -> Result<Vec<Reservation>> {
-    if json.is_array() {
-        let rs: Vec<Reservation> = serde_json::from_value(json)
+    if let serde_json::Value::Array(items) = json {
+        let items = items
+            .into_iter()
+            .filter(|item| !is_booking_cancellation(item))
+            .collect();
+        let rs: Vec<Reservation> = serde_json::from_value(serde_json::Value::Array(items))
             .context("schema.org reservation array didn't match the expected shape")?;
         Ok(rs)
+    } else if is_booking_cancellation(&json) {
+        Ok(Vec::new())
     } else {
         let r: Reservation = serde_json::from_value(json)
             .context("schema.org reservation JSON didn't match the expected shape")?;
         Ok(vec![r])
     }
+}
+
+/// Whether a reservation object cancels a whole booking by its
+/// reference: a cancelled status and no `reservationFor`, as a refund
+/// confirmation that names no flights or dates is written.
+pub fn is_booking_cancellation(value: &serde_json::Value) -> bool {
+    let cancelled = value
+        .get("reservationStatus")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_cancelled_status);
+    let no_leg = value
+        .get("reservationFor")
+        .is_none_or(serde_json::Value::is_null);
+    cancelled && no_leg
 }
 
 /// Convert a parsed reservation document into zero or more VEVENT
@@ -1188,6 +1211,27 @@ mod tests {
             )]
         );
         assert_eq!(renamed_uids(&leg("491")).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn booking_cancellation_renders_no_event() {
+        let cancellation = json!({
+            "@type": "FlightReservation",
+            "reservationNumber": "ABC123",
+            "reservationStatus": "ReservationCancelled"
+        });
+        assert_eq!(convert(&cancellation).unwrap().len(), 0);
+        let leg = json!({
+            "@type": "FlightReservation",
+            "reservationNumber": "XYZ789",
+            "reservationFor": {"departureTime": "2046-01-01T10:00:00Z"}
+        });
+        let uids: Vec<String> = convert(&json!([cancellation, leg]))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.uid)
+            .collect();
+        assert_eq!(uids, vec!["flight-XYZ789@mailsift".to_string()]);
     }
 
     /// Without a flight number the UID stays at the bare reference.
