@@ -1247,7 +1247,7 @@ fn build_feed(state: &AppState) -> Result<Vec<FeedItem>> {
                 date,
                 date_display,
                 kind: "reservation",
-                title: reservation_provider(&value).unwrap_or_default(),
+                title: reservation_title(&value),
                 subtitle: reservation_number(&value).unwrap_or_default(),
                 vendor_url: vendor_url(&value),
                 href: format!("/reservations/{year}/{slug}.json"),
@@ -2316,6 +2316,23 @@ fn reservation_provider(value: &Value) -> Option<String> {
 }
 
 /// Booking reference.
+fn reservation_is_cancelled(value: &Value) -> bool {
+    value
+        .get("reservationStatus")
+        .and_then(Value::as_str)
+        .is_some_and(crate::reservation::is_cancelled_status)
+}
+
+/// The provider, saying so when the booking was cancelled.
+fn reservation_title(value: &Value) -> String {
+    let provider = reservation_provider(value).unwrap_or_default();
+    if reservation_is_cancelled(value) {
+        format!("{provider} (cancelled)")
+    } else {
+        provider
+    }
+}
+
 fn reservation_number(value: &Value) -> Option<String> {
     pick_str(value, &["reservationNumber", "reservationId", "identifier"])
 }
@@ -2356,7 +2373,7 @@ async fn list_reservations(
         {
             continue;
         }
-        let provider = reservation_provider(&value).unwrap_or_default();
+        let provider = reservation_title(&value);
         let number = reservation_number(&value).unwrap_or_default();
         let under = value.get("underName").and_then(named).unwrap_or_default();
         let date_raw = reservation_date(&value).unwrap_or_default();
@@ -2493,6 +2510,10 @@ async fn view_reservation(
     let for_val = value.get("reservationFor");
     let mut fields: Vec<(&str, Option<String>)> = vec![
         ("Provider", Some(provider.clone())),
+        (
+            "Status",
+            reservation_is_cancelled(&value).then(|| "Cancelled".to_string()),
+        ),
         ("Reference", (!number.is_empty()).then_some(number.clone())),
         ("Route", route),
         ("Passenger", value.get("underName").and_then(named)),
@@ -4480,6 +4501,29 @@ mod tests {
             body.contains(">2026-11-05<") && !body.contains(">2026-11-05 15:00<"),
             "hotel row should not carry time: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_reservation_is_marked_in_list_and_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("reservations/2026")).unwrap();
+        fs::write(
+            tmp.path().join("reservations/2026/ibis-HT.json"),
+            br#"{"@type":"LodgingReservation","reservationNumber":"HT",
+                 "reservationStatus":"https://schema.org/ReservationCancelled",
+                 "checkinTime":"2026-11-05",
+                 "reservationFor":{"@type":"LodgingBusiness","name":"ibis"}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            reservations_dir: Some(tmp.path().join("reservations")),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (_, body) = get(&app, "/reservations").await;
+        assert!(body.contains("ibis (cancelled)"), "{body}");
+        let (_, body) = get(&app, "/reservations/2026/ibis-HT/view").await;
+        assert!(body.contains("Cancelled"), "{body}");
     }
 
     #[tokio::test]

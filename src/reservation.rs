@@ -16,7 +16,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
-use icalendar::{Calendar, Component, DatePerhapsTime, Event, EventLike};
+use icalendar::{Calendar, Component, DatePerhapsTime, Event, EventLike, EventStatus};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -64,6 +64,32 @@ struct ReservationId {
     reservation_id: Option<String>,
     #[serde(default)]
     identifier: Option<String>,
+    /// `ReservationCancelled` and friends; see [`is_cancelled_status`].
+    #[serde(default)]
+    reservation_status: Option<String>,
+}
+
+impl ReservationId {
+    fn is_cancelled(&self) -> bool {
+        self.reservation_status
+            .as_deref()
+            .is_some_and(is_cancelled_status)
+    }
+}
+
+/// Whether a schema.org `reservationStatus` says the booking is off.
+///
+/// The value may carry the vocabulary URL (`http://schema.org/Cancelled`
+/// in older markup), and vendors write the bare `Cancelled` as often as
+/// `ReservationCancelled`.
+pub fn is_cancelled_status(status: &str) -> bool {
+    let name = status
+        .trim()
+        .trim_start_matches("https://schema.org/")
+        .trim_start_matches("http://schema.org/");
+    ["ReservationCancelled", "Cancelled", "Canceled"]
+        .iter()
+        .any(|c| name.eq_ignore_ascii_case(c))
 }
 
 #[derive(Debug, Deserialize)]
@@ -560,12 +586,21 @@ fn render(r: Reservation) -> Option<SingleEvent> {
     };
 
     let uid = uid_for(prefix, &id, leg.as_deref(), &summary, &dtstart);
+    // The event keeps its UID so it replaces the booked one. Not every
+    // client shows STATUS, so the summary says it too.
+    let cancelled = id.is_cancelled();
+    let summary = if cancelled {
+        format!("Cancelled: {summary}")
+    } else {
+        summary
+    };
     let body = render_ics(
         &uid,
         &dtstart,
         dtend.as_ref(),
         &summary,
         location.as_deref(),
+        cancelled,
     );
     Some(SingleEvent {
         uid,
@@ -738,8 +773,12 @@ fn render_ics(
     dtend: Option<&DateTimeField>,
     summary: &str,
     location: Option<&str>,
+    cancelled: bool,
 ) -> String {
     let mut event = Event::new();
+    if cancelled {
+        event.status(EventStatus::Cancelled);
+    }
     let start: DatePerhapsTime = dtstart.into();
     event
         .uid(uid)
@@ -811,6 +850,52 @@ mod tests {
         assert!(ev.body.contains("DTEND:20241230T110000"));
         assert!(ev.body.contains("LOCATION:1-3 Düsternstraße"));
         assert!(ev.body.contains("SUMMARY:Stay at Ruby Lotti Hotel Hamburg"));
+    }
+
+    #[test]
+    fn cancelled_lodging_keeps_its_uid_and_is_marked_cancelled() {
+        let v = json!({
+            "@type": "LodgingReservation",
+            "reservationNumber": "9999999999",
+            "reservationStatus": "https://schema.org/ReservationCancelled",
+            "checkinTime": "2024-12-27",
+            "checkoutTime": "2024-12-30",
+            "reservationFor": {"name": "Example Hotel"}
+        });
+        let ev = first(convert(&v).unwrap());
+        assert_eq!(ev.uid, "hotel-9999999999@mailsift");
+        let lines: Vec<&str> = ev.body.lines().collect();
+        assert!(lines.contains(&"STATUS:CANCELLED"));
+        assert!(lines.contains(&"SUMMARY:Cancelled: Stay at Example Hotel"));
+    }
+
+    #[test]
+    fn confirmed_reservation_has_no_status() {
+        let v = json!({
+            "@type": "LodgingReservation",
+            "reservationNumber": "9999999999",
+            "reservationStatus": "ReservationConfirmed",
+            "checkinTime": "2024-12-27",
+            "reservationFor": {"name": "Example Hotel"}
+        });
+        let ev = first(convert(&v).unwrap());
+        assert!(!ev.body.contains("STATUS:"));
+        assert!(ev.body.contains("SUMMARY:Stay at Example Hotel"));
+    }
+
+    #[test]
+    fn cancelled_status_spellings() {
+        for status in [
+            "ReservationCancelled",
+            "http://schema.org/Cancelled",
+            "https://schema.org/ReservationCancelled",
+            "canceled",
+        ] {
+            assert!(is_cancelled_status(status), "{status}");
+        }
+        for status in ["ReservationConfirmed", "ReservationPending", ""] {
+            assert!(!is_cancelled_status(status), "{status}");
+        }
     }
 
     #[test]
