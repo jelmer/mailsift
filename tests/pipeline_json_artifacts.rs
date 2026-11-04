@@ -55,7 +55,7 @@ fn replay_flight() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
 fn reservation_json_is_archived_under_year_and_provider() {
     let (_out, reservations, _tickets, _events) = replay_flight();
 
-    let path = reservations.join("2026/fixture-air-fx7qt2.json");
+    let path = reservations.join("2026/fixture-air-fx7qt2-fx123.json");
     let body =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
@@ -155,7 +155,7 @@ fn filed_dates(out: &Path) -> (String, String, String) {
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         serde_json::from_str(&body).expect("valid JSON")
     };
-    let reservation = json(out.join("reservations/2026/fixture-air-fx7qt2.json"));
+    let reservation = json(out.join("reservations/2026/fixture-air-fx7qt2-fx123.json"));
     let sidecar = json(out.join("tickets/2026/fixture-air-fx123-2026-04-10.meta.json"));
 
     let events: Vec<_> = std::fs::read_dir(out.join("events"))

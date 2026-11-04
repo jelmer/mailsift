@@ -489,6 +489,17 @@ pub fn run(
                     &mut summary,
                 );
             }
+            for artifact in &reservations {
+                router::cancel_superseded_legs(
+                    &run.extractor,
+                    artifact,
+                    dir,
+                    event_sink,
+                    seen,
+                    received_at_epoch,
+                    &mut summary,
+                );
+            }
         }
 
         file_or_drop(
