@@ -165,12 +165,14 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 }
 
 /// Decide, from a message file's headers alone, whether any of
-/// `extractors` could match it.
+/// `extractors` could match it. A forward from one of
+/// `trusted_forwarders` is kept: it is unwrapped before dispatch, so
+/// its own headers don't tell.
 ///
 /// Errs on the side of keeping the message: an unreadable file, or one
 /// whose header block doesn't fit the peek window, is passed through
 /// to the pipeline, which will report the problem properly.
-fn could_match_any(path: &Path, extractors: &[Extractor]) -> bool {
+fn could_match_any(path: &Path, extractors: &[Extractor], trusted_forwarders: &[String]) -> bool {
     let header = match read_header_block(path) {
         Ok(Some(h)) => h,
         Ok(None) => {
@@ -185,6 +187,9 @@ fn could_match_any(path: &Path, extractors: &[Extractor]) -> bool {
             return true;
         }
     };
+    if crate::unforward::is_from_trusted_forwarder(&header, trusted_forwarders) {
+        return true;
+    }
     let (from_domain, subject) = pipeline::match_headers_from_raw(&header);
     extractors
         .iter()
@@ -226,7 +231,7 @@ pub fn run(config: MaildirScanConfig<'_>) -> Result<()> {
         // so the sorted enumeration (and hence `--limit`) survives.
         all = all
             .par_iter()
-            .filter(|p| could_match_any(p, config.extractors))
+            .filter(|p| could_match_any(p, config.extractors, config.targets.trusted_forwarders))
             .cloned()
             .collect();
         info!(
@@ -432,7 +437,7 @@ mod tests {
             b"From: Airline <no-reply@flight.fixture.test>\nSubject: fixture-flight AB123\n\nbody",
         )
         .unwrap();
-        assert!(could_match_any(&path, &named("fixture-flight")));
+        assert!(could_match_any(&path, &named("fixture-flight"), &[]));
     }
 
     #[test]
@@ -444,7 +449,7 @@ mod tests {
             b"From: Someone <hi@unrelated.example>\nSubject: fixture-flight AB123\n\nbody",
         )
         .unwrap();
-        assert!(!could_match_any(&path, &named("fixture-flight")));
+        assert!(!could_match_any(&path, &named("fixture-flight"), &[]));
     }
 
     #[test]
@@ -456,14 +461,27 @@ mod tests {
             b"From: Airline <no-reply@flight.fixture.test>\nSubject: newsletter\n\nbody",
         )
         .unwrap();
-        assert!(!could_match_any(&path, &named("fixture-flight")));
+        assert!(!could_match_any(&path, &named("fixture-flight"), &[]));
+    }
+
+    #[test]
+    fn could_match_any_keeps_a_forward_from_a_trusted_sender() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("msg");
+        fs::write(
+            &path,
+            b"From: Friend <friend@example.org>\nSubject: Fwd: your flight\n\nbody",
+        )
+        .unwrap();
+        let trusted = ["friend@example.org".to_string()];
+        assert!(could_match_any(&path, &named("fixture-flight"), &trusted));
     }
 
     #[test]
     fn could_match_any_keeps_an_unreadable_file() {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("does-not-exist");
-        assert!(could_match_any(&path, &named("fixture-flight")));
+        assert!(could_match_any(&path, &named("fixture-flight"), &[]));
     }
 
     #[test]
@@ -494,7 +512,7 @@ mod tests {
         let extractors = named("fixture-flight");
         let kept: Vec<PathBuf> = paths
             .par_iter()
-            .filter(|p| could_match_any(p, &extractors))
+            .filter(|p| could_match_any(p, &extractors, &[]))
             .cloned()
             .collect();
         assert_eq!(kept, expected);
