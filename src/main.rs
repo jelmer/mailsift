@@ -528,9 +528,10 @@ struct ImapScanArgs {
     /// Only run the named extractor. Repeat to select several.
     ///
     /// When every selected extractor declares `from_domains`, the
-    /// `UID SEARCH` is narrowed to those senders so the server never
-    /// returns the other messages. Falls back to the unnarrowed
-    /// search if the server rejects the query.
+    /// `UID SEARCH` is narrowed to those senders and the
+    /// `trusted_forwarders`, so the server never returns the other
+    /// messages. Falls back to the unnarrowed search if the server
+    /// rejects the query.
     #[arg(long = "extractor", value_name = "NAME")]
     only: Vec<String>,
     #[command(flatten)]
@@ -687,6 +688,7 @@ enum Command {
         /// `subject_regex` in its manifest, the scan reads just each
         /// message's headers and skips the ones no selected extractor
         /// could match, rather than parsing every message in full.
+        /// Forwards from `trusted_forwarders` are always read.
         #[arg(long = "extractor", value_name = "NAME")]
         only: Vec<String>,
         #[command(flatten)]

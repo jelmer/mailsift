@@ -90,6 +90,24 @@ pub fn try_unwrap_forwarded(raw: &[u8], trusted_senders: &[String]) -> Option<Un
     None
 }
 
+/// Whether the `From:` of a raw header block is on `trusted`.
+///
+/// For the scan prefilters, which only see headers: a forward is
+/// unwrapped later, so its outer `From` and `Subject` say nothing about
+/// which extractor will want it.
+pub fn is_from_trusted_forwarder(raw_headers: &[u8], trusted: &[String]) -> bool {
+    if trusted.is_empty() {
+        return false;
+    }
+    let Ok((headers, _)) = mailparse::parse_headers(raw_headers) else {
+        return false;
+    };
+    headers
+        .iter()
+        .find(|h| h.get_key_ref().eq_ignore_ascii_case("from"))
+        .is_some_and(|h| is_trusted(&h.get_value(), trusted))
+}
+
 /// Match the outer `From:` header against the trusted-sender list.
 /// Comparison is on the bare email address (case-insensitive); the
 /// list may also contain bare addresses.
@@ -102,7 +120,7 @@ fn is_trusted(from_header: &str, trusted: &[String]) -> bool {
 
 /// Pull the email address out of a header value like
 /// `"Joe Example <joe@example.com>"` or just `joe@example.com`.
-fn extract_email_address(header: &str) -> String {
+pub(crate) fn extract_email_address(header: &str) -> String {
     if let Some(start) = header.rfind('<')
         && let Some(end) = header.rfind('>')
         && end > start
@@ -474,6 +492,23 @@ mod tests {
         let raw = b"From: joe@example.com\r\nSubject: Hi\r\n\r\nplain mail, no forward\r\n";
         let trusted = vec!["joe@example.com".to_string()];
         assert!(try_unwrap_forwarded(raw, &trusted).is_none());
+    }
+
+    #[test]
+    fn headers_from_a_trusted_forwarder() {
+        let trusted = vec!["joe@example.com".to_string()];
+        assert!(is_from_trusted_forwarder(
+            b"From: Joe <JOE@example.com>\r\nSubject: Fwd: a thing\r\n\r\n",
+            &trusted
+        ));
+        assert!(!is_from_trusted_forwarder(
+            b"From: someone@example.com\r\nSubject: Fwd: a thing\r\n\r\n",
+            &trusted
+        ));
+        assert!(!is_from_trusted_forwarder(
+            b"Subject: no sender\r\n\r\n",
+            &trusted
+        ));
     }
 
     #[test]

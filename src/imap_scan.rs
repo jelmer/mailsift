@@ -212,7 +212,8 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
     // let the server drop everything else: no UID for a message we'd
     // only discard in the prefilter. Correctness never rests on this,
     // so a server that rejects the query just costs us the speedup.
-    let mut from_restriction = build_from_restriction(config.extractors);
+    let mut from_restriction =
+        build_from_restriction(config.extractors, config.targets.trusted_forwarders);
     let query = match &from_restriction {
         Some(r) => format!("{base_query} {r}"),
         None => base_query.clone(),
@@ -526,7 +527,7 @@ fn backfill(
 ) -> Result<()> {
     let names: Vec<&str> = changed.iter().map(|e| e.name.as_str()).collect();
     let range = format!("UID 1:{through_uid}");
-    let restriction = build_from_restriction(changed);
+    let restriction = build_from_restriction(changed, config.targets.trusted_forwarders);
     info!(
         extractors = ?names,
         through_uid,
@@ -737,25 +738,18 @@ fn process_uid_set_with_progress(
                 warn!("prefilter FETCH response without UID");
                 continue;
             };
-            let (from_domain, subject) = match message.header() {
-                Some(raw) => pipeline::match_headers_from_raw(raw),
-                None => (None, None),
-            };
             // No BODYSTRUCTURE; fall back to header-only filtering.
             // Shouldn't happen for a well-formed response but isn't
             // fatal; we'd rather fetch the body and have the extractor
             // decide than silently skip a real message.
             let parts = message.bodystructure().map(body_parts_from_structure);
-            let any_match = config.extractors.iter().any(|e| {
-                if !e.matches_headers(from_domain.as_deref(), subject.as_deref()) {
-                    return false;
-                }
-                match &parts {
-                    Some(p) => e.body_could_match(p),
-                    None => true,
-                }
-            });
-            if any_match {
+            let keep = prefilter_keeps(
+                message.header().unwrap_or_default(),
+                parts.as_ref(),
+                config.extractors,
+                config.targets.trusted_forwarders,
+            );
+            if keep {
                 body_set.push(uid);
             } else {
                 stats.prefilter_skipped += 1;
@@ -786,6 +780,26 @@ fn process_uid_set_with_progress(
         }
     }
     Ok(stats)
+}
+
+/// Whether the prefilter fetches a message's body, given its `From` and
+/// `Subject` header block and, when the server sent one, its body
+/// structure. A forward from a trusted sender is always fetched: it is
+/// unwrapped before dispatch, so its own headers don't tell.
+fn prefilter_keeps(
+    header: &[u8],
+    parts: Option<&BodyParts>,
+    extractors: &[crate::extractor::Extractor],
+    trusted_forwarders: &[String],
+) -> bool {
+    if crate::unforward::is_from_trusted_forwarder(header, trusted_forwarders) {
+        return true;
+    }
+    let (from_domain, subject) = pipeline::match_headers_from_raw(header);
+    extractors.iter().any(|e| {
+        e.matches_headers(from_domain.as_deref(), subject.as_deref())
+            && parts.is_none_or(|p| e.body_could_match(p))
+    })
 }
 
 /// Fetch the full messages for `uids` and run the pipeline over them.
@@ -1104,7 +1118,9 @@ fn build_search_query(since: Option<&str>, before: Option<&str>) -> String {
 }
 
 /// The sender restriction to append to a `UID SEARCH`, built from the
-/// selected extractors' `from_domains`.
+/// selected extractors' `from_domains` and the trusted forwarders,
+/// whose forwards are unwrapped later and so come from them rather
+/// than from the vendor.
 ///
 /// `None` means "no restriction is safe": some extractor declares no
 /// `from_domains` at all and so could match a message from any sender.
@@ -1118,7 +1134,10 @@ fn build_search_query(since: Option<&str>, before: Option<&str>) -> String {
 /// per-message prefilter still applies the exact rule afterwards.
 ///
 /// [`Extractor::matches_headers`]: crate::extractor::Extractor::matches_headers
-fn build_from_restriction(extractors: &[crate::extractor::Extractor]) -> Option<String> {
+fn build_from_restriction(
+    extractors: &[crate::extractor::Extractor],
+    trusted_forwarders: &[String],
+) -> Option<String> {
     if extractors.is_empty() {
         return None;
     }
@@ -1134,9 +1153,17 @@ fn build_from_restriction(extractors: &[crate::extractor::Extractor]) -> Option<
     }
     domains.sort_unstable();
     domains.dedup();
+    let mut forwarders: Vec<String> = trusted_forwarders
+        .iter()
+        .map(|f| crate::unforward::extract_email_address(f).to_lowercase())
+        .collect();
+    forwarders.sort_unstable();
+    forwarders.dedup();
 
     let mut terms = domains
         .iter()
+        .copied()
+        .chain(forwarders.iter().map(String::as_str))
         .map(|d| format!("HEADER FROM {}", quote_imap_string(d)));
     let mut query = terms.next()?;
     for term in terms {
@@ -1324,7 +1351,7 @@ mod tests {
     #[test]
     fn from_restriction_for_a_single_extractor() {
         assert_eq!(
-            build_from_restriction(&fixture_extractors(&["fixture-flight"])).as_deref(),
+            build_from_restriction(&fixture_extractors(&["fixture-flight"]), &[]).as_deref(),
             Some(r#"HEADER FROM "flight.fixture.test""#)
         );
     }
@@ -1333,8 +1360,11 @@ mod tests {
     fn from_restriction_ors_several_domains() {
         // Two extractors, one domain each: a single binary OR.
         assert_eq!(
-            build_from_restriction(&fixture_extractors(&["fixture-flight", "fixture-lodging"]))
-                .as_deref(),
+            build_from_restriction(
+                &fixture_extractors(&["fixture-flight", "fixture-lodging"]),
+                &[]
+            )
+            .as_deref(),
             Some(r#"OR HEADER FROM "flight.fixture.test" HEADER FROM "lodging.fixture.test""#)
         );
     }
@@ -1343,11 +1373,14 @@ mod tests {
     fn from_restriction_nests_ors_for_three_domains() {
         // N terms need N-1 prefix ORs; check the nesting shape.
         assert_eq!(
-            build_from_restriction(&fixture_extractors(&[
-                "fixture-flight",
-                "fixture-lodging",
-                "fixture-parcel-status",
-            ]))
+            build_from_restriction(
+                &fixture_extractors(&[
+                    "fixture-flight",
+                    "fixture-lodging",
+                    "fixture-parcel-status",
+                ]),
+                &[]
+            )
             .as_deref(),
             Some(
                 r#"OR OR HEADER FROM "flight.fixture.test" HEADER FROM "lodging.fixture.test" HEADER FROM "parcel.fixture.test""#
@@ -1360,14 +1393,39 @@ mod tests {
         // `fixture-ics-pass` declares only `requires:`, so it could
         // match a message from anyone; narrowing would hide those.
         assert_eq!(
-            build_from_restriction(&fixture_extractors(&["fixture-flight", "fixture-ics-pass"])),
+            build_from_restriction(
+                &fixture_extractors(&["fixture-flight", "fixture-ics-pass"]),
+                &[]
+            ),
             None
         );
     }
 
     #[test]
+    fn from_restriction_includes_trusted_forwarders() {
+        // A trusted forward comes from the forwarder, not the vendor.
+        assert_eq!(
+            build_from_restriction(
+                &fixture_extractors(&["fixture-flight"]),
+                &["Friend@example.org".to_string()]
+            )
+            .as_deref(),
+            Some(r#"OR HEADER FROM "flight.fixture.test" HEADER FROM "friend@example.org""#)
+        );
+    }
+
+    #[test]
+    fn prefilter_keeps_a_forward_from_a_trusted_sender() {
+        let extractors = fixture_extractors(&["fixture-flight"]);
+        let header = b"From: Friend <friend@example.org>\r\nSubject: Fwd: your flight\r\n\r\n";
+        let trusted = ["friend@example.org".to_string()];
+        assert!(prefilter_keeps(header, None, &extractors, &trusted));
+        assert!(!prefilter_keeps(header, None, &extractors, &[]));
+    }
+
+    #[test]
     fn from_restriction_is_none_without_extractors() {
-        assert_eq!(build_from_restriction(&[]), None);
+        assert_eq!(build_from_restriction(&[], &[]), None);
     }
 
     #[test]
