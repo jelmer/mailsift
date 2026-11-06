@@ -397,6 +397,18 @@ For the full extractor contract - manifest fields, dispatch semantics,
 artifact filenames, and how to test one - see
 [README.extractors.md](README.extractors.md).
 
+## Related projects
+
+Two companion dashboards consume mailsift's artifacts and infer higher-level
+structure the extractors deliberately don't:
+
+- [doorstep](https://github.com/jelmer/doorstep) serves the parcels directory
+  over HTTP and keeps the records fresh by polling carriers' own tracking
+  APIs, merging updates back into the same files mailsift writes.
+- [wayfare](https://github.com/jelmer/wayfare) reads the reservations and
+  tickets directories, groups the bookings that belong to the same trip, and
+  serves them as a TripIt-style timeline.
+
 ## Development
 
 ```sh
