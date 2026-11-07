@@ -306,6 +306,7 @@ fn maybe_prune(path: &Path, now_ts: i64) -> Result<()> {
 
 /// Aggregated counts for one extractor, computed by [`aggregate`].
 #[derive(Debug, Default, Serialize)]
+#[cfg_attr(feature = "web", derive(utoipa::ToSchema))]
 pub struct ExtractorStats {
     pub name: String,
     pub runs: u64,
@@ -379,6 +380,7 @@ pub fn aggregate(path: &Path) -> Result<Vec<ExtractorStats>> {
 /// everything a human needs to triage: when, which extractor, which
 /// sender domain, and the (truncated) error the pipeline logged.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "web", derive(utoipa::ToSchema))]
 pub struct RecentFailure {
     pub ts: i64,
     pub extractor: String,

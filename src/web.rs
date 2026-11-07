@@ -29,6 +29,10 @@ use iso_currency::Currency;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::info;
+use utoipa::OpenApi;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::config::Config;
 
@@ -214,38 +218,68 @@ async fn serve_unix(path: &Path, app: Router, mode: u32) -> Result<()> {
     }
 }
 
+/// Base OpenAPI metadata. The actual paths and schemas are gathered
+/// by [`utoipa_axum`] as each `#[utoipa::path]`-annotated handler is
+/// registered via `routes!`; what's listed here are only the extra
+/// schemas (`Artifact`, stats types) that aren't referenced by any
+/// handler's own `#[utoipa::path(... body = T)]` and would otherwise
+/// be dropped from the spec.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "mailsift",
+        description = "Read-only JSON API over the mailsift artifact directories. Paired \
+                       with the HTML dashboard under the same server.",
+    ),
+    components(schemas(
+        Artifact,
+        crate::stats::ExtractorStats,
+        crate::stats::RecentFailure,
+    )),
+    tags(
+        (name = "artifacts", description = "Extracted artifact records (bills, parcels, receipts, subscriptions, reservations)."),
+        (name = "stats", description = "Pipeline event-log aggregates."),
+    ),
+)]
+struct ApiDoc;
+
 fn router(state: Arc<AppState>) -> Router {
+    let (api_router, api_doc) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .routes(routes!(api_bills))
+        .routes(routes!(api_parcels))
+        .routes(routes!(api_receipts))
+        .routes(routes!(api_subscriptions))
+        .routes(routes!(api_reservations))
+        .routes(routes!(api_stats))
+        .routes(routes!(api_recent_failures))
+        .split_for_parts();
+
     Router::new()
         .route("/", get(index))
         .route("/all", get(list_all))
         .route("/events", get(list_events))
-        .route("/events/:name", get(get_event))
+        .route("/events/{name}", get(get_event))
         .route("/bills", get(list_bills))
-        .route("/bills/:year/:slug/view", get(view_bill))
-        .route("/bills/:year/:name", get(get_bill))
+        .route("/bills/{year}/{slug}/view", get(view_bill))
+        .route("/bills/{year}/{name}", get(get_bill))
         .route("/parcels", get(list_parcels))
-        .route("/parcels/:name/view", get(view_parcel))
-        .route("/parcels/:name", get(get_parcel))
+        .route("/parcels/{name}/view", get(view_parcel))
+        .route("/parcels/{name}", get(get_parcel))
         .route("/receipts", get(list_receipts))
-        .route("/receipts/:year/:slug/view", get(view_receipt))
-        .route("/receipts/:year/:name", get(get_receipt))
+        .route("/receipts/{year}/{slug}/view", get(view_receipt))
+        .route("/receipts/{year}/{name}", get(get_receipt))
         .route("/subscriptions", get(list_subscriptions))
-        .route("/subscriptions/:name/view", get(view_subscription))
-        .route("/subscriptions/:name", get(get_subscription))
+        .route("/subscriptions/{name}/view", get(view_subscription))
+        .route("/subscriptions/{name}", get(get_subscription))
         .route("/reservations", get(list_reservations))
-        .route("/reservations/:year/:slug/view", get(view_reservation))
-        .route("/reservations/:year/:name", get(get_reservation))
+        .route("/reservations/{year}/{slug}/view", get(view_reservation))
+        .route("/reservations/{year}/{name}", get(get_reservation))
         .route("/tickets", get(list_tickets))
-        .route("/tickets/:year/:slug/view", get(view_ticket))
-        .route("/tickets/:year/:name", get(get_ticket))
+        .route("/tickets/{year}/{slug}/view", get(view_ticket))
+        .route("/tickets/{year}/{name}", get(get_ticket))
         .route("/stats", get(show_stats))
-        .route("/api/bills.json", get(api_bills))
-        .route("/api/parcels.json", get(api_parcels))
-        .route("/api/receipts.json", get(api_receipts))
-        .route("/api/subscriptions.json", get(api_subscriptions))
-        .route("/api/reservations.json", get(api_reservations))
-        .route("/api/stats.json", get(api_stats))
-        .route("/api/recent-failures.json", get(api_recent_failures))
+        .merge(api_router)
+        .merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", api_doc))
         .fallback(not_found)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -818,14 +852,33 @@ fn short_datetime(raw: &str) -> String {
     short_date(raw)
 }
 
+/// OpenAPI placeholder for the free-form artifact JSON objects the
+/// `/api/*.json` endpoints return. The real shape is kind-specific and
+/// defined by each extractor, so this schema is an open object.
+///
+/// Year-sharded kinds (bills, receipts, reservations) also include
+/// `_year` and `_slug` string fields injected by the server.
+#[derive(utoipa::ToSchema)]
+#[schema(
+    description = "Free-form artifact JSON object. Year-sharded kinds also include `_year` and `_slug` string fields injected by the server."
+)]
+#[allow(dead_code)]
+struct Artifact(serde_json::Value);
+
 /// Query parameters shared by every list page: pagination, a
 /// substring search, and a shard-year filter. All fields are optional
 /// and lenient — values that don't parse fall back to `None` rather
 /// than 400ing a shared URL.
-#[derive(Default)]
+#[derive(Default, utoipa::IntoParams, utoipa::ToSchema)]
+#[into_params(parameter_in = Query)]
 struct ListQuery {
+    /// 1-indexed page number. Values that don't parse fall back to page 1.
     page: Option<usize>,
+    /// Case-insensitive substring filter applied across every string
+    /// leaf of the artifact JSON.
     q: Option<String>,
+    /// Year-shard filter for year-sharded kinds (bills, receipts,
+    /// reservations, tickets). Ignored on flat kinds.
     year: Option<String>,
 }
 
@@ -2949,6 +3002,19 @@ fn content_type_for(name: &str) -> &'static str {
     }
 }
 
+/// List all bill artifacts. Year-sharded: each item has `_year` and
+/// `_slug` fields injected alongside the extractor's own JSON payload.
+#[utoipa::path(
+    get,
+    path = "/api/bills.json",
+    tag = "artifacts",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "Bill artifacts, filtered by `q`/`year`.", body = [Artifact]),
+        (status = 404, description = "`bills_dir` is not configured."),
+        (status = 500, description = "I/O or JSON parse error."),
+    ),
+)]
 async fn api_bills(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
@@ -2969,6 +3035,18 @@ async fn api_bills(
     Ok(Json(Value::Array(items)))
 }
 
+/// List all parcel artifacts. Flat directory, no year shard.
+#[utoipa::path(
+    get,
+    path = "/api/parcels.json",
+    tag = "artifacts",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "Parcel artifacts, filtered by `q`.", body = [Artifact]),
+        (status = 404, description = "`parcels_dir` is not configured."),
+        (status = 500, description = "I/O or JSON parse error."),
+    ),
+)]
 async fn api_parcels(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
@@ -2982,6 +3060,19 @@ async fn api_parcels(
     Ok(Json(Value::Array(items)))
 }
 
+/// List all receipt artifacts. Year-sharded: each item has `_year` and
+/// `_slug` fields injected alongside the extractor's own JSON payload.
+#[utoipa::path(
+    get,
+    path = "/api/receipts.json",
+    tag = "artifacts",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "Receipt artifacts, filtered by `q`/`year`.", body = [Artifact]),
+        (status = 404, description = "`receipts_dir` is not configured."),
+        (status = 500, description = "I/O or JSON parse error."),
+    ),
+)]
 async fn api_receipts(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
@@ -3002,6 +3093,18 @@ async fn api_receipts(
     Ok(Json(Value::Array(items)))
 }
 
+/// List all subscription artifacts. Flat directory, no year shard.
+#[utoipa::path(
+    get,
+    path = "/api/subscriptions.json",
+    tag = "artifacts",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "Subscription artifacts, filtered by `q`.", body = [Artifact]),
+        (status = 404, description = "`subscriptions_dir` is not configured."),
+        (status = 500, description = "I/O or JSON parse error."),
+    ),
+)]
 async fn api_subscriptions(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
@@ -3015,6 +3118,20 @@ async fn api_subscriptions(
     Ok(Json(Value::Array(items)))
 }
 
+/// List all reservation artifacts. Year-sharded: each item has `_year`
+/// and `_slug` fields injected alongside the extractor's own JSON
+/// payload.
+#[utoipa::path(
+    get,
+    path = "/api/reservations.json",
+    tag = "artifacts",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "Reservation artifacts, filtered by `q`/`year`.", body = [Artifact]),
+        (status = 404, description = "`reservations_dir` is not configured."),
+        (status = 500, description = "I/O or JSON parse error."),
+    ),
+)]
 async fn api_reservations(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
@@ -3188,6 +3305,17 @@ fn render_recent_failures(failures: &[crate::stats::RecentFailure]) -> String {
     )
 }
 
+/// Aggregated per-extractor pipeline statistics, sorted by run count
+/// descending. Returns an empty array when the event log is missing.
+#[utoipa::path(
+    get,
+    path = "/api/stats.json",
+    tag = "stats",
+    responses(
+        (status = 200, description = "Per-extractor aggregates.", body = [crate::stats::ExtractorStats]),
+        (status = 500, description = "I/O error reading the event log."),
+    ),
+)]
 async fn api_stats(State(_state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
     let Some(log_path) = crate::stats::default_log_path() else {
         return Ok(Json(Value::Array(vec![])));
@@ -3199,6 +3327,17 @@ async fn api_stats(State(_state): State<Arc<AppState>>) -> Result<Json<Value>, A
     Ok(Json(serde_json::to_value(stats)?))
 }
 
+/// Recent extractor failures, newest first. Returns an empty array
+/// when the event log is missing.
+#[utoipa::path(
+    get,
+    path = "/api/recent-failures.json",
+    tag = "stats",
+    responses(
+        (status = 200, description = "Recent extractor failures.", body = [crate::stats::RecentFailure]),
+        (status = 500, description = "I/O error reading the event log."),
+    ),
+)]
 async fn api_recent_failures(State(_state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
     let Some(log_path) = crate::stats::default_log_path() else {
         return Ok(Json(Value::Array(vec![])));
@@ -3641,6 +3780,42 @@ mod tests {
         let (status, body) = get(&app, "/all").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("All artifacts"));
+    }
+
+    #[tokio::test]
+    async fn openapi_json_lists_every_api_endpoint() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/api-docs/openapi.json").await;
+        assert_eq!(status, StatusCode::OK);
+        let spec: Value = serde_json::from_str(&body).expect("not valid JSON");
+        let paths = spec["paths"].as_object().expect("no paths");
+        for route in [
+            "/api/bills.json",
+            "/api/parcels.json",
+            "/api/receipts.json",
+            "/api/subscriptions.json",
+            "/api/reservations.json",
+            "/api/stats.json",
+            "/api/recent-failures.json",
+        ] {
+            assert!(paths.contains_key(route), "missing {route} in spec");
+        }
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("no schemas");
+        for schema in ["Artifact", "ExtractorStats", "RecentFailure"] {
+            assert!(schemas.contains_key(schema), "missing schema {schema}");
+        }
+    }
+
+    #[tokio::test]
+    async fn swagger_ui_served_at_api_docs() {
+        let (_tmp, config) = fixture();
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/api-docs/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("swagger-ui"), "no swagger-ui marker in page");
     }
 
     #[tokio::test]

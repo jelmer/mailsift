@@ -18,11 +18,11 @@ smtp = ["lettre/smtp-transport", "lettre/tokio1-rustls-tls"]
 # JMAP (RFC 8620/8621) mailbox watcher (`mailsift jmap-watch`).
 jmap = ["dep:jmap-client", "dep:futures-util"]
 # Read-only HTTP dashboard for the artifact directories (`mailsift web`).
-web = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-service"]
+web = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-service", "dep:utoipa", "dep:utoipa-axum", "dep:utoipa-swagger-ui"]
 
 [dependencies]
 anyhow = "1"
-axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "query", "json"], optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json"], optional = true }
 base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
@@ -65,6 +65,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 wait-timeout = "0.2"
 iso_currency = "0.7.1"
+utoipa = { version = "6", optional = true }
+utoipa-axum = { version = "0.3", optional = true }
+utoipa-swagger-ui = { version = "10", default-features = false, features = ["axum", "url"], optional = true }
 
 [dev-dependencies]
 assert_cmd = "2"
