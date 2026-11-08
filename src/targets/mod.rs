@@ -114,6 +114,9 @@ pub trait EventSink {
 pub enum EventSinkKind {
     LocalDir(PathBuf),
     Caldav(caldav::CaldavSink),
+    /// Drop events with a warning when no event sink is configured
+    /// (e.g. `mailsift web` running without `events_dir` or `[caldav]`).
+    Disabled,
 }
 
 impl EventSink for EventSinkKind {
@@ -121,6 +124,13 @@ impl EventSink for EventSinkKind {
         match self {
             EventSinkKind::LocalDir(dir) => local_events::file_single(event, dir),
             EventSinkKind::Caldav(sink) => sink.file(event),
+            EventSinkKind::Disabled => {
+                warn!(
+                    uid = %event.uid,
+                    "event emitted, but no event sink (events_dir / [caldav]) is configured; dropping"
+                );
+                Ok(FileOutcome::Kept(String::new()))
+            }
         }
     }
 }
