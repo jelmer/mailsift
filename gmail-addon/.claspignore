@@ -1,0 +1,5 @@
+# Only push Apps Script runtime files
+**/**
+!appsscript.json
+!Code.js
+!Matcher.js
