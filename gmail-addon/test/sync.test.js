@@ -242,3 +242,33 @@ test('background sync stops retrying a failed message once it leaves the lookbac
   addon.context.syncMatchingEmails();
   assert.deepEqual(addon.uploads, ['t0-m0', 't0-m0']);
 });
+
+test('a step keeps going past five threads while within its time budget', () => {
+  const addon = loadAddon({
+    threads: Array.from({ length: 20 }, (_, i) => ({ id: `t${i}`, messages: 1 })),
+    manifests: [narrow],
+  });
+
+  addon.context.onSyncNow();
+
+  const state = addon.syncState();
+  assert.equal(state.threadsDone, 20);
+  assert.equal(state.done, true);
+});
+
+test('Sync Next Batch continues using commonEventObject parameters', () => {
+  const addon = loadAddon({
+    threads: [{ id: 't0', messages: 12 }],
+    manifests: [catchAll],
+  });
+  addon.context.onSyncNow();
+  const first = addon.uploads.length;
+
+  addon.context.onSyncNow({
+    commonEventObject: { parameters: { continueBatch: 'true' } },
+  });
+
+  assert.ok(addon.uploads.length > first);
+  // A restarted sync would have reset the counters.
+  assert.equal(addon.syncState().scannedMessages, addon.uploads.length);
+});

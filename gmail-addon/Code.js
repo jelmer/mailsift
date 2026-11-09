@@ -31,7 +31,7 @@ const SEARCH_PAGE_SIZE = 100;
 // 30s, and one message (Gmail fetches plus the server running the
 // extraction pipeline) has to fit in the remainder.
 const UI_BATCH_MAX_DURATION_MS = 10000;
-const UI_BATCH_THREADS = 5;
+const UI_SYNC_MAX_THREADS = 50;
 
 /**
  * Load user settings from `PropertiesService`.
@@ -922,8 +922,12 @@ function onUploadCurrentMessage(e) {
   if (e && e.gmail && e.gmail.accessToken) {
     GmailApp.setCurrentMessageAccessToken(e.gmail.accessToken);
   }
-  const messageId = e.parameters.messageId;
-  const dryRun = e.parameters.dryRun === 'true';
+  const params = getActionParameters(e);
+  const messageId = params.messageId;
+  if (!messageId) {
+    throw new Error('Upload action is missing its messageId parameter');
+  }
+  const dryRun = params.dryRun === 'true';
   const message = GmailApp.getMessageById(messageId);
   const dateObj = message.getDate();
   const receivedAtEpoch = dateObj
@@ -958,6 +962,26 @@ function onUploadCurrentMessage(e) {
       )
       .build();
   }
+}
+
+/**
+ * Return the parameters set on the action that triggered `e`, or `{}`
+ * when there are none (e.g. the universal "Sync Matching Emails" action).
+ * Workspace add-ons pass them in `commonEventObject.parameters`; older
+ * Gmail add-on events used `parameters`.
+ *
+ * @param {Object=} e
+ * @return {Object<string, string>}
+ */
+function getActionParameters(e) {
+  if (!e) {
+    return {};
+  }
+  return (
+    (e.commonEventObject && e.commonEventObject.parameters) ||
+    e.parameters ||
+    {}
+  );
 }
 
 /**
@@ -1037,7 +1061,7 @@ function saveSyncState(state) {
 }
 
 /**
- * Run a single fast interactive sync batch (~4 seconds max) and return
+ * Run one time-bounded interactive sync step and return
  * an updated Progress Card showing a visual progress bar, live counters,
  * and a list of matched messages with links to Mailsift.
  *
@@ -1045,8 +1069,7 @@ function saveSyncState(state) {
  * @return {GoogleAppsScript.Card_Service.ActionResponse}
  */
 function onSyncNow(e) {
-  const reset =
-    !e || !e.parameters || e.parameters.continueBatch !== 'true';
+  const reset = getActionParameters(e).continueBatch !== 'true';
   try {
     const state = runInteractiveSyncStep(reset);
     const card = buildSyncProgressCard(state);
@@ -1119,16 +1142,17 @@ function runInteractiveSyncStep(reset) {
   const checkedIds = loadCheckedMessageIds();
 
   if (reset || state.totalThreads === 0) {
-    const allCandidateThreads = GmailApp.search(query, 0, 50);
+    const allCandidateThreads = GmailApp.search(query, 0, UI_SYNC_MAX_THREADS);
     state.totalThreads = allCandidateThreads.length;
     state.offset = 0;
     state.threadsDone = 0;
   }
 
+  // How many threads fit in this step is up to the time budget.
   const batchThreads = GmailApp.search(
     query,
     state.offset,
-    UI_BATCH_THREADS
+    Math.max(state.totalThreads - state.threadsDone, 1)
   );
   if (batchThreads.length === 0) {
     state.done = true;
