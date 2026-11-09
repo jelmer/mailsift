@@ -174,7 +174,47 @@ pub enum ExplainOutcome {
         receipts: u32,
         tickets: u32,
         subscriptions: u32,
+        /// The JSON artifacts among them, as the extractor wrote them.
+        records: Vec<ProducedRecord>,
     },
+}
+
+/// A JSON artifact an extractor produced, for callers that show what
+/// was extracted.
+#[derive(Debug)]
+pub struct ProducedRecord {
+    pub kind: Kind,
+    pub data: serde_json::Value,
+}
+
+/// Parse the JSON artifacts among `artifacts` for an [`ExplainRecord`].
+/// One that can't be read or parsed is left out with a warning; filing
+/// it fails (and is logged) the same way.
+fn produced_records<'a>(
+    extractor: &str,
+    artifacts: impl IntoIterator<Item = &'a Artifact>,
+) -> Vec<ProducedRecord> {
+    artifacts
+        .into_iter()
+        .filter(|a| a.ext == "json")
+        .filter_map(|a| {
+            let parsed = std::fs::read(&a.path)
+                .map_err(anyhow::Error::from)
+                .and_then(|raw| Ok(serde_json::from_slice(&raw)?));
+            match parsed {
+                Ok(data) => Some(ProducedRecord { kind: a.kind, data }),
+                Err(e) => {
+                    warn!(
+                        extractor,
+                        path = %a.path.display(),
+                        error = format!("{e:#}"),
+                        "unreadable JSON artifact"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// Run every discovered extractor against `raw` and route the artifacts
@@ -446,6 +486,17 @@ pub fn run(
                     receipts: (receipt_arts.len() + receipt_blob_arts.len()) as u32,
                     tickets: ticket_arts.len() as u32,
                     subscriptions: subscription_arts.len() as u32,
+                    records: produced_records(
+                        &run.extractor,
+                        reservations
+                            .iter()
+                            .chain(&bill_arts)
+                            .chain(&parcel_arts)
+                            .chain(&receipt_arts)
+                            .chain(&ticket_records)
+                            .chain(&subscription_arts)
+                            .copied(),
+                    ),
                 },
             });
         }

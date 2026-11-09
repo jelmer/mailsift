@@ -1276,6 +1276,7 @@ fn print_explain(
                     receipts,
                     tickets,
                     subscriptions,
+                    records: _,
                 } => {
                     let total = events
                         + reservations
