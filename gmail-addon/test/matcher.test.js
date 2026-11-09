@@ -9,6 +9,7 @@ const {
   extractPassingDkimDomains,
   satisfiesDkim,
   matchMessage,
+  hasLdJsonBlock,
   buildGmailSearchQuery,
 } = require('../Matcher.js');
 
@@ -123,6 +124,35 @@ test('matchMessage filters manifests by from_domains, subject_regex, requires, a
 
   assert.equal(matched.length, 1);
   assert.equal(matched[0].name, 'easyjet');
+});
+
+test('matchMessage only matches schema-ld when the HTML has an ld+json block', () => {
+  const manifests = [{ name: 'schema-ld', order: 10, requires: ['html'] }];
+  const msg = (hasLdJson) => ({
+    from: 'Example Hotel <bookings@hotel.example>',
+    subject: 'Your stay',
+    bodyParts: {
+      hasHtml: true,
+      hasText: true,
+      hasLdJson,
+      mimeTypes: ['text/html', 'text/plain'],
+      attachmentFilenames: [],
+    },
+  });
+
+  assert.deepEqual(
+    matchMessage(manifests, msg(true)).map((m) => m.name),
+    ['schema-ld']
+  );
+  assert.deepEqual(matchMessage(manifests, msg(false)), []);
+});
+
+test('hasLdJsonBlock detects ld+json script tags', () => {
+  assert.equal(
+    hasLdJsonBlock('<script TYPE="Application/LD+JSON">{}</script>'),
+    true
+  );
+  assert.equal(hasLdJsonBlock('<p>application/json</p>'), false);
 });
 
 test('buildGmailSearchQuery narrows from: when all extractors constrain from_domains', () => {

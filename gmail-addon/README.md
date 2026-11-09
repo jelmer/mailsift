@@ -5,6 +5,7 @@ A Google Workspace Add-on for Gmail that fetches extractor manifests from a `mai
 ## Features
 
 - **Contextual Sidebar Trigger**: When opening an email in Gmail, checks whether the message matches any extractor manifest from your Mailsift server, optionally auto-uploads matching messages, and shows a button to upload (or dry-run) any email manually.
+- **schema-ld Prefilter**: The `schema-ld` extractor's manifest only requires an HTML body, so the add-on additionally requires an `application/ld+json` block in the HTML before treating a message as a match. Otherwise nearly every HTML email would be uploaded.
 - **Background Sync**: Scans recent Gmail threads (`newer_than:7d -label:Mailsift`, narrowed to `from:(...)` when all extractors declare `from_domains`), uploads matching raw RFC822 messages, and applies the `Mailsift` label. Can be triggered manually from the add-on or run automatically every hour via an Apps Script time-driven trigger.
 - **External Auth Support**: Supports an optional `Authorization` header (`Bearer <token>` or `Basic <credentials>`) in Settings for Mailsift servers behind an authenticating reverse proxy.
 

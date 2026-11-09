@@ -5,7 +5,7 @@ const { loadAddon } = require('./fakes.js');
 // Card actions are killed after this long.
 const CARD_ACTION_LIMIT_MS = 30000;
 
-const catchAll = { name: 'schema-ld', order: 10, requires: ['html'] };
+const catchAll = { name: 'any-html', order: 10, requires: ['html'] };
 const narrow = { name: 'dhl', order: 20, from_domains: ['dhl.example'] };
 
 function messageIds(threadId, count) {
@@ -74,7 +74,7 @@ test('a message the server rejects does not block the rest of the sync', () => {
   assert.deepEqual(state.failures, [
     {
       subject: 'Order t0 update 0',
-      extractors: 'schema-ld',
+      extractors: 'any-html',
       error: 'POST /api/messages failed with HTTP 500: extractor crashed',
     },
   ]);
@@ -106,4 +106,20 @@ test('background sync uploads the remaining messages and then reports failures',
 
   assert.throws(() => addon.context.syncMatchingEmails());
   assert.deepEqual(addon.uploads, ['t0-m0', 't1-m0', 't0-m0']);
+});
+
+test('schema-ld mail without ld+json is not uploaded', () => {
+  const schemaLd = { name: 'schema-ld', order: 10, requires: ['html'] };
+  const addon = loadAddon({
+    threads: [
+      { id: 't0', messages: 1 },
+      { id: 't1', messages: 1, html: '<script type="application/ld+json">{}</script>' },
+    ],
+    manifests: [schemaLd],
+  });
+
+  addon.context.runInteractiveSyncStep(true);
+
+  assert.deepEqual(addon.uploads, ['t1-m0']);
+  assert.deepEqual(addon.labelled(), ['t1']);
 });

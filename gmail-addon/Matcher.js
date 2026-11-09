@@ -88,11 +88,28 @@ function matchesFilenamePattern(pattern, filename) {
   return name === pat;
 }
 
+// schema-ld's manifest only requires an HTML body, which nearly all mail
+// has, but its script does nothing unless the HTML carries an ld+json
+// block. Without this check the add-on would upload all HTML mail.
+// TODO: replace with a manifest rule if mailsift grows one for this.
+const SCHEMA_LD_EXTRACTOR = 'schema-ld';
+
+/**
+ * Check whether an HTML body has a `<script type="application/ld+json">`
+ * block, the only thing the schema-ld extractor reads.
+ *
+ * @param {string} html
+ * @return {boolean}
+ */
+function hasLdJsonBlock(html) {
+  return /application\/ld\+json/i.test(html);
+}
+
 /**
  * Check a single `requires:` entry against a message's body summary.
  *
  * @param {string} req
- * @param {Object} bodyParts `{ hasHtml, hasText, mimeTypes, attachmentFilenames }`
+ * @param {Object} bodyParts `{ hasHtml, hasText, hasLdJson, mimeTypes, attachmentFilenames }`
  * @return {boolean}
  */
 function satisfiesBodyRequirement(req, bodyParts) {
@@ -238,7 +255,7 @@ function matchHeaders(manifests, headers) {
  * @param {Object} msg
  *   - `from`: `From:` header string
  *   - `subject`: `Subject:` header string
- *   - `bodyParts`: optional `{ hasHtml, hasText, mimeTypes, attachmentFilenames }`
+ *   - `bodyParts`: optional `{ hasHtml, hasText, hasLdJson, mimeTypes, attachmentFilenames }`
  *   - `rawRfc822`: optional raw RFC822 string (for DKIM inspection)
  *   - `receivedAtEpoch`: optional unix epoch seconds
  * @return {Array<Object>} matching manifests
@@ -258,6 +275,13 @@ function matchMessage(manifests, msg) {
       if (!allHold) {
         return false;
       }
+    }
+    if (
+      manifest.name === SCHEMA_LD_EXTRACTOR &&
+      msg.bodyParts &&
+      !msg.bodyParts.hasLdJson
+    ) {
+      return false;
     }
 
     const requireDkim = manifest.require_dkim || [];
@@ -349,6 +373,7 @@ if (typeof module !== 'undefined' && module.exports) {
     compileSubjectRegex,
     matchesFilenamePattern,
     satisfiesBodyRequirement,
+    hasLdJsonBlock,
     extractPassingDkimDomains,
     satisfiesDkim,
     matchHeaders,

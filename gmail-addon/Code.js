@@ -335,6 +335,7 @@ function inspectMessageBodyParts(message) {
   return {
     hasHtml: Boolean(htmlBody),
     hasText: Boolean(plainBody),
+    hasLdJson: hasLdJsonBlock(htmlBody),
     mimeTypes,
     attachmentFilenames,
   };

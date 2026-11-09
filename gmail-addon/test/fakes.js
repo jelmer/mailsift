@@ -28,7 +28,7 @@ function response(code, text) {
 
 /**
  * @param {Object} opts
- * @param {Array<{id: string, messages: number}>} opts.threads
+ * @param {Array<{id: string, messages: number, html?: string}>} opts.threads
  * @param {Array<Object>} opts.manifests
  * @param {Object=} opts.cost
  * @param {Set<string>=} opts.failIds message IDs the server rejects
@@ -46,6 +46,7 @@ function loadAddon({ threads, manifests, cost, failIds }) {
   const mailbox = threads.map((t) => ({
     id: t.id,
     messages: t.messages,
+    html: t.html || '<p>Your order</p>',
     labels: new Set(),
   }));
 
@@ -58,7 +59,7 @@ function loadAddon({ threads, manifests, cost, failIds }) {
       tick(cost.body);
       return [];
     },
-    getBody: () => '<p>Your order</p>',
+    getBody: () => t.html,
     getPlainBody: () => 'Your order',
     getRawContent: () => {
       tick(cost.raw);
