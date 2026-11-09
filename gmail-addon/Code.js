@@ -18,6 +18,13 @@ const CACHE_MSG_RESULT_PREFIX = 'MAILSIFT_MSG_RES_';
 const CACHE_TTL_SECONDS = 3600; // 1 hour
 const MSG_RESULT_TTL_SECONDS = 21600; // 6 hours
 const DEFAULT_PROCESSED_LABEL = 'Mailsift';
+const PROP_SYNC_CURSOR = 'MAILSIFT_SYNC_CURSOR';
+const PROP_SYNC_RETRIES = 'MAILSIFT_SYNC_RETRIES';
+const SYNC_LOOKBACK_SECONDS = 7 * 86400;
+// Gmail can take a while to index new mail, so the background sync
+// searches this far before its cursor; checkedIds skips repeats.
+const SYNC_OVERLAP_SECONDS = 3600;
+const SEARCH_PAGE_SIZE = 100;
 // Stop starting new messages after this long. Card actions are killed at
 // 30s, and one message (Gmail fetches plus the server running the
 // extraction pipeline) has to fit in the remainder.
@@ -1346,77 +1353,191 @@ function onBackToHome() {
 }
 
 /**
- * Background time-driven trigger entrypoint: scans recent Gmail threads
- * with a 4-minute budget.
+ * Read the background sync cursor: the unix time (seconds) up to which
+ * mail has been synced, or `null` before the first run.
  *
- * Messages the server rejects are skipped and their threads left
- * unlabelled, so the next run retries them; the run then throws so the
- * failure shows up in the trigger's execution log and failure emails.
+ * @param {GoogleAppsScript.Properties.Properties} props
+ * @return {number|null}
+ */
+function loadSyncCursor(props) {
+  const raw = props.getProperty(PROP_SYNC_CURSOR);
+  if (raw === null) {
+    return null;
+  }
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(
+      `Invalid ${PROP_SYNC_CURSOR} property: ${JSON.stringify(raw)}`
+    );
+  }
+  return Number(raw);
+}
+
+/**
+ * Read the messages whose upload failed in an earlier background run.
+ *
+ * @param {GoogleAppsScript.Properties.Properties} props
+ * @return {Array<{id: string, error: string}>}
+ */
+function loadSyncRetries(props) {
+  const raw = props.getProperty(PROP_SYNC_RETRIES);
+  if (raw === null) {
+    return [];
+  }
+  const retries = JSON.parse(raw);
+  if (!Array.isArray(retries)) {
+    throw new Error(`Invalid ${PROP_SYNC_RETRIES} property: ${raw}`);
+  }
+  return retries;
+}
+
+/**
+ * List the messages in threads matching `query` that were received after
+ * `sinceEpoch`.
+ *
+ * @param {string} query
+ * @param {number} sinceEpoch unix seconds
+ * @return {Array<{message: GoogleAppsScript.Gmail.GmailMessage, date: number}>}
+ */
+function listMessagesSince(query, sinceEpoch) {
+  const threads = [];
+  for (let start = 0; ; start += SEARCH_PAGE_SIZE) {
+    const page = GmailApp.search(query, start, SEARCH_PAGE_SIZE);
+    threads.push(...page);
+    if (page.length < SEARCH_PAGE_SIZE) {
+      break;
+    }
+  }
+  const entries = [];
+  for (const messages of GmailApp.getMessagesForThreads(threads)) {
+    for (const message of messages) {
+      const date = message.getDate().getTime() / 1000;
+      if (date > sinceEpoch) {
+        entries.push({ message, date });
+      }
+    }
+  }
+  return entries;
+}
+
+/**
+ * Background time-driven trigger entrypoint.
+ *
+ * Works through mail received since the cursor saved by the previous run
+ * (at most `SYNC_LOOKBACK_SECONDS` back), oldest first, and moves the
+ * cursor up to the last message handled, so a run that hits the time
+ * budget is continued by the next one. Labelled threads are searched
+ * too, so replies to them aren't missed.
+ *
+ * Messages the server rejects are kept in a retry list and tried again
+ * by later runs until they fall out of the lookback window. The run
+ * throws after finishing if anything failed, so failures show up in the
+ * trigger's execution log and failure emails.
  *
  * @return {Object} `{ scanned, matched, uploaded, timedOut }`
  */
 function syncMatchingEmails() {
   const maxDurationMs = 240000;
   const startMs = Date.now();
+  const startEpoch = Math.floor(startMs / 1000);
+  const oldestEpoch = startEpoch - SYNC_LOOKBACK_SECONDS;
   const settings = getSettings();
+  const props = PropertiesService.getUserProperties();
   const extractors = getExtractors(false);
-  const query = buildGmailSearchQuery(extractors, {
-    newerThanDays: 7,
-    excludeLabel: settings.processedLabel,
-  });
+  const cursor = Math.max(loadSyncCursor(props) || 0, oldestEpoch);
+  const sinceEpoch = cursor - SYNC_OVERLAP_SECONDS;
+  const query = buildGmailSearchQuery(extractors, { afterEpoch: sinceEpoch });
+
+  const entries = listMessagesSince(query, sinceEpoch);
+  const listed = new Set(entries.map((e) => e.message.getId()));
+  const abandoned = [];
+  let retries = [];
+  for (const retry of loadSyncRetries(props)) {
+    if (listed.has(retry.id)) {
+      retries.push(retry);
+      continue;
+    }
+    const message = GmailApp.getMessageById(retry.id);
+    if (!message) {
+      abandoned.push(`${retry.id}: message no longer exists`);
+      continue;
+    }
+    const date = message.getDate().getTime() / 1000;
+    if (date < oldestEpoch) {
+      abandoned.push(`${retry.id}: ${retry.error}`);
+      continue;
+    }
+    retries.push(retry);
+    entries.push({ message, date });
+  }
+  entries.sort((a, b) => a.date - b.date);
 
   const checkedIds = loadCheckedMessageIds();
-  const threads = GmailApp.search(query, 0, 30);
+  const handledIds = new Set();
+  const failed = [];
+  const labelledThreads = new Set();
+  let newCursor = cursor;
   let scanned = 0;
   let matchedCount = 0;
   let uploadedCount = 0;
   let timedOut = false;
-  const failures = [];
 
   try {
-    for (const thread of threads) {
-      if (timedOut) {
+    for (const { message, date } of entries) {
+      if (Date.now() - startMs > maxDurationMs) {
+        timedOut = true;
         break;
       }
-      let threadHadMatch = false;
-      let threadFailed = false;
-      for (const message of thread.getMessages()) {
-        if (Date.now() - startMs > maxDurationMs) {
-          timedOut = true;
-          break;
-        }
-        const msgId = message.getId();
-        if (checkedIds.has(msgId)) {
-          continue;
-        }
+      const msgId = message.getId();
+      if (!checkedIds.has(msgId)) {
         scanned++;
         const { matching, result, error } = syncMessage(extractors, message);
         if (matching.length > 0) {
           matchedCount++;
         }
         if (error) {
-          threadFailed = true;
-          failures.push(`${msgId}: ${error.message}`);
-          continue;
-        }
-        checkedIds.add(msgId);
-        if (result) {
-          uploadedCount++;
-          threadHadMatch = true;
+          failed.push({ id: msgId, error: error.message });
+        } else {
+          checkedIds.add(msgId);
+          if (result) {
+            uploadedCount++;
+            const thread = message.getThread();
+            if (!labelledThreads.has(thread.getId())) {
+              markThreadProcessed(thread, settings.processedLabel);
+              labelledThreads.add(thread.getId());
+            }
+          }
         }
       }
-      if (threadHadMatch && !threadFailed && !timedOut) {
-        markThreadProcessed(thread, settings.processedLabel);
-      }
+      handledIds.add(msgId);
+      newCursor = Math.max(newCursor, Math.floor(date));
+    }
+    if (!timedOut) {
+      newCursor = Math.max(newCursor, startEpoch);
     }
   } finally {
     saveCheckedMessageIds(checkedIds);
+    props.setProperty(PROP_SYNC_CURSOR, String(newCursor));
+    // Retries this run didn't get to stay on the list.
+    retries = retries.filter((r) => !handledIds.has(r.id));
+    props.setProperty(PROP_SYNC_RETRIES, JSON.stringify(retries.concat(failed)));
   }
 
-  if (failures.length > 0) {
-    throw new Error(
-      `${failures.length} message(s) failed to upload:\n${failures.join('\n')}`
+  const problems = [];
+  if (failed.length > 0) {
+    const lines = failed.map((r) => `${r.id}: ${r.error}`);
+    problems.push(
+      `${failed.length} message(s) failed to upload:\n${lines.join('\n')}`
     );
+  }
+  if (abandoned.length > 0) {
+    const days = SYNC_LOOKBACK_SECONDS / 86400;
+    problems.push(
+      `Gave up on ${abandoned.length} message(s) older than the ` +
+        `${days}-day lookback:\n${abandoned.join('\n')}`
+    );
+  }
+  if (problems.length > 0) {
+    throw new Error(problems.join('\n'));
   }
 
   return {

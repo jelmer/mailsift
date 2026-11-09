@@ -316,17 +316,21 @@ function matchMessage(manifests, msg) {
  * every message in the mailbox.
  *
  * @param {Array<Object>} manifests
- * @param {Object} opts `{ newerThanDays: number, excludeLabel: string }`
+ * @param {Object} opts `{ newerThanDays?: number, afterEpoch?: number,
+ *   excludeLabel?: string }`; `afterEpoch` (unix seconds) takes precedence
+ *   over `newerThanDays`
  * @return {string}
  */
 function buildGmailSearchQuery(manifests, opts) {
   const options = opts || {};
-  const newerThanDays = options.newerThanDays || 7;
-  const excludeLabel = options.excludeLabel || 'Mailsift';
-
-  const parts = [`newer_than:${newerThanDays}d`];
-  if (excludeLabel) {
-    parts.push(`-label:${excludeLabel}`);
+  const parts = [];
+  if (typeof options.afterEpoch === 'number') {
+    parts.push(`after:${Math.floor(options.afterEpoch)}`);
+  } else {
+    parts.push(`newer_than:${options.newerThanDays || 7}d`);
+  }
+  if (options.excludeLabel) {
+    parts.push(`-label:${options.excludeLabel}`);
   }
 
   if (manifests.length > 0) {

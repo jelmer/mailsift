@@ -178,3 +178,12 @@ test('buildGmailSearchQuery narrows from: when all extractors constrain from_dom
     'newer_than:7d -label:Mailsift'
   );
 });
+
+test('buildGmailSearchQuery searches from afterEpoch without a label filter', () => {
+  assert.equal(
+    buildGmailSearchQuery([{ name: 'dhl', from_domains: ['dhl.com'] }], {
+      afterEpoch: 1700000000.5,
+    }),
+    'after:1700000000 from:(dhl.com)'
+  );
+});

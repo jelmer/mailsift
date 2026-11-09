@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { loadAddon } = require('./fakes.js');
+const { loadAddon, START_MS, HOUR_MS } = require('./fakes.js');
 
 // Card actions are killed after this long.
 const CARD_ACTION_LIMIT_MS = 30000;
@@ -122,4 +122,123 @@ test('schema-ld mail without ld+json is not uploaded', () => {
 
   assert.deepEqual(addon.uploads, ['t1-m0']);
   assert.deepEqual(addon.labelled(), ['t1']);
+});
+
+const narrowShop = { name: 'shop', order: 20, from_domains: ['shop.example'] };
+
+function threadsReceived(count) {
+  return Array.from({ length: count }, (_, i) => ({
+    id: `t${i}`,
+    hoursAgo: [count - i],
+  }));
+}
+
+test('background sync covers every thread since the last run, oldest first', () => {
+  const addon = loadAddon({
+    threads: threadsReceived(40),
+    manifests: [narrowShop],
+    cost: { upload: 100 },
+  });
+
+  addon.context.syncMatchingEmails();
+
+  assert.deepEqual(
+    addon.uploads,
+    Array.from({ length: 40 }, (_, i) => `t${i}-m0`)
+  );
+  assert.equal(addon.props.get('MAILSIFT_SYNC_CURSOR'), String(START_MS / 1000));
+});
+
+test('background sync resumes where a timed-out run stopped', () => {
+  const addon = loadAddon({
+    threads: threadsReceived(100),
+    manifests: [narrowShop],
+  });
+
+  addon.context.syncMatchingEmails();
+  const firstRun = addon.uploads.length;
+  assert.ok(firstRun > 0 && firstRun < 100, `uploaded ${firstRun}`);
+  assert.equal(
+    addon.props.get('MAILSIFT_SYNC_CURSOR'),
+    String((START_MS - (100 - firstRun + 1) * HOUR_MS) / 1000)
+  );
+
+  while (addon.uploads.length < 100) {
+    addon.sleep(HOUR_MS);
+    addon.context.syncMatchingEmails();
+  }
+  assert.deepEqual(
+    addon.uploads,
+    Array.from({ length: 100 }, (_, i) => `t${i}-m0`)
+  );
+});
+
+test('background sync picks up replies in threads it already labelled', () => {
+  const addon = loadAddon({
+    threads: [{ id: 't0', hoursAgo: [5] }],
+    manifests: [narrowShop],
+    cost: { upload: 100 },
+  });
+  addon.context.syncMatchingEmails();
+  assert.deepEqual(addon.labelled(), ['t0']);
+
+  addon.sleep(HOUR_MS);
+  addon.deliver('t0');
+  addon.sleep(HOUR_MS);
+  addon.context.syncMatchingEmails();
+
+  assert.deepEqual(addon.uploads, ['t0-m0', 't0-m1']);
+  assert.equal(
+    addon.searches.at(-1),
+    `after:${(START_MS - HOUR_MS) / 1000} from:(shop.example)`
+  );
+});
+
+test('background sync does not redo messages before the cursor once the cache expires', () => {
+  const addon = loadAddon({
+    threads: [{ id: 't0', hoursAgo: [5] }],
+    manifests: [narrowShop],
+    cost: { upload: 100 },
+  });
+  addon.context.syncMatchingEmails();
+
+  addon.sleep(7 * HOUR_MS);
+  addon.deliver('t0');
+  addon.expireCache();
+  addon.context.syncMatchingEmails();
+
+  assert.deepEqual(addon.uploads, ['t0-m0', 't0-m1']);
+});
+
+test('background sync rejects a corrupt cursor', () => {
+  const addon = loadAddon({ threads: [], manifests: [narrowShop] });
+  addon.props.set('MAILSIFT_SYNC_CURSOR', 'yesterday');
+
+  assert.throws(() => addon.context.syncMatchingEmails(), {
+    message: 'Invalid MAILSIFT_SYNC_CURSOR property: "yesterday"',
+  });
+});
+
+test('background sync stops retrying a failed message once it leaves the lookback window', () => {
+  const addon = loadAddon({
+    threads: [{ id: 't0', hoursAgo: [24] }],
+    manifests: [narrowShop],
+    cost: { upload: 100 },
+    failIds: new Set(['t0-m0']),
+  });
+  assert.throws(() => addon.context.syncMatchingEmails());
+  addon.sleep(HOUR_MS);
+  assert.throws(() => addon.context.syncMatchingEmails());
+  assert.deepEqual(addon.uploads, ['t0-m0', 't0-m0']);
+
+  addon.sleep(7 * 24 * HOUR_MS);
+  assert.throws(() => addon.context.syncMatchingEmails(), {
+    message:
+      'Gave up on 1 message(s) older than the 7-day lookback:\n' +
+      't0-m0: POST /api/messages failed with HTTP 500: extractor crashed',
+  });
+
+  addon.sleep(HOUR_MS);
+  addon.context.syncMatchingEmails();
+  assert.deepEqual(addon.uploads, ['t0-m0', 't0-m0']);
 });
