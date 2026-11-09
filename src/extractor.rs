@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use tracing::{debug, info, warn};
 use wait_timeout::ChildExt;
@@ -18,7 +18,7 @@ use crate::artifacts::{ScanResult, scan};
 /// prefilters: the first two against parsed message headers, and
 /// `requires` against an IMAP `BODYSTRUCTURE` summary in
 /// [`crate::imap_scan`].
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub name: String,
     /// Lower numbers run earlier. Defaults to 100.
@@ -26,18 +26,21 @@ pub struct Manifest {
     pub order: i32,
     /// Path to the executable to run, relative to the manifest's
     /// directory. Defaults to `<manifest-stem>.py` next to the manifest.
+    /// Omitted when serialising manifests over the HTTP API so local
+    /// script paths are not exposed.
+    #[serde(default, skip_serializing)]
     pub script: Option<String>,
     /// Dispatch hints: when set, the extractor only runs against a
     /// message whose `From` domain matches one of these patterns.
     /// Patterns are case-insensitive; `*.example.com` matches any
     /// subdomain (including the bare domain).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub from_domains: Vec<String>,
     /// Dispatch hint: when set, the extractor only runs against a
     /// message whose `Subject` matches this regex.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_regex: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<String>,
     /// Only run this extractor when the message has a passing DKIM
     /// signature from one of these domains, per the topmost
@@ -51,14 +54,14 @@ pub struct Manifest {
     /// but not the bare `myshopify.com` itself. Useful for SaaS
     /// platforms (Shopify, Mailgun, ...) where every tenant's
     /// notifications are DKIM-signed under a shared parent zone.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub require_dkim: Vec<String>,
     /// Date (`YYYY-MM-DD`, UTC) the vendor started signing. Mail that
     /// fails `require_dkim` is still accepted if we received it before
     /// this date. "Received" is taken from the mail source (IMAP
     /// INTERNALDATE, the Maildir delivery timestamp), never from
     /// headers the sender wrote; without one, unsigned mail is refused.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unsigned_before: Option<String>,
 }
 

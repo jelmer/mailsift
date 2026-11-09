@@ -19,15 +19,16 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::{Path as UrlPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
 use chrono::{NaiveDate, NaiveDateTime, Utc};
 use iso_currency::Currency;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::info;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
@@ -278,6 +279,13 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/tickets/{year}/{slug}/view", get(view_ticket))
         .route("/tickets/{year}/{name}", get(get_ticket))
         .route("/stats", get(show_stats))
+        .route("/api/extractors", get(api_extractors))
+        .route(
+            "/api/messages",
+            post(api_post_message).layer(DefaultBodyLimit::max(
+                crate::pipeline::MAX_MESSAGE_BYTES + 1024 * 1024,
+            )),
+        )
         .merge(api_router)
         .merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", api_doc))
         .fallback(not_found)
@@ -3349,6 +3357,228 @@ async fn api_recent_failures(State(_state): State<Arc<AppState>>) -> Result<Json
     Ok(Json(serde_json::to_value(failures)?))
 }
 
+fn extractors_dirs(config: &Config) -> Vec<PathBuf> {
+    match &config.extractors_dir {
+        Some(dirs) => dirs.as_slice().to_vec(),
+        None => vec![PathBuf::from("extractors")],
+    }
+}
+
+/// Serve the discovered extractor manifests as JSON so external clients
+/// (such as the Gmail Add-on) can prefilter messages locally before
+/// uploading them to `POST /api/messages`.
+async fn api_extractors(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<crate::extractor::Manifest>>, AppError> {
+    let dirs = extractors_dirs(&state.config);
+    let mut manifests: Vec<crate::extractor::Manifest> = Vec::new();
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for dir in &dirs {
+        let entries = if state.config.extractors_dir.is_none() && !dir.exists() {
+            Vec::new()
+        } else {
+            fs::read_dir(dir)
+                .with_context(|| format!("listing extractors dir {}", dir.display()))?
+                .collect::<std::io::Result<Vec<_>>>()?
+        };
+        for entry in entries {
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name.starts_with('_') || !name.ends_with(".yaml") {
+                continue;
+            }
+            let path = entry.path();
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("reading manifest {}", path.display()))?;
+            let manifest: crate::extractor::Manifest = serde_norway::from_str(&raw)
+                .with_context(|| format!("parsing manifest {}", path.display()))?;
+            if seen_names.insert(manifest.name.clone()) {
+                manifests.push(manifest);
+            }
+        }
+    }
+
+    manifests.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)));
+    Ok(Json(manifests))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PostMessageQuery {
+    source: Option<String>,
+    received_at: Option<i64>,
+    dry_run: Option<bool>,
+}
+
+/// Accept a raw RFC822 email message in the request body and run the
+/// extraction pipeline over it.
+async fn api_post_message(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PostMessageQuery>,
+    body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    if body.is_empty() {
+        return Err(AppError::bad_request("empty message body"));
+    }
+    if body.len() > crate::pipeline::MAX_MESSAGE_BYTES {
+        return Err(AppError::bad_request("message exceeds MAX_MESSAGE_BYTES"));
+    }
+
+    let config = Arc::clone(&state.config);
+    let source = query.source.unwrap_or_else(|| "web-api".to_string());
+    let received_at = query.received_at;
+    let dry_run = query.dry_run.unwrap_or(false);
+    let raw = body.to_vec();
+
+    let outcome = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let runtime = tokio::runtime::Handle::current();
+        let dirs = extractors_dirs(&config);
+        let extractors = crate::extractor::discover(&dirs)?;
+
+        let event_sink = match (&config.events_dir, &config.caldav) {
+            (Some(dir), _) => crate::targets::EventSinkKind::LocalDir(dir.clone()),
+            (None, Some(cal)) => {
+                let target = crate::cli::parse_caldav_url(&cal.url)?;
+                let user = target.user.or_else(|| cal.user.clone());
+                let password = cal
+                    .password_file
+                    .as_deref()
+                    .map(|p| -> Result<String> { Ok(fs::read_to_string(p)?.trim().to_string()) })
+                    .transpose()?;
+                crate::targets::EventSinkKind::Caldav(crate::targets::caldav::CaldavSink::new(
+                    target.url,
+                    user,
+                    password,
+                    runtime.clone(),
+                )?)
+            }
+            (None, None) => crate::targets::EventSinkKind::Disabled,
+        };
+
+        let receipts_sink = if let Some(dir) = &config.receipts_dir {
+            Some(crate::targets::receipts::ReceiptSink::LocalDir(dir.clone()))
+        } else if let Some(dav) = &config.receipts_webdav {
+            let target = crate::cli::parse_caldav_url(&dav.url)?;
+            let user = target.user.or_else(|| dav.user.clone());
+            let password = dav
+                .password_file
+                .as_deref()
+                .map(|p| -> Result<String> { Ok(fs::read_to_string(p)?.trim().to_string()) })
+                .transpose()?;
+            Some(crate::targets::receipts::ReceiptSink::Webdav(
+                crate::targets::webdav::WebdavSink::new(
+                    target.url,
+                    user,
+                    password,
+                    runtime.clone(),
+                )?,
+            ))
+        } else {
+            None
+        };
+
+        let tickets_sink = if let Some(dir) = &config.tickets_dir {
+            Some(crate::targets::tickets::TicketSink::LocalDir(dir.clone()))
+        } else if let Some(dav) = &config.tickets_webdav {
+            let target = crate::cli::parse_caldav_url(&dav.url)?;
+            let user = target.user.or_else(|| dav.user.clone());
+            let password = dav
+                .password_file
+                .as_deref()
+                .map(|p| -> Result<String> { Ok(fs::read_to_string(p)?.trim().to_string()) })
+                .transpose()?;
+            Some(crate::targets::tickets::TicketSink::Webdav(
+                crate::targets::webdav::WebdavSink::new(
+                    target.url,
+                    user,
+                    password,
+                    runtime.clone(),
+                )?,
+            ))
+        } else {
+            None
+        };
+
+        let recorder = crate::stats::Recorder::default_file();
+        let seen = if !dry_run && matches!(event_sink, crate::targets::EventSinkKind::Caldav(_)) {
+            crate::seen::Store::default_path().and_then(|p| crate::seen::Store::open(&p).ok())
+        } else {
+            None
+        };
+
+        let mut explain_buf = Vec::new();
+        crate::pipeline::run(
+            &raw,
+            &source,
+            &extractors,
+            crate::pipeline::PipelineTargets {
+                event_sink: &event_sink,
+                bills_dir: config.bills_dir.as_deref(),
+                parcels_dir: config.parcels_dir.as_deref(),
+                subscriptions_dir: config.subscriptions_dir.as_deref(),
+                reservations_dir: config.reservations_dir.as_deref(),
+                receipts: receipts_sink.as_ref(),
+                tickets: tickets_sink.as_ref(),
+                firefly: None,
+                trackers: None,
+                trusted_forwarders: &config.trusted_forwarders,
+                recorder: &recorder,
+                seen: seen.as_ref(),
+            },
+            crate::pipeline::DkimPolicy::Enforce { received_at },
+            dry_run,
+            Some(&mut explain_buf),
+        )?;
+
+        let mut matched = Vec::new();
+        let mut failed = Vec::new();
+        for rec in explain_buf {
+            match rec.outcome {
+                crate::pipeline::ExplainOutcome::Produced {
+                    events,
+                    reservations,
+                    bills,
+                    parcels,
+                    receipts,
+                    tickets,
+                    subscriptions,
+                } => {
+                    matched.push(json!({
+                        "extractor": rec.extractor,
+                        "events": events,
+                        "reservations": reservations,
+                        "bills": bills,
+                        "parcels": parcels,
+                        "receipts": receipts,
+                        "tickets": tickets,
+                        "subscriptions": subscriptions,
+                    }));
+                }
+                crate::pipeline::ExplainOutcome::Failed { error } => {
+                    failed.push(json!({
+                        "extractor": rec.extractor,
+                        "error": error,
+                    }));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(json!({
+            "ok": true,
+            "dry_run": dry_run,
+            "matched": matched,
+            "failed": failed,
+        }))
+    })
+    .await
+    .context("joining pipeline task")??;
+
+    Ok(Json(outcome))
+}
+
 /// (filename, parsed JSON) for every `*.json` directly under `dir`.
 fn walk_flat_json(dir: &Path) -> Result<Vec<(String, Value)>> {
     let mut out = Vec::new();
@@ -5545,5 +5775,83 @@ tickets_dir = "/var/mailsift/tickets"
         let (status, body) = get(&app, "/").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains(">stats</a>"), "no stats link in nav: {body}");
+    }
+
+    #[tokio::test]
+    async fn api_extractors_serves_discovered_manifests_without_script_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ext_dir = tmp.path().join("extractors");
+        fs::create_dir_all(&ext_dir).unwrap();
+        fs::write(
+            ext_dir.join("acme.yaml"),
+            "name: acme\norder: 20\nscript: secret-path.py\nfrom_domains:\n  - acme.example\nsubject_regex: \"(?i)invoice\"\n",
+        )
+        .unwrap();
+        let config = Config {
+            extractors_dir: Some(crate::config::ExtractorsDir::Single(ext_dir)),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let (status, body) = get(&app, "/api/extractors").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains("secret-path.py"),
+            "script path must not be exposed: {body}"
+        );
+        let parsed: Vec<crate::extractor::Manifest> = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "acme");
+        assert_eq!(parsed[0].order, 20);
+        assert_eq!(parsed[0].from_domains, vec!["acme.example"]);
+    }
+
+    #[tokio::test]
+    async fn post_messages_runs_pipeline_and_files_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ext_dir = tmp.path().join("extractors");
+        let parcels_dir = tmp.path().join("parcels");
+        fs::create_dir_all(&ext_dir).unwrap();
+        fs::create_dir_all(&parcels_dir).unwrap();
+
+        fs::write(
+            ext_dir.join("dhl.yaml"),
+            "name: dhl\nfrom_domains:\n  - dhl.example\n",
+        )
+        .unwrap();
+        let script = ext_dir.join("dhl.py");
+        fs::write(
+            &script,
+            "#!/bin/sh\ncat > /dev/null\nprintf '{\"trackingNumber\":\"DHL999\",\"deliveryStatus\":\"OnItsWay\"}' > dhl.parcel.json\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let config = Config {
+            extractors_dir: Some(crate::config::ExtractorsDir::Single(ext_dir)),
+            parcels_dir: Some(parcels_dir.clone()),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+        let raw_email = "From: notify@dhl.example\r\nSubject: Your parcel\r\nDate: Wed, 10 Apr 2026 12:00:00 +0000\r\n\r\nYour parcel DHL999 is on its way.\r\n";
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/messages?source=gmail-test")
+            .header(header::CONTENT_TYPE, "message/rfc822")
+            .body(axum::body::Body::from(raw_email))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["matched"][0]["extractor"], "dhl");
+        assert_eq!(parsed["matched"][0]["parcels"], 1);
+        assert!(parcels_dir.join("DHL999.json").exists());
     }
 }
