@@ -45,8 +45,9 @@ function response(code, text, headers) {
  * @param {Array<Object>} opts.manifests
  * @param {Object=} opts.cost
  * @param {Set<string>=} opts.failIds message IDs the server rejects
+ * @param {Function=} opts.onUpload called on each upload
  */
-function loadAddon({ threads, manifests, cost, failIds }) {
+function loadAddon({ threads, manifests, cost, failIds, onUpload }) {
   cost = Object.assign({}, DEFAULT_COST, cost || {});
   failIds = failIds || new Set();
   let now = START_MS;
@@ -158,6 +159,9 @@ function loadAddon({ threads, manifests, cost, failIds }) {
           ''
         );
         uploads.push(id);
+        if (onUpload) {
+          onUpload(id);
+        }
         if (failIds.has(id)) {
           return response(500, 'extractor crashed');
         }

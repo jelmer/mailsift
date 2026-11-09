@@ -27,11 +27,12 @@ const SYNC_LOOKBACK_SECONDS = 7 * 86400;
 // searches this far before its cursor; checkedIds skips repeats.
 const SYNC_OVERLAP_SECONDS = 3600;
 const SEARCH_PAGE_SIZE = 100;
+// Time budgets for a sync run from the hourly trigger (executions are
+// killed at 6 minutes) and from a card action (killed at 30 seconds).
 const SYNC_MAX_DURATION_MS = 240000;
-// A queued or running status older than this belongs to a run that never
-// started or was killed (executions are limited to 6 minutes).
+const UI_SYNC_BUDGET_MS = 20000;
+// A running status older than this belongs to a run that was killed.
 const SYNC_STALE_MS = 10 * 60 * 1000;
-const SCHEDULED_SYNC_HANDLER = 'runScheduledSync';
 
 /**
  * Load user settings from `PropertiesService`.
@@ -436,7 +437,7 @@ function onHomepage(statusMessage) {
       .setWrapText(true)
   );
   const syncButtons = CardService.newButtonSet();
-  if (!isSyncActive(syncStatus)) {
+  if (!isSyncRunning(syncStatus)) {
     syncButtons.addButton(
       CardService.newTextButton()
         .setText('Start Sync')
@@ -1070,7 +1071,7 @@ function syncMessage(extractors, message) {
 /**
  * Read the status of the current or most recent sync run, or `null`.
  *
- * @return {Object|null} `{ state: 'queued'|'running'|'finished'|'failed',
+ * @return {Object|null} `{ state: 'running'|'finished'|'failed',
  *   updatedAt, total?, handled?, scanned?, matched?, uploaded?, error? }`
  */
 function getSyncStatus() {
@@ -1091,57 +1092,54 @@ function saveSyncStatus(status) {
 }
 
 /**
- * Whether `status` describes a run that is queued or running, ignoring
- * ones that have gone quiet for too long to still be alive.
+ * Whether `status` describes a run that is still going, ignoring ones
+ * that have gone quiet for too long to still be alive.
  *
  * @param {Object|null} status
  * @return {boolean}
  */
-function isSyncActive(status) {
+function isSyncRunning(status) {
   return Boolean(
     status &&
-      (status.state === 'queued' || status.state === 'running') &&
+      status.state === 'running' &&
       Date.now() - status.updatedAt < SYNC_STALE_MS
   );
 }
 
 /**
- * Schedule a one-off run of the background sync, which (unlike a card
- * action) may run for several minutes.
+ * Run a sync with the card action budget and summarise it for a
+ * notification. Errors are recorded in the sync status by `runSync`.
+ *
+ * @return {string}
  */
-function scheduleSyncRun() {
-  ScriptApp.newTrigger(SCHEDULED_SYNC_HANDLER).timeBased().after(1000).create();
-  saveSyncStatus({ state: 'queued' });
-}
-
-/**
- * Handler for the one-off triggers created by `scheduleSyncRun`.
- */
-function runScheduledSync() {
-  // One-off triggers aren't removed after they fire. Remove them all: the
-  // run below covers whatever any of them was for.
-  for (const t of ScriptApp.getProjectTriggers()) {
-    if (t.getHandlerFunction() === SCHEDULED_SYNC_HANDLER) {
-      ScriptApp.deleteTrigger(t);
-    }
+function syncFromCard() {
+  let outcome;
+  try {
+    outcome = runSync(UI_SYNC_BUDGET_MS);
+  } catch (err) {
+    return `Sync failed: ${err.message}`;
   }
-  syncMatchingEmails();
+  if (outcome === null) {
+    return 'A sync is already running.';
+  }
+  if (outcome.problems.length > 0) {
+    return 'Sync finished with errors.';
+  }
+  if (outcome.remaining > 0) {
+    return `${outcome.remaining} message(s) left to sync.`;
+  }
+  return 'Sync finished.';
 }
 
 /**
- * "Start Sync" action: queue a background sync run unless one is already
- * queued or running, and show its status on the homepage.
+ * "Start Sync" action: sync as much as fits in a card action and show
+ * the result on the homepage. Pressing it again continues where it
+ * stopped, as does the hourly sync.
  *
  * @return {GoogleAppsScript.Card_Service.ActionResponse}
  */
 function onSyncNow() {
-  let note;
-  if (isSyncActive(getSyncStatus())) {
-    note = 'A sync is already in progress.';
-  } else {
-    scheduleSyncRun();
-    note = 'Sync started. Refresh to follow its progress.';
-  }
+  const note = syncFromCard();
   return CardService.newActionResponseBuilder()
     .setNavigation(CardService.newNavigation().updateCard(onHomepage()))
     .setNotification(CardService.newNotification().setText(note))
@@ -1154,9 +1152,7 @@ function onSyncNow() {
  * @return {GoogleAppsScript.Card_Service.UniversalActionResponse}
  */
 function onSyncNowUniversal() {
-  if (!isSyncActive(getSyncStatus())) {
-    scheduleSyncRun();
-  }
+  syncFromCard();
   return CardService.newUniversalActionResponseBuilder()
     .displayAddOnCards([onHomepage()])
     .build();
@@ -1194,33 +1190,38 @@ function describeSyncStatus(status) {
   if (!status) {
     return { text: 'No recent sync', detail: '' };
   }
-  const counts = (s) =>
-    `Scanned ${s.scanned} · Matched ${s.matched} · Uploaded ${s.uploaded}`;
+  const counts = `Scanned ${status.scanned} · Matched ${status.matched} · Uploaded ${status.uploaded}`;
   const ago = Math.round((Date.now() - status.updatedAt) / 60000);
   const when = ago < 1 ? 'just now' : `${ago} min ago`;
-  if (status.state !== 'finished' && status.state !== 'failed' && !isSyncActive(status)) {
-    return {
-      text: 'Sync stopped responding',
-      detail: `Last update ${when}; the run was probably killed.`,
-    };
-  }
   switch (status.state) {
-    case 'queued':
-      return { text: 'Sync queued', detail: 'Starts within a minute or so.' };
     case 'running':
+      if (!isSyncRunning(status)) {
+        return {
+          text: 'Sync stopped responding',
+          detail: `Last update ${when}; the run was probably killed.`,
+        };
+      }
       return {
         text: renderProgressBar(status.handled, status.total),
-        detail: counts(status),
+        detail: counts,
       };
-    case 'finished':
-      return { text: `Sync finished ${when}`, detail: counts(status) };
+    case 'finished': {
+      const remaining = status.total - status.handled;
+      if (remaining > 0) {
+        return {
+          text: `Synced ${status.handled} of ${status.total} message(s) ${when}`,
+          detail: `${counts}\nPress Start Sync to continue; otherwise the next hourly sync does.`,
+        };
+      }
+      return { text: `Sync finished ${when}`, detail: counts };
+    }
     case 'failed':
       return {
         text: `Sync failed ${when}`,
         detail:
           status.scanned === undefined
             ? status.error
-            : `${counts(status)}\n${status.error}`,
+            : `${counts}\n${status.error}`,
       };
     default:
       throw new Error(`Unknown sync state ${status.state}`);
@@ -1295,35 +1296,47 @@ function listMessagesSince(query, sinceEpoch) {
 }
 
 /**
- * Background time-driven trigger entrypoint.
+ * Time-driven trigger entrypoint for the hourly sync.
  *
- * Works through mail received since the cursor saved by the previous run
- * (at most `SYNC_LOOKBACK_SECONDS` back), oldest first, and moves the
- * cursor up to the last message handled, so a run that hits the time
- * budget is continued by the next one. Labelled threads are searched
- * too, so replies to them aren't missed.
+ * Throws if any message failed, so the execution is marked failed in the
+ * Apps Script log. Add-on triggers don't send failure emails; the
+ * homepage's sync status is where failures show up.
  *
- * Messages the server rejects are kept in a retry list and tried again
- * by later runs until they fall out of the lookback window. The run
- * throws after finishing if anything failed, so failures show up in the
- * trigger's execution log and failure emails.
- *
- * Progress goes to the sync status shown on the homepage. A run that
- * runs out of time queues a follow-up run, and a run that finds another
- * one in progress leaves the work to it.
- *
- * @return {Object|null} `{ scanned, matched, uploaded, timedOut }`, or
- *   `null` if another run was in progress
+ * @return {Object|null} see `runSync`
  */
 function syncMatchingEmails() {
+  const outcome = runSync(SYNC_MAX_DURATION_MS);
+  if (outcome && outcome.problems.length > 0) {
+    throw new Error(outcome.problems.join('\n'));
+  }
+  return outcome;
+}
+
+/**
+ * Sync mail received since the cursor saved by the previous run (at most
+ * `SYNC_LOOKBACK_SECONDS` back), oldest first, for up to `budgetMs`.
+ *
+ * Progress (the cursor, checked messages and retry list) is saved after
+ * every message, so a run that is stopped early or killed is continued
+ * by the next one. Labelled threads are searched too, so replies to them
+ * aren't missed. Messages the server rejects are kept in a retry list and
+ * tried again by later runs until they fall out of the lookback window.
+ *
+ * Only one run happens at a time; a run that finds another in progress
+ * leaves the work to it.
+ *
+ * @param {number} budgetMs stop starting new messages after this long
+ * @return {Object|null} `{ scanned, matched, uploaded, remaining,
+ *   problems }`, or `null` if another run was in progress
+ */
+function runSync(budgetMs) {
   const lock = LockService.getUserLock();
   if (!lock.tryLock(0)) {
     console.log('Another sync run is in progress; leaving the work to it.');
     return null;
   }
-  let outcome;
   try {
-    outcome = syncWithLock();
+    return syncWithLock(budgetMs);
   } catch (err) {
     saveSyncStatus(
       Object.assign({}, getSyncStatus(), { state: 'failed', error: err.message })
@@ -1332,22 +1345,15 @@ function syncMatchingEmails() {
   } finally {
     lock.releaseLock();
   }
-  const { problems, ...result } = outcome;
-  if (result.timedOut) {
-    scheduleSyncRun();
-  }
-  if (problems.length > 0) {
-    throw new Error(problems.join('\n'));
-  }
-  return result;
 }
 
 /**
- * The body of `syncMatchingEmails`, run while holding its lock.
+ * The body of `runSync`, run while holding its lock.
  *
- * @return {Object} `{ scanned, matched, uploaded, timedOut, problems }`
+ * @param {number} budgetMs
+ * @return {Object} see `runSync`
  */
-function syncWithLock() {
+function syncWithLock(budgetMs) {
   const startMs = Date.now();
   const startEpoch = Math.floor(startMs / 1000);
   const oldestEpoch = startEpoch - SYNC_LOOKBACK_SECONDS;
@@ -1361,7 +1367,7 @@ function syncWithLock() {
   const entries = listMessagesSince(query, sinceEpoch);
   const listed = new Set(entries.map((e) => e.message.getId()));
   const abandoned = [];
-  let retries = [];
+  const retries = [];
   for (const retry of loadSyncRetries(props)) {
     if (listed.has(retry.id)) {
       retries.push(retry);
@@ -1387,7 +1393,13 @@ function syncWithLock() {
   const failed = [];
   const labelledThreads = new Set();
   let newCursor = cursor;
-  let timedOut = false;
+  const persist = () => {
+    saveCheckedMessageIds(checkedIds);
+    props.setProperty(PROP_SYNC_CURSOR, String(newCursor));
+    // Retries this run hasn't got to yet stay on the list.
+    const pending = retries.filter((r) => !handledIds.has(r.id));
+    props.setProperty(PROP_SYNC_RETRIES, JSON.stringify(pending.concat(failed)));
+  };
   const status = {
     state: 'running',
     total: entries.length,
@@ -1400,13 +1412,13 @@ function syncWithLock() {
 
   try {
     for (const { message, date } of entries) {
-      if (Date.now() - startMs > SYNC_MAX_DURATION_MS) {
-        timedOut = true;
+      if (status.handled > 0 && Date.now() - startMs > budgetMs) {
         break;
       }
       const msgId = message.getId();
       status.handled++;
-      if (!checkedIds.has(msgId)) {
+      const isNew = !checkedIds.has(msgId);
+      if (isNew) {
         status.scanned++;
         const { matching, result, error } = syncMessage(extractors, message);
         if (matching.length > 0) {
@@ -1425,20 +1437,19 @@ function syncWithLock() {
             }
           }
         }
-        saveSyncStatus(status);
       }
       handledIds.add(msgId);
       newCursor = Math.max(newCursor, Math.floor(date));
+      if (isNew || status.handled % 20 === 0) {
+        persist();
+        saveSyncStatus(status);
+      }
     }
-    if (!timedOut) {
+    if (status.handled === entries.length) {
       newCursor = Math.max(newCursor, startEpoch);
     }
   } finally {
-    saveCheckedMessageIds(checkedIds);
-    props.setProperty(PROP_SYNC_CURSOR, String(newCursor));
-    // Retries this run didn't get to stay on the list.
-    retries = retries.filter((r) => !handledIds.has(r.id));
-    props.setProperty(PROP_SYNC_RETRIES, JSON.stringify(retries.concat(failed)));
+    persist();
   }
 
   const problems = [];
@@ -1456,16 +1467,14 @@ function syncWithLock() {
     );
   }
 
-  if (!timedOut) {
-    status.state = problems.length > 0 ? 'failed' : 'finished';
-    status.error = problems.join('\n');
-    saveSyncStatus(status);
-  }
+  status.state = problems.length > 0 ? 'failed' : 'finished';
+  status.error = problems.join('\n');
+  saveSyncStatus(status);
   return {
     scanned: status.scanned,
     matched: status.matched,
     uploaded: status.uploaded,
-    timedOut,
+    remaining: entries.length - status.handled,
     problems,
   };
 }
