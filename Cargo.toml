@@ -25,7 +25,7 @@ anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json"], optional = true }
 base64 = "0.22"
 bytes = "1"
-chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 clap = { version = "4", features = ["derive"] }
 # Randomness for OAuth2 PKCE verifier + CSRF state.
 getrandom = "0.2"

@@ -10,9 +10,8 @@
 //! the sibling lookup is exercised rather than stubbed.
 
 // The sidecar carries a `.meta.json` infix rather than a plain
-// `.json`: a ticket blob's extension is arbitrary, so a
-// `<slug>.ticket.json` attachment would otherwise land on the
-// sidecar's own path.
+// `.json`: a ticket blob's extension is arbitrary, so a ticket filed
+// as `<slug>.json` would otherwise land on the sidecar's own path.
 
 use std::path::{Path, PathBuf};
 
@@ -223,4 +222,74 @@ fn booking_mails_out_of_order_leave_the_newest() {
         filed_dates(out.path()),
         dates("2026-03-03T09:00:00Z", "20260303T090000Z")
     );
+}
+
+/// A boarding pass mailed after check-in comes without a reservation;
+/// the extractor names the booking in a same-slug `.ticket.json`.
+#[test]
+fn a_ticket_record_names_the_booking() {
+    let manifest = manifest_dir();
+    let eml = manifest.join("tests/fixtures/eml/boarding-pass.eml");
+    let extractors = manifest.join("tests/fixtures/extractors");
+    let out = tempfile::tempdir().expect("tempdir");
+    let tickets = out.path().join("tickets");
+
+    common::mailsift()
+        .arg("replay")
+        .arg(&eml)
+        .arg("--extractors")
+        .arg(&extractors)
+        .arg("--events-dir")
+        .arg(out.path().join("events"))
+        .arg("--tickets-dir")
+        .arg(&tickets)
+        .assert()
+        .success();
+
+    // Filed under the year the record gives, not the message's.
+    let sidecar = json(tickets.join("2027/fixture-air-fx456-2027-01-05.meta.json"));
+    assert_eq!(sidecar["file"], "fixture-air-fx456-2027-01-05.pdf");
+    assert_eq!(sidecar["reservationNumber"], "FX9ZZ1");
+    assert_eq!(sidecar["underName"], "Test User");
+    assert_eq!(sidecar["provider"], "Fixture Air");
+
+    // A record that doesn't parse is skipped, but its pass is still
+    // filed, under the message's year and without a booking.
+    let sidecar = json(tickets.join("2026/fixture-air-fx789-2027-01-05.meta.json"));
+    assert_eq!(sidecar["file"], "fixture-air-fx789-2027-01-05.pdf");
+    assert!(sidecar.get("reservationNumber").is_none(), "{sidecar}");
+
+    // A record is never filed as a ticket itself.
+    let mut filed: Vec<String> = walk(&tickets);
+    filed.sort();
+    assert_eq!(
+        filed,
+        [
+            "2026/fixture-air-fx789-2027-01-05.meta.json",
+            "2026/fixture-air-fx789-2027-01-05.pdf",
+            "2027/fixture-air-fx456-2027-01-05.meta.json",
+            "2027/fixture-air-fx456-2027-01-05.pdf",
+        ]
+    );
+}
+
+fn walk(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for year in std::fs::read_dir(dir).expect("tickets dir") {
+        let year = year.unwrap();
+        for file in std::fs::read_dir(year.path()).unwrap() {
+            out.push(format!(
+                "{}/{}",
+                year.file_name().to_string_lossy(),
+                file.unwrap().file_name().to_string_lossy()
+            ));
+        }
+    }
+    out
+}
+
+fn json(path: PathBuf) -> serde_json::Value {
+    let body =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_str(&body).expect("valid JSON")
 }

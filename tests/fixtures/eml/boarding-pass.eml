@@ -1,0 +1,10 @@
+From: checkin@boarding.fixture.test
+To: jelmer@example.org
+Subject: fixture-boarding-pass for your flight on 5 January
+Date: Mon, 28 Dec 2026 09:00:00 +0000
+Message-ID: <fixture-boarding-pass-1@boarding.fixture.test>
+Authentication-Results: example.org; dkim=pass header.d=boarding.fixture.test header.i=@boarding.fixture.test
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+You are checked in. Boarding passes attached.

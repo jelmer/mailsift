@@ -393,6 +393,7 @@ pub fn run(
         let mut receipt_arts: Vec<&Artifact> = Vec::new();
         let mut receipt_blob_arts: Vec<&Artifact> = Vec::new();
         let mut ticket_arts: Vec<&Artifact> = Vec::new();
+        let mut ticket_records: Vec<&Artifact> = Vec::new();
         let mut subscription_arts: Vec<&Artifact> = Vec::new();
         for artifact in &run.result.artifacts {
             match artifact.kind {
@@ -413,7 +414,13 @@ pub fn run(
                         receipt_blob_arts.push(artifact);
                     }
                 }
-                Kind::Ticket => ticket_arts.push(artifact),
+                Kind::Ticket => {
+                    if artifact.ext == "json" {
+                        ticket_records.push(artifact);
+                    } else {
+                        ticket_arts.push(artifact);
+                    }
+                }
                 Kind::Subscription => subscription_arts.push(artifact),
             }
         }
@@ -613,41 +620,53 @@ pub fn run(
             },
         );
 
-        // A ticket on its own is just a binary blob, but it usually
-        // ships with a sibling `.event.ics` or `.reservation.json` in
-        // the same extractor run; that's where the relevant date
-        // lives (DTSTART, departureTime, checkinTime, ...). Use the
-        // earliest such date for filing. When no sibling is present
-        // we fall back to the message Date and warn: the extractor
-        // really should have emitted one.
-        let ticket_year = (!ticket_arts.is_empty() && tickets.is_some()).then(|| {
-            router::earliest_sibling_year(&run.result.artifacts).unwrap_or_else(|| {
+        // A ticket on its own is just a binary blob. What it is for -
+        // the booking, the passenger, the date to file it under -
+        // comes from a same-slug `.ticket.json` the extractor wrote,
+        // which a boarding pass mailed apart from its booking needs,
+        // and otherwise from the reservations or events of the same
+        // run (departureTime, DTSTART, ...). With neither, the message
+        // Date files it, with a warning: the extractor should have
+        // said.
+        for record in &ticket_records {
+            if !ticket_arts.iter().any(|t| t.slug == record.slug) {
                 warn!(
                     extractor = %run.extractor,
-                    "ticket emitted without a sibling event/reservation; falling back to message Date"
+                    path = %record.path.display(),
+                    "ticket record without a ticket beside it"
                 );
-                message_date_year(&parsed_headers).unwrap_or_else(current_year)
-            })
-        });
-        // The same sibling reservation that dates the ticket also
-        // names the booking; a boarding pass carries neither itself.
-        let ticket_meta = if !ticket_arts.is_empty() && tickets.is_some() {
-            router::sibling_ticket_meta(&run.result.artifacts)
-        } else {
-            crate::targets::tickets::TicketMeta::default()
-        };
+            }
+        }
+        let sibling_year = router::earliest_sibling_year(&run.result.artifacts);
+        let sibling_meta = router::sibling_ticket_meta(&run.result.artifacts);
         file_or_drop(
             "ticket",
             &run.extractor,
             ticket_arts,
             tickets,
             |artifact, sink| {
+                let record = router::ticket_record(&run.extractor, &ticket_records, &artifact.slug);
+                let year = record
+                    .as_ref()
+                    .and_then(|r| r.year())
+                    .or(sibling_year)
+                    .unwrap_or_else(|| {
+                        warn!(
+                            extractor = %run.extractor,
+                            "ticket emitted without a date of its own or a sibling event/reservation; falling back to message Date"
+                        );
+                        message_date_year(&parsed_headers).unwrap_or_else(current_year)
+                    });
+                let meta = match &record {
+                    Some(record) => record.meta_over(&sibling_meta),
+                    None => sibling_meta.clone(),
+                };
                 router::file_ticket_artifact(
                     &run.extractor,
                     artifact,
-                    ticket_year.expect("year computed when both tickets and sink exist"),
+                    year,
                     sink,
-                    &ticket_meta,
+                    &meta,
                     received_at_epoch,
                     &mut summary,
                 );

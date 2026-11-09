@@ -772,6 +772,74 @@ impl ReservationDatesDoc {
     }
 }
 
+/// What an extractor says about one of its tickets, in a same-slug
+/// `<slug>.ticket.json`: the booking it belongs to, for a ticket mailed
+/// without one beside it, like a boarding pass after check-in.
+#[derive(Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct TicketRecord {
+    #[serde(default)]
+    reservation_number: Option<String>,
+    #[serde(default)]
+    under_name: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    /// The day the ticket is for, as `YYYY-MM-DD`; files it under that
+    /// year.
+    #[serde(default)]
+    date: Option<chrono::NaiveDate>,
+}
+
+impl TicketRecord {
+    pub(super) fn year(&self) -> Option<i32> {
+        use chrono::Datelike;
+        self.date.map(|d| d.year())
+    }
+
+    /// The record's fields, falling back to `sibling`'s for any it
+    /// leaves out.
+    pub(super) fn meta_over(&self, sibling: &tickets::TicketMeta) -> tickets::TicketMeta {
+        tickets::TicketMeta {
+            reservation_number: self
+                .reservation_number
+                .clone()
+                .or_else(|| sibling.reservation_number.clone()),
+            under_name: self
+                .under_name
+                .clone()
+                .or_else(|| sibling.under_name.clone()),
+            provider: self.provider.clone().or_else(|| sibling.provider.clone()),
+        }
+    }
+}
+
+/// The `.ticket.json` record for the ticket with this slug, if the
+/// extractor wrote one. One that doesn't parse is warned about and
+/// ignored, so the ticket is still filed on what the run's
+/// reservations say.
+pub(super) fn ticket_record(
+    extractor: &str,
+    records: &[&Artifact],
+    slug: &str,
+) -> Option<TicketRecord> {
+    let record = records.iter().find(|r| r.slug == slug)?;
+    let parsed = fs::read_to_string(&record.path)
+        .map_err(anyhow::Error::from)
+        .and_then(|body| serde_json::from_str(&body).map_err(anyhow::Error::from));
+    match parsed {
+        Ok(record) => Some(record),
+        Err(e) => {
+            warn!(
+                extractor,
+                path = %record.path.display(),
+                error = format!("{e:#}"),
+                "unreadable ticket record"
+            );
+            None
+        }
+    }
+}
+
 /// Collect identifying fields from this run's sibling
 /// `.reservation.json` artifacts for the ticket sidecar. A boarding
 /// pass carries none of this itself, but the reservation filed in the
