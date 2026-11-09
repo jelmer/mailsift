@@ -19,6 +19,7 @@ use crate::artifacts::{ScanResult, scan};
 /// `requires` against an IMAP `BODYSTRUCTURE` summary in
 /// [`crate::imap_scan`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "web", derive(utoipa::ToSchema))]
 pub struct Manifest {
     pub name: String,
     /// Lower numbers run earlier. Defaults to 100.

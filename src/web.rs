@@ -22,13 +22,13 @@ use anyhow::{Context, Result};
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use bytes::Bytes;
 use chrono::{NaiveDate, NaiveDateTime, Utc};
 use iso_currency::Currency;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::info;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
@@ -229,8 +229,9 @@ async fn serve_unix(path: &Path, app: Router, mode: u32) -> Result<()> {
 #[openapi(
     info(
         title = "mailsift",
-        description = "Read-only JSON API over the mailsift artifact directories. Paired \
-                       with the HTML dashboard under the same server.",
+        description = "JSON API over the mailsift artifact directories, plus an endpoint \
+                       for submitting messages to the extraction pipeline. Paired with the \
+                       HTML dashboard under the same server.",
     ),
     components(schemas(
         Artifact,
@@ -240,6 +241,7 @@ async fn serve_unix(path: &Path, app: Router, mode: u32) -> Result<()> {
     tags(
         (name = "artifacts", description = "Extracted artifact records (bills, parcels, receipts, subscriptions, reservations)."),
         (name = "stats", description = "Pipeline event-log aggregates."),
+        (name = "ingest", description = "Extractor discovery and message submission."),
     ),
 )]
 struct ApiDoc;
@@ -253,6 +255,12 @@ fn router(state: Arc<AppState>) -> Router {
         .routes(routes!(api_reservations))
         .routes(routes!(api_stats))
         .routes(routes!(api_recent_failures))
+        .routes(routes!(api_extractors))
+        .merge(
+            OpenApiRouter::new()
+                .routes(routes!(api_post_message))
+                .layer(DefaultBodyLimit::max(crate::pipeline::MAX_MESSAGE_BYTES)),
+        )
         .split_for_parts();
 
     Router::new()
@@ -279,13 +287,6 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/tickets/{year}/{slug}/view", get(view_ticket))
         .route("/tickets/{year}/{name}", get(get_ticket))
         .route("/stats", get(show_stats))
-        .route("/api/extractors", get(api_extractors))
-        .route(
-            "/api/messages",
-            post(api_post_message).layer(DefaultBodyLimit::max(
-                crate::pipeline::MAX_MESSAGE_BYTES + 1024 * 1024,
-            )),
-        )
         .merge(api_router)
         .merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", api_doc))
         .fallback(not_found)
@@ -3367,6 +3368,15 @@ fn extractors_dirs(config: &Config) -> Vec<PathBuf> {
 /// Serve the discovered extractor manifests as JSON so external clients
 /// (such as the Gmail Add-on) can prefilter messages locally before
 /// uploading them to `POST /api/messages`.
+#[utoipa::path(
+    get,
+    path = "/api/extractors",
+    tag = "ingest",
+    responses(
+        (status = 200, description = "Extractor manifests, sorted by `order` then name.", body = [crate::extractor::Manifest]),
+        (status = 500, description = "I/O or YAML parse error reading a manifest."),
+    ),
+)]
 async fn api_extractors(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<crate::extractor::Manifest>>, AppError> {
@@ -3405,25 +3415,68 @@ async fn api_extractors(
     Ok(Json(manifests))
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct PostMessageQuery {
+    /// Label recorded as the message's source. Defaults to `web-api`.
     source: Option<String>,
+    /// When the message was received, as a unix timestamp. Used to
+    /// apply an extractor's `unsigned_before` cutoff.
     received_at: Option<i64>,
+    /// Run the extractors without writing any artifacts.
     dry_run: Option<bool>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct PostMessageResponse {
+    ok: bool,
+    dry_run: bool,
+    /// Extractors that produced output, with per-kind artifact counts.
+    matched: Vec<MatchedExtractor>,
+    /// Extractors that matched the message but failed.
+    failed: Vec<FailedExtractor>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct MatchedExtractor {
+    extractor: String,
+    events: u32,
+    reservations: u32,
+    bills: u32,
+    parcels: u32,
+    receipts: u32,
+    tickets: u32,
+    subscriptions: u32,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct FailedExtractor {
+    extractor: String,
+    error: String,
 }
 
 /// Accept a raw RFC822 email message in the request body and run the
 /// extraction pipeline over it.
+#[utoipa::path(
+    post,
+    path = "/api/messages",
+    tag = "ingest",
+    params(PostMessageQuery),
+    request_body(content = String, content_type = "message/rfc822", description = "Raw RFC822 message."),
+    responses(
+        (status = 200, description = "Pipeline outcome per extractor.", body = PostMessageResponse),
+        (status = 400, description = "Empty message body."),
+        (status = 413, description = "Message larger than `MAX_MESSAGE_BYTES`."),
+        (status = 500, description = "Pipeline or sink configuration error."),
+    ),
+)]
 async fn api_post_message(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PostMessageQuery>,
     body: Bytes,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<PostMessageResponse>, AppError> {
     if body.is_empty() {
         return Err(AppError::bad_request("empty message body"));
-    }
-    if body.len() > crate::pipeline::MAX_MESSAGE_BYTES {
-        return Err(AppError::bad_request("message exceeds MAX_MESSAGE_BYTES"));
     }
 
     let config = Arc::clone(&state.config);
@@ -3432,7 +3485,7 @@ async fn api_post_message(
     let dry_run = query.dry_run.unwrap_or(false);
     let raw = body.to_vec();
 
-    let outcome = tokio::task::spawn_blocking(move || -> Result<Value> {
+    let outcome = tokio::task::spawn_blocking(move || -> Result<PostMessageResponse> {
         let runtime = tokio::runtime::Handle::current();
         let dirs = extractors_dirs(&config);
         let extractors = crate::extractor::discover(&dirs)?;
@@ -3545,33 +3598,33 @@ async fn api_post_message(
                     tickets,
                     subscriptions,
                 } => {
-                    matched.push(json!({
-                        "extractor": rec.extractor,
-                        "events": events,
-                        "reservations": reservations,
-                        "bills": bills,
-                        "parcels": parcels,
-                        "receipts": receipts,
-                        "tickets": tickets,
-                        "subscriptions": subscriptions,
-                    }));
+                    matched.push(MatchedExtractor {
+                        extractor: rec.extractor,
+                        events,
+                        reservations,
+                        bills,
+                        parcels,
+                        receipts,
+                        tickets,
+                        subscriptions,
+                    });
                 }
                 crate::pipeline::ExplainOutcome::Failed { error } => {
-                    failed.push(json!({
-                        "extractor": rec.extractor,
-                        "error": error,
-                    }));
+                    failed.push(FailedExtractor {
+                        extractor: rec.extractor,
+                        error,
+                    });
                 }
                 _ => {}
             }
         }
 
-        Ok(json!({
-            "ok": true,
-            "dry_run": dry_run,
-            "matched": matched,
-            "failed": failed,
-        }))
+        Ok(PostMessageResponse {
+            ok: true,
+            dry_run,
+            matched,
+            failed,
+        })
     })
     .await
     .context("joining pipeline task")??;
@@ -4028,15 +4081,27 @@ mod tests {
             "/api/reservations.json",
             "/api/stats.json",
             "/api/recent-failures.json",
+            "/api/extractors",
+            "/api/messages",
         ] {
             assert!(paths.contains_key(route), "missing {route} in spec");
         }
         let schemas = spec["components"]["schemas"]
             .as_object()
             .expect("no schemas");
-        for schema in ["Artifact", "ExtractorStats", "RecentFailure"] {
+        for schema in [
+            "Artifact",
+            "ExtractorStats",
+            "RecentFailure",
+            "Manifest",
+            "PostMessageResponse",
+        ] {
             assert!(schemas.contains_key(schema), "missing schema {schema}");
         }
+        assert!(
+            schemas["Manifest"]["properties"].get("script").is_none(),
+            "script path must not be in the spec"
+        );
     }
 
     #[tokio::test]
@@ -5853,5 +5918,43 @@ tickets_dir = "/var/mailsift/tickets"
         assert_eq!(parsed["matched"][0]["extractor"], "dhl");
         assert_eq!(parsed["matched"][0]["parcels"], 1);
         assert!(parcels_dir.join("DHL999.json").exists());
+    }
+
+    fn post_message_request(body: Vec<u8>) -> Request<axum::body::Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/api/messages")
+            .header(header::CONTENT_TYPE, "message/rfc822")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    fn app_without_extractors(tmp: &Path) -> Router {
+        let ext_dir = tmp.join("extractors");
+        fs::create_dir_all(&ext_dir).unwrap();
+        let config = Config {
+            extractors_dir: Some(crate::config::ExtractorsDir::Single(ext_dir)),
+            ..Config::default()
+        };
+        router(state_with(config, ""))
+    }
+
+    #[tokio::test]
+    async fn post_messages_accepts_bodies_beyond_axum_default_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app_without_extractors(tmp.path());
+        let mut raw = b"From: someone@example.com\r\nSubject: big\r\n\r\n".to_vec();
+        raw.resize(3 * 1024 * 1024, b'x');
+        let resp = app.oneshot(post_message_request(raw)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_messages_rejects_bodies_over_max_message_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app_without_extractors(tmp.path());
+        let raw = vec![b'x'; crate::pipeline::MAX_MESSAGE_BYTES + 1];
+        let resp = app.oneshot(post_message_request(raw)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
