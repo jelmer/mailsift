@@ -59,6 +59,9 @@ function loadAddon({ threads, manifests, cost, failIds }) {
   const uploads = [];
   const searches = [];
   const server = { manifests };
+  const triggers = [];
+  let nextTriggerId = 1;
+  const lock = { held: false };
   const extractorRequests = [];
   const mailbox = threads.map((t) => ({
     id: t.id,
@@ -179,7 +182,39 @@ function loadAddon({ threads, manifests, cost, failIds }) {
       },
     },
     CardService: stub,
-    ScriptApp: stub,
+    ScriptApp: {
+      getProjectTriggers: () => triggers.slice(),
+      deleteTrigger: (t) => triggers.splice(triggers.indexOf(t), 1),
+      newTrigger: (handler) => ({
+        timeBased: () => {
+          const builder = {
+            after: () => builder,
+            everyHours: () => builder,
+            create: () => {
+              const id = `trigger-${nextTriggerId++}`;
+              const t = { getHandlerFunction: () => handler, getUniqueId: () => id };
+              triggers.push(t);
+              return t;
+            },
+          };
+          return builder;
+        },
+      }),
+    },
+    LockService: {
+      getUserLock: () => ({
+        tryLock: () => {
+          if (lock.held) {
+            return false;
+          }
+          lock.held = true;
+          return true;
+        },
+        releaseLock: () => {
+          lock.held = false;
+        },
+      }),
+    },
     __now: () => now,
   };
   vm.createContext(context);
@@ -198,7 +233,10 @@ function loadAddon({ threads, manifests, cost, failIds }) {
     extractorRequests,
     props,
     labelled: () => mailbox.filter((t) => t.labels.size > 0).map((t) => t.id),
-    syncState: () => JSON.parse(cache.get('MAILSIFT_SYNC_STATE_V2') || 'null'),
+    lock,
+    /** Handler names of the project's triggers. */
+    triggers: () => triggers.map((t) => t.getHandlerFunction()),
+    syncStatus: () => JSON.parse(cache.get('MAILSIFT_SYNC_STATUS_V1') || 'null'),
     /** Drop everything from the user cache, as its TTLs would. */
     expireCache: () => cache.clear(),
     /** Let `ms` of virtual time pass. */

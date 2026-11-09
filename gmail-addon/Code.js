@@ -13,7 +13,7 @@ const PROP_AUTO_UPLOAD = 'MAILSIFT_AUTO_UPLOAD';
 const PROP_PROCESSED_LABEL = 'MAILSIFT_PROCESSED_LABEL';
 const CACHE_EXTRACTORS_KEY = 'MAILSIFT_EXTRACTORS_V2';
 const CACHE_CHECKED_IDS_KEY = 'MAILSIFT_CHECKED_IDS_V1';
-const CACHE_SYNC_STATE_KEY = 'MAILSIFT_SYNC_STATE_V2';
+const CACHE_SYNC_STATUS_KEY = 'MAILSIFT_SYNC_STATUS_V1';
 const CACHE_MSG_RESULT_PREFIX = 'MAILSIFT_MSG_RES_';
 const CACHE_MAX_TTL_SECONDS = 21600;
 // How long to use the cached extractor list before revalidating it.
@@ -27,11 +27,11 @@ const SYNC_LOOKBACK_SECONDS = 7 * 86400;
 // searches this far before its cursor; checkedIds skips repeats.
 const SYNC_OVERLAP_SECONDS = 3600;
 const SEARCH_PAGE_SIZE = 100;
-// Stop starting new messages after this long. Card actions are killed at
-// 30s, and one message (Gmail fetches plus the server running the
-// extraction pipeline) has to fit in the remainder.
-const UI_BATCH_MAX_DURATION_MS = 10000;
-const UI_SYNC_MAX_THREADS = 50;
+const SYNC_MAX_DURATION_MS = 240000;
+// A queued or running status older than this belongs to a run that never
+// started or was killed (executions are limited to 6 minutes).
+const SYNC_STALE_MS = 10 * 60 * 1000;
+const SCHEDULED_SYNC_HANDLER = 'runScheduledSync';
 
 /**
  * Load user settings from `PropertiesService`.
@@ -426,19 +426,38 @@ function onHomepage(statusMessage) {
     );
   }
 
+  const syncStatus = getSyncStatus();
+  const { text, detail } = describeSyncStatus(syncStatus);
   section.addWidget(
-    CardService.newButtonSet()
-      .addButton(
-        CardService.newTextButton()
-          .setText('Start Sync')
-          .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-          .setOnClickAction(
-            CardService.newAction()
-              .setFunctionName('onSyncNow')
-              .setLoadIndicator(CardService.LoadIndicator.SPINNER)
-          )
+    CardService.newDecoratedText()
+      .setTopLabel('Sync')
+      .setText(text)
+      .setBottomLabel(detail)
+      .setWrapText(true)
+  );
+  const syncButtons = CardService.newButtonSet();
+  if (!isSyncActive(syncStatus)) {
+    syncButtons.addButton(
+      CardService.newTextButton()
+        .setText('Start Sync')
+        .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+        .setOnClickAction(
+          CardService.newAction()
+            .setFunctionName('onSyncNow')
+            .setLoadIndicator(CardService.LoadIndicator.SPINNER)
+        )
+    );
+  }
+  syncButtons.addButton(
+    CardService.newTextButton()
+      .setText('Refresh')
+      .setOnClickAction(
+        CardService.newAction()
+          .setFunctionName('onRefreshHomepage')
+          .setLoadIndicator(CardService.LoadIndicator.SPINNER)
       )
   );
+  section.addWidget(syncButtons);
 
   section.addWidget(
     CardService.newButtonSet()
@@ -1016,76 +1035,6 @@ function saveCheckedMessageIds(ids) {
 }
 
 /**
- * Load or initialize interactive sync session state from `CacheService`.
- *
- * @param {boolean=} reset
- * @return {Object}
- */
-function getSyncState(reset) {
-  if (!reset) {
-    try {
-      const raw = CacheService.getUserCache().get(CACHE_SYNC_STATE_KEY);
-      if (raw) {
-        return JSON.parse(raw);
-      }
-    } catch (_) {}
-  }
-  return {
-    offset: 0,
-    totalThreads: 0,
-    threadsDone: 0,
-    scannedMessages: 0,
-    matchedMessages: 0,
-    uploadedMessages: 0,
-    recentFinds: [],
-    failures: [],
-    failedIds: [],
-    currentThread: null,
-    done: false,
-  };
-}
-
-/**
- * Save interactive sync session state to `CacheService`.
- *
- * @param {Object} state
- */
-function saveSyncState(state) {
-  try {
-    CacheService.getUserCache().put(
-      CACHE_SYNC_STATE_KEY,
-      JSON.stringify(state),
-      1800
-    );
-  } catch (_) {}
-}
-
-/**
- * Run one time-bounded interactive sync step and return
- * an updated Progress Card showing a visual progress bar, live counters,
- * and a list of matched messages with links to Mailsift.
- *
- * @param {Object=} e
- * @return {GoogleAppsScript.Card_Service.ActionResponse}
- */
-function onSyncNow(e) {
-  const reset = getActionParameters(e).continueBatch !== 'true';
-  try {
-    const state = runInteractiveSyncStep(reset);
-    const card = buildSyncProgressCard(state);
-    return CardService.newActionResponseBuilder()
-      .setNavigation(CardService.newNavigation().updateCard(card))
-      .build();
-  } catch (err) {
-    return CardService.newActionResponseBuilder()
-      .setNotification(
-        CardService.newNotification().setText(`Sync failed: ${err.message}`)
-      )
-      .build();
-  }
-}
-
-/**
  * Evaluate one message during sync and upload it if it matches.
  *
  * An HTTP error from the Mailsift server is returned as `error` rather
@@ -1119,235 +1068,163 @@ function syncMessage(extractors, message) {
 }
 
 /**
- * Execute one bounded step of interactive sync and update `SyncState`.
+ * Read the status of the current or most recent sync run, or `null`.
  *
- * Card actions are killed after 30 seconds, losing anything not yet
- * saved, so the time budget is checked before every message rather than
- * every thread. A thread that doesn't fit is resumed in the next step;
- * `checkedIds` skips the messages already handled.
- *
- * @param {boolean} reset
- * @return {Object} updated sync state
+ * @return {Object|null} `{ state: 'queued'|'running'|'finished'|'failed',
+ *   updatedAt, total?, handled?, scanned?, matched?, uploaded?, error? }`
  */
-function runInteractiveSyncStep(reset) {
-  const startMs = Date.now();
-  const settings = getSettings();
-  const extractors = getExtractors();
-  const query = buildGmailSearchQuery(extractors, {
-    newerThanDays: 7,
-    excludeLabel: settings.processedLabel,
-  });
-
-  const state = getSyncState(reset);
-  const checkedIds = loadCheckedMessageIds();
-
-  if (reset || state.totalThreads === 0) {
-    const allCandidateThreads = GmailApp.search(query, 0, UI_SYNC_MAX_THREADS);
-    state.totalThreads = allCandidateThreads.length;
-    state.offset = 0;
-    state.threadsDone = 0;
-  }
-
-  // How many threads fit in this step is up to the time budget.
-  const batchThreads = GmailApp.search(
-    query,
-    state.offset,
-    Math.max(state.totalThreads - state.threadsDone, 1)
-  );
-  if (batchThreads.length === 0) {
-    state.done = true;
-    state.threadsDone = state.totalThreads;
-    saveSyncState(state);
-    return state;
-  }
-
-  const failedIds = new Set(state.failedIds);
-  // Always handle at least one message, even if setup used up the budget.
-  let handledAny = false;
-  try {
-    for (const thread of batchThreads) {
-      const threadId = thread.getId();
-      if (!state.currentThread || state.currentThread.id !== threadId) {
-        state.currentThread = { id: threadId, matched: false, failed: false };
-      }
-      let finished = true;
-      for (const message of thread.getMessages()) {
-        const msgId = message.getId();
-        if (checkedIds.has(msgId) || failedIds.has(msgId)) {
-          continue;
-        }
-        if (handledAny && Date.now() - startMs > UI_BATCH_MAX_DURATION_MS) {
-          finished = false;
-          break;
-        }
-        handledAny = true;
-        state.scannedMessages++;
-        const { info, matching, result, error } = syncMessage(
-          extractors,
-          message
-        );
-        const subject = info.subject || '(no subject)';
-        const names = matching.map((m) => m.name).join(', ');
-        if (matching.length > 0) {
-          state.matchedMessages++;
-        }
-        if (error) {
-          failedIds.add(msgId);
-          state.currentThread.failed = true;
-          state.failures.unshift({ subject, extractors: names, error: error.message });
-          state.failures = state.failures.slice(0, 8);
-          continue;
-        }
-        checkedIds.add(msgId);
-        if (result) {
-          state.uploadedMessages++;
-          state.currentThread.matched = true;
-          state.recentFinds.unshift({
-            subject,
-            extractors: names,
-            outcome: formatUploadOutcome(result),
-          });
-          state.recentFinds = state.recentFinds.slice(0, 8);
-        }
-      }
-      if (!finished) {
-        break;
-      }
-      // A labelled thread drops out of the search results, so only
-      // advance the offset past threads that stay in them. Threads with
-      // a failed upload stay unlabelled so a later sync retries them.
-      if (state.currentThread.matched && !state.currentThread.failed) {
-        markThreadProcessed(thread, settings.processedLabel);
-      } else {
-        state.offset++;
-      }
-      state.currentThread = null;
-      state.threadsDone = Math.min(state.threadsDone + 1, state.totalThreads);
-    }
-
-    if (state.threadsDone >= state.totalThreads) {
-      state.done = true;
-    }
-  } finally {
-    state.failedIds = Array.from(failedIds);
-    saveCheckedMessageIds(checkedIds);
-    saveSyncState(state);
-  }
-  return state;
+function getSyncStatus() {
+  const raw = CacheService.getUserCache().get(CACHE_SYNC_STATUS_KEY);
+  return raw ? JSON.parse(raw) : null;
 }
 
 /**
- * Build the visual Sync Progress Card showing a progress bar, live
- * counters, extracted items, and a "Next Batch" button.
- *
- * @param {Object} state
- * @return {GoogleAppsScript.Card_Service.Card}
+ * @param {Object} status see `getSyncStatus`
  */
-function buildSyncProgressCard(state) {
-  const settings = getSettings();
-  const bar = renderProgressBar(state.threadsDone, state.totalThreads);
-  const statusTitle = state.done ? 'Sync Complete' : 'Sync in Progress';
-
-  const card = CardService.newCardBuilder().setHeader(
-    CardService.newCardHeader()
-      .setTitle('Mailsift Sync')
-      .setSubtitle(statusTitle)
+function saveSyncStatus(status) {
+  status.updatedAt = Date.now();
+  CacheService.getUserCache().put(
+    CACHE_SYNC_STATUS_KEY,
+    JSON.stringify(status),
+    CACHE_MAX_TTL_SECONDS
   );
-
-  const progressSection = CardService.newCardSection()
-    .setHeader('Progress')
-    .addWidget(
-      CardService.newDecoratedText()
-        .setTopLabel('Threads Processed')
-        .setText(bar)
-        .setBottomLabel(
-          `Scanned ${state.scannedMessages} msg(s) · Matched ${state.matchedMessages} · Uploaded ${state.uploadedMessages}`
-        )
-    );
-
-  const buttons = CardService.newButtonSet();
-  if (!state.done && state.totalThreads > state.threadsDone) {
-    const remaining = state.totalThreads - state.threadsDone;
-    buttons.addButton(
-      CardService.newTextButton()
-        .setText(`Sync Next Batch (${remaining} left)`)
-        .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-        .setOnClickAction(
-          CardService.newAction()
-            .setFunctionName('onSyncNow')
-            .setParameters({ continueBatch: 'true' })
-            .setLoadIndicator(CardService.LoadIndicator.SPINNER)
-        )
-    );
-  } else {
-    buttons.addButton(
-      CardService.newTextButton()
-        .setText('Rescan')
-        .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-        .setOnClickAction(
-          CardService.newAction()
-            .setFunctionName('onSyncNow')
-            .setParameters({ continueBatch: 'false' })
-            .setLoadIndicator(CardService.LoadIndicator.SPINNER)
-        )
-    );
-  }
-  buttons.addButton(
-    CardService.newTextButton()
-      .setText('Back')
-      .setOnClickAction(
-        CardService.newAction().setFunctionName('onBackToHome')
-      )
-  );
-  progressSection.addWidget(buttons);
-  card.addSection(progressSection);
-
-  if (state.recentFinds && state.recentFinds.length > 0) {
-    const findsSection = CardService.newCardSection().setHeader(
-      'Matched & Uploaded'
-    );
-    for (const item of state.recentFinds) {
-      findsSection.addWidget(
-        CardService.newDecoratedText()
-          .setTopLabel(item.extractors)
-          .setText(item.subject)
-          .setBottomLabel(item.outcome)
-          .setOpenLink(
-            CardService.newOpenLink().setUrl(settings.serverUrl + '/all')
-          )
-      );
-    }
-    card.addSection(findsSection);
-  }
-
-  if (state.failedIds.length > 0) {
-    const failuresSection = CardService.newCardSection().setHeader(
-      `Failed Uploads (${state.failedIds.length}, retried on rescan)`
-    );
-    for (const item of state.failures) {
-      failuresSection.addWidget(
-        CardService.newDecoratedText()
-          .setTopLabel(item.extractors)
-          .setText(item.subject)
-          .setBottomLabel(item.error)
-          .setWrapText(true)
-      );
-    }
-    card.addSection(failuresSection);
-  }
-
-  return card.build();
 }
 
 /**
- * Navigate back to the Homepage card.
+ * Whether `status` describes a run that is queued or running, ignoring
+ * ones that have gone quiet for too long to still be alive.
+ *
+ * @param {Object|null} status
+ * @return {boolean}
+ */
+function isSyncActive(status) {
+  return Boolean(
+    status &&
+      (status.state === 'queued' || status.state === 'running') &&
+      Date.now() - status.updatedAt < SYNC_STALE_MS
+  );
+}
+
+/**
+ * Schedule a one-off run of the background sync, which (unlike a card
+ * action) may run for several minutes.
+ */
+function scheduleSyncRun() {
+  ScriptApp.newTrigger(SCHEDULED_SYNC_HANDLER).timeBased().after(1000).create();
+  saveSyncStatus({ state: 'queued' });
+}
+
+/**
+ * Handler for the one-off triggers created by `scheduleSyncRun`.
+ */
+function runScheduledSync() {
+  // One-off triggers aren't removed after they fire. Remove them all: the
+  // run below covers whatever any of them was for.
+  for (const t of ScriptApp.getProjectTriggers()) {
+    if (t.getHandlerFunction() === SCHEDULED_SYNC_HANDLER) {
+      ScriptApp.deleteTrigger(t);
+    }
+  }
+  syncMatchingEmails();
+}
+
+/**
+ * "Start Sync" action: queue a background sync run unless one is already
+ * queued or running, and show its status on the homepage.
  *
  * @return {GoogleAppsScript.Card_Service.ActionResponse}
  */
-function onBackToHome() {
+function onSyncNow() {
+  let note;
+  if (isSyncActive(getSyncStatus())) {
+    note = 'A sync is already in progress.';
+  } else {
+    scheduleSyncRun();
+    note = 'Sync started. Refresh to follow its progress.';
+  }
+  return CardService.newActionResponseBuilder()
+    .setNavigation(CardService.newNavigation().updateCard(onHomepage()))
+    .setNotification(CardService.newNotification().setText(note))
+    .build();
+}
+
+/**
+ * Universal action wrapper for `onSyncNow`.
+ *
+ * @return {GoogleAppsScript.Card_Service.UniversalActionResponse}
+ */
+function onSyncNowUniversal() {
+  if (!isSyncActive(getSyncStatus())) {
+    scheduleSyncRun();
+  }
+  return CardService.newUniversalActionResponseBuilder()
+    .displayAddOnCards([onHomepage()])
+    .build();
+}
+
+/**
+ * Universal action wrapper for `onSettings`.
+ *
+ * @return {GoogleAppsScript.Card_Service.UniversalActionResponse}
+ */
+function onSettingsUniversal() {
+  return CardService.newUniversalActionResponseBuilder()
+    .displayAddOnCards([onSettings()])
+    .build();
+}
+
+/**
+ * "Refresh" action: re-render the homepage with the latest sync status.
+ *
+ * @return {GoogleAppsScript.Card_Service.ActionResponse}
+ */
+function onRefreshHomepage() {
   return CardService.newActionResponseBuilder()
     .setNavigation(CardService.newNavigation().updateCard(onHomepage()))
     .build();
+}
+
+/**
+ * Describe `status` for the homepage as `{ text, detail }`.
+ *
+ * @param {Object|null} status
+ * @return {{text: string, detail: string}}
+ */
+function describeSyncStatus(status) {
+  if (!status) {
+    return { text: 'No recent sync', detail: '' };
+  }
+  const counts = (s) =>
+    `Scanned ${s.scanned} · Matched ${s.matched} · Uploaded ${s.uploaded}`;
+  const ago = Math.round((Date.now() - status.updatedAt) / 60000);
+  const when = ago < 1 ? 'just now' : `${ago} min ago`;
+  if (status.state !== 'finished' && status.state !== 'failed' && !isSyncActive(status)) {
+    return {
+      text: 'Sync stopped responding',
+      detail: `Last update ${when}; the run was probably killed.`,
+    };
+  }
+  switch (status.state) {
+    case 'queued':
+      return { text: 'Sync queued', detail: 'Starts within a minute or so.' };
+    case 'running':
+      return {
+        text: renderProgressBar(status.handled, status.total),
+        detail: counts(status),
+      };
+    case 'finished':
+      return { text: `Sync finished ${when}`, detail: counts(status) };
+    case 'failed':
+      return {
+        text: `Sync failed ${when}`,
+        detail:
+          status.scanned === undefined
+            ? status.error
+            : `${counts(status)}\n${status.error}`,
+      };
+    default:
+      throw new Error(`Unknown sync state ${status.state}`);
+  }
 }
 
 /**
@@ -1431,10 +1308,46 @@ function listMessagesSince(query, sinceEpoch) {
  * throws after finishing if anything failed, so failures show up in the
  * trigger's execution log and failure emails.
  *
- * @return {Object} `{ scanned, matched, uploaded, timedOut }`
+ * Progress goes to the sync status shown on the homepage. A run that
+ * runs out of time queues a follow-up run, and a run that finds another
+ * one in progress leaves the work to it.
+ *
+ * @return {Object|null} `{ scanned, matched, uploaded, timedOut }`, or
+ *   `null` if another run was in progress
  */
 function syncMatchingEmails() {
-  const maxDurationMs = 240000;
+  const lock = LockService.getUserLock();
+  if (!lock.tryLock(0)) {
+    console.log('Another sync run is in progress; leaving the work to it.');
+    return null;
+  }
+  let outcome;
+  try {
+    outcome = syncWithLock();
+  } catch (err) {
+    saveSyncStatus(
+      Object.assign({}, getSyncStatus(), { state: 'failed', error: err.message })
+    );
+    throw err;
+  } finally {
+    lock.releaseLock();
+  }
+  const { problems, ...result } = outcome;
+  if (result.timedOut) {
+    scheduleSyncRun();
+  }
+  if (problems.length > 0) {
+    throw new Error(problems.join('\n'));
+  }
+  return result;
+}
+
+/**
+ * The body of `syncMatchingEmails`, run while holding its lock.
+ *
+ * @return {Object} `{ scanned, matched, uploaded, timedOut, problems }`
+ */
+function syncWithLock() {
   const startMs = Date.now();
   const startEpoch = Math.floor(startMs / 1000);
   const oldestEpoch = startEpoch - SYNC_LOOKBACK_SECONDS;
@@ -1474,30 +1387,37 @@ function syncMatchingEmails() {
   const failed = [];
   const labelledThreads = new Set();
   let newCursor = cursor;
-  let scanned = 0;
-  let matchedCount = 0;
-  let uploadedCount = 0;
   let timedOut = false;
+  const status = {
+    state: 'running',
+    total: entries.length,
+    handled: 0,
+    scanned: 0,
+    matched: 0,
+    uploaded: 0,
+  };
+  saveSyncStatus(status);
 
   try {
     for (const { message, date } of entries) {
-      if (Date.now() - startMs > maxDurationMs) {
+      if (Date.now() - startMs > SYNC_MAX_DURATION_MS) {
         timedOut = true;
         break;
       }
       const msgId = message.getId();
+      status.handled++;
       if (!checkedIds.has(msgId)) {
-        scanned++;
+        status.scanned++;
         const { matching, result, error } = syncMessage(extractors, message);
         if (matching.length > 0) {
-          matchedCount++;
+          status.matched++;
         }
         if (error) {
           failed.push({ id: msgId, error: error.message });
         } else {
           checkedIds.add(msgId);
           if (result) {
-            uploadedCount++;
+            status.uploaded++;
             const thread = message.getThread();
             if (!labelledThreads.has(thread.getId())) {
               markThreadProcessed(thread, settings.processedLabel);
@@ -1505,6 +1425,7 @@ function syncMatchingEmails() {
             }
           }
         }
+        saveSyncStatus(status);
       }
       handledIds.add(msgId);
       newCursor = Math.max(newCursor, Math.floor(date));
@@ -1534,15 +1455,18 @@ function syncMatchingEmails() {
         `${days}-day lookback:\n${abandoned.join('\n')}`
     );
   }
-  if (problems.length > 0) {
-    throw new Error(problems.join('\n'));
-  }
 
+  if (!timedOut) {
+    status.state = problems.length > 0 ? 'failed' : 'finished';
+    status.error = problems.join('\n');
+    saveSyncStatus(status);
+  }
   return {
-    scanned,
-    matched: matchedCount,
-    uploaded: uploadedCount,
+    scanned: status.scanned,
+    matched: status.matched,
+    uploaded: status.uploaded,
     timedOut,
+    problems,
   };
 }
 

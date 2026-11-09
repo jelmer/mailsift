@@ -23,11 +23,11 @@
       "universalActions": [
         {
           "label": "Sync Matching Emails",
-          "runFunction": "onSyncNow"
+          "runFunction": "onSyncNowUniversal"
         },
         {
           "label": "Settings",
-          "runFunction": "onSettings"
+          "runFunction": "onSettingsUniversal"
         }
       ]
     },
