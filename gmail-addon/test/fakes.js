@@ -2,6 +2,7 @@
 // services. Fake service calls advance a virtual clock by `cost[...]` ms,
 // which `Date.now()` inside the context reports.
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -25,8 +26,12 @@ const stub = new Proxy(function () {}, {
   apply: () => stub,
 });
 
-function response(code, text) {
-  return { getResponseCode: () => code, getContentText: () => text };
+function response(code, text, headers) {
+  return {
+    getResponseCode: () => code,
+    getContentText: () => text,
+    getHeaders: () => headers || {},
+  };
 }
 
 /**
@@ -53,6 +58,8 @@ function loadAddon({ threads, manifests, cost, failIds }) {
   const labels = new Map();
   const uploads = [];
   const searches = [];
+  const server = { manifests };
+  const extractorRequests = [];
   const mailbox = threads.map((t) => ({
     id: t.id,
     dates: (t.hoursAgo || Array(t.messages).fill(24)).map(
@@ -116,19 +123,31 @@ function loadAddon({ threads, manifests, cost, failIds }) {
       getUserProperties: () => ({
         getProperty: (k) => (props.has(k) ? props.get(k) : null),
         setProperty: (k, v) => props.set(k, String(v)),
+        setProperties: (kv) => {
+          for (const [k, v] of Object.entries(kv)) {
+            props.set(k, String(v));
+          }
+        },
       }),
     },
     CacheService: {
       getUserCache: () => ({
         get: (k) => (cache.has(k) ? cache.get(k) : null),
         put: (k, v) => cache.set(k, v),
+        remove: (k) => cache.delete(k),
       }),
     },
     UrlFetchApp: {
-      fetch: (url) => {
+      fetch: (url, opts) => {
         if (url.endsWith('/api/extractors')) {
           tick(cost.extractors);
-          return response(200, JSON.stringify(manifests));
+          const body = JSON.stringify(server.manifests);
+          const etag = `"${crypto.createHash('sha256').update(body).digest('hex')}"`;
+          const ifNoneMatch = (opts.headers || {})['If-None-Match'] || null;
+          extractorRequests.push(ifNoneMatch);
+          return ifNoneMatch === etag
+            ? response(304, '', { ETag: etag })
+            : response(200, body, { ETag: etag });
         }
         tick(cost.upload);
         const id = decodeURIComponent(/source=([^&]+)/.exec(url)[1]).replace(
@@ -174,6 +193,9 @@ function loadAddon({ threads, manifests, cost, failIds }) {
     context,
     uploads,
     searches,
+    server,
+    /** The `If-None-Match` header (or null) of each `/api/extractors` request. */
+    extractorRequests,
     props,
     labelled: () => mailbox.filter((t) => t.labels.size > 0).map((t) => t.id),
     syncState: () => JSON.parse(cache.get('MAILSIFT_SYNC_STATE_V2') || 'null'),

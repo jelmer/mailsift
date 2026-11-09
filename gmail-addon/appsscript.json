@@ -26,10 +26,6 @@
           "runFunction": "onSyncNow"
         },
         {
-          "label": "Refresh Extractors",
-          "runFunction": "onRefreshExtractors"
-        },
-        {
           "label": "Settings",
           "runFunction": "onSettings"
         }

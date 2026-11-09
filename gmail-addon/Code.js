@@ -11,11 +11,13 @@ const PROP_SERVER_URL = 'MAILSIFT_SERVER_URL';
 const PROP_AUTH_HEADER = 'MAILSIFT_AUTH_HEADER';
 const PROP_AUTO_UPLOAD = 'MAILSIFT_AUTO_UPLOAD';
 const PROP_PROCESSED_LABEL = 'MAILSIFT_PROCESSED_LABEL';
-const CACHE_EXTRACTORS_KEY = 'MAILSIFT_EXTRACTORS_JSON_V1';
+const CACHE_EXTRACTORS_KEY = 'MAILSIFT_EXTRACTORS_V2';
 const CACHE_CHECKED_IDS_KEY = 'MAILSIFT_CHECKED_IDS_V1';
 const CACHE_SYNC_STATE_KEY = 'MAILSIFT_SYNC_STATE_V2';
 const CACHE_MSG_RESULT_PREFIX = 'MAILSIFT_MSG_RES_';
-const CACHE_TTL_SECONDS = 3600; // 1 hour
+const CACHE_MAX_TTL_SECONDS = 21600;
+// How long to use the cached extractor list before revalidating it.
+const EXTRACTORS_FRESH_MS = 5 * 60 * 1000;
 const MSG_RESULT_TTL_SECONDS = 21600; // 6 hours
 const DEFAULT_PROCESSED_LABEL = 'Mailsift';
 const PROP_SYNC_CURSOR = 'MAILSIFT_SYNC_CURSOR';
@@ -67,72 +69,87 @@ function buildHeaders(settings, extraHeaders) {
 }
 
 /**
- * Return cached extractor manifests without making a network call, or
- * `null` if the cache is cold.
+ * Return the cached extractor manifests with the ETag they were served
+ * with and when that was last confirmed, or `null` if the cache is cold.
  *
- * @return {Array<Object>|null}
+ * @return {{manifests: Array<Object>, etag: (string|null), checkedAt: number}|null}
  */
 function getCachedExtractors() {
   const cached = CacheService.getUserCache().get(CACHE_EXTRACTORS_KEY);
-  if (!cached) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(cached);
-    return Array.isArray(parsed) ? parsed : null;
-  } catch (_) {
-    return null;
-  }
+  return cached ? JSON.parse(cached) : null;
 }
 
 /**
- * Download and cache the extractor manifests from
- * `GET <serverUrl>/api/extractors`.
+ * Look up a response header case-insensitively.
  *
- * @param {boolean=} forceRefresh
+ * @param {GoogleAppsScript.URL_Fetch.HTTPResponse} resp
+ * @param {string} name
+ * @return {string|null}
+ */
+function getResponseHeader(resp, name) {
+  const headers = resp.getHeaders();
+  const key = Object.keys(headers).find(
+    (k) => k.toLowerCase() === name.toLowerCase()
+  );
+  return key === undefined ? null : headers[key];
+}
+
+/**
+ * Return the extractor manifests from `GET <serverUrl>/api/extractors`.
+ *
+ * A cached list is used as-is for `EXTRACTORS_FRESH_MS`; after that it is
+ * revalidated with `If-None-Match`, which costs a round trip but no body
+ * when nothing changed.
+ *
  * @return {Array<Object>}
  */
-function getExtractors(forceRefresh) {
+function getExtractors() {
   const settings = getSettings();
   if (!settings.serverUrl) {
     throw new Error('Mailsift server URL is not configured.');
   }
 
-  if (!forceRefresh) {
-    const cached = getCachedExtractors();
-    if (cached) {
-      return cached;
-    }
+  const cached = getCachedExtractors();
+  const nowMs = Date.now();
+  if (cached && nowMs - cached.checkedAt < EXTRACTORS_FRESH_MS) {
+    return cached.manifests;
   }
 
   const url = settings.serverUrl + '/api/extractors';
+  const extraHeaders = { Accept: 'application/json' };
+  if (cached && cached.etag) {
+    extraHeaders['If-None-Match'] = cached.etag;
+  }
   const resp = UrlFetchApp.fetch(url, {
     method: 'get',
-    headers: buildHeaders(settings, { Accept: 'application/json' }),
+    headers: buildHeaders(settings, extraHeaders),
     muteHttpExceptions: true,
   });
 
   const status = resp.getResponseCode();
-  if (status < 200 || status >= 300) {
+  let manifests;
+  if (status === 304 && cached) {
+    manifests = cached.manifests;
+  } else if (status >= 200 && status < 300) {
+    manifests = JSON.parse(resp.getContentText());
+    if (!Array.isArray(manifests)) {
+      throw new Error('Expected JSON array from /api/extractors');
+    }
+  } else {
     throw new Error(
       `GET ${url} failed with HTTP ${status}: ${resp.getContentText().slice(0, 200)}`
     );
   }
 
-  const text = resp.getContentText();
-  const manifests = JSON.parse(text);
-  if (!Array.isArray(manifests)) {
-    throw new Error('Expected JSON array from /api/extractors');
-  }
-  try {
-    CacheService.getUserCache().put(
-      CACHE_EXTRACTORS_KEY,
-      JSON.stringify(manifests),
-      CACHE_TTL_SECONDS
-    );
-  } catch (_) {
-    // Ignore cache size limits if manifest set is very large.
-  }
+  CacheService.getUserCache().put(
+    CACHE_EXTRACTORS_KEY,
+    JSON.stringify({
+      manifests,
+      etag: getResponseHeader(resp, 'ETag'),
+      checkedAt: nowMs,
+    }),
+    CACHE_MAX_TTL_SECONDS
+  );
   return manifests;
 }
 
@@ -366,9 +383,8 @@ function markThreadProcessed(thread, labelName) {
 }
 
 /**
- * Homepage trigger handler. Renders immediately using cached extractor
- * metadata so opening the sidebar or saving settings never blocks on a
- * slow network request.
+ * Homepage trigger handler. Loads the extractor list (usually from the
+ * cache), which also shows whether the server is reachable.
  *
  * @param {string=} statusMessage Optional status banner to display
  * @return {GoogleAppsScript.Card_Service.Card}
@@ -392,34 +408,26 @@ function onHomepage(statusMessage) {
     );
   }
 
-  const cachedExtractors = getCachedExtractors();
-  if (cachedExtractors) {
+  try {
+    const extractors = getExtractors();
     section.addWidget(
       CardService.newDecoratedText()
-        .setTopLabel('Loaded Extractors')
-        .setText(`${cachedExtractors.length} active extractor(s) cached`)
+        .setTopLabel('Extractors')
+        .setText(`${extractors.length} active extractor(s)`)
         .setBottomLabel('Ready to match and sync emails')
     );
-  } else {
+  } catch (err) {
     section.addWidget(
       CardService.newDecoratedText()
-        .setTopLabel('Extractor Cache')
-        .setText('Not loaded yet')
-        .setBottomLabel('Click "Load Extractors" below to fetch from server')
+        .setTopLabel('Extractors')
+        .setText('Could not load extractors from the server')
+        .setBottomLabel(err.message)
+        .setWrapText(true)
     );
   }
 
   section.addWidget(
     CardService.newButtonSet()
-      .addButton(
-        CardService.newTextButton()
-          .setText('Load Extractors')
-          .setOnClickAction(
-            CardService.newAction()
-              .setFunctionName('onRefreshExtractors')
-              .setLoadIndicator(CardService.LoadIndicator.SPINNER)
-          )
-      )
       .addButton(
         CardService.newTextButton()
           .setText('Start Sync')
@@ -480,23 +488,17 @@ function onGmailMessageOpen(e) {
   );
 
   const section = CardService.newCardSection();
-  let extractors = getCachedExtractors();
-  if (!extractors) {
+  let extractors;
+  try {
+    extractors = getExtractors();
+  } catch (err) {
     section.addWidget(
       CardService.newTextParagraph().setText(
-        'Extractor rules are not cached yet. Click "Load Extractors" to fetch them from your Mailsift server, or upload this email directly.'
+        `Could not load extractors from the server: ${err.message}`
       )
     );
     section.addWidget(
       CardService.newButtonSet()
-        .addButton(
-          CardService.newTextButton()
-            .setText('Load Extractors')
-            .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-            .setOnClickAction(
-              CardService.newAction().setFunctionName('onRefreshExtractorsFromMessage')
-            )
-        )
         .addButton(
           CardService.newTextButton()
             .setText('Upload Anyway')
@@ -605,34 +607,6 @@ function onGmailMessageOpen(e) {
   }
 
   return card.build();
-}
-
-/**
- * Refresh extractors and re-render the current message card.
- *
- * @param {Object} e
- * @return {GoogleAppsScript.Card_Service.ActionResponse}
- */
-function onRefreshExtractorsFromMessage(e) {
-  try {
-    const list = getExtractors(true);
-    return CardService.newActionResponseBuilder()
-      .setNavigation(
-        CardService.newNavigation().updateCard(onGmailMessageOpen(e))
-      )
-      .setNotification(
-        CardService.newNotification().setText(
-          `Loaded ${list.length} extractor(s).`
-        )
-      )
-      .build();
-  } catch (err) {
-    return CardService.newActionResponseBuilder()
-      .setNotification(
-        CardService.newNotification().setText(`Failed: ${err.message}`)
-      )
-      .build();
-  }
 }
 
 /**
@@ -1135,7 +1109,7 @@ function syncMessage(extractors, message) {
 function runInteractiveSyncStep(reset) {
   const startMs = Date.now();
   const settings = getSettings();
-  const extractors = getExtractors(false);
+  const extractors = getExtractors();
   const query = buildGmailSearchQuery(extractors, {
     newerThanDays: 7,
     excludeLabel: settings.processedLabel,
@@ -1442,7 +1416,7 @@ function syncMatchingEmails() {
   const oldestEpoch = startEpoch - SYNC_LOOKBACK_SECONDS;
   const settings = getSettings();
   const props = PropertiesService.getUserProperties();
-  const extractors = getExtractors(false);
+  const extractors = getExtractors();
   const cursor = Math.max(loadSyncCursor(props) || 0, oldestEpoch);
   const sinceEpoch = cursor - SYNC_OVERLAP_SECONDS;
   const query = buildGmailSearchQuery(extractors, { afterEpoch: sinceEpoch });
@@ -1546,36 +1520,6 @@ function syncMatchingEmails() {
     uploaded: uploadedCount,
     timedOut,
   };
-}
-
-/**
- * Force-refresh the cached `/api/extractors` list and update the card
- * with connection timing.
- *
- * @return {GoogleAppsScript.Card_Service.ActionResponse}
- */
-function onRefreshExtractors() {
-  const startMs = Date.now();
-  try {
-    const list = getExtractors(true);
-    const elapsedMs = Date.now() - startMs;
-    const msg = `Connected in ${elapsedMs}ms — loaded ${list.length} extractor(s).`;
-    return CardService.newActionResponseBuilder()
-      .setNavigation(CardService.newNavigation().updateCard(onHomepage(msg)))
-      .setNotification(CardService.newNotification().setText(msg))
-      .build();
-  } catch (err) {
-    return CardService.newActionResponseBuilder()
-      .setNavigation(
-        CardService.newNavigation().updateCard(
-          onHomepage(`Connection error: ${err.message}`)
-        )
-      )
-      .setNotification(
-        CardService.newNotification().setText(`Refresh failed: ${err.message}`)
-      )
-      .build();
-  }
 }
 
 /**
@@ -1686,7 +1630,7 @@ function onSaveSettings(e) {
   return CardService.newActionResponseBuilder()
     .setNavigation(
       CardService.newNavigation().updateCard(
-        onHomepage('Settings saved. Click "Load Extractors" to test connection.')
+        onHomepage('Settings saved.')
       )
     )
     .setNotification(

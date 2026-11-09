@@ -19,7 +19,7 @@ mailsift web --listen 127.0.0.1:8088
 ```
 
 The server exposes:
-- `GET /api/extractors` — JSON array of discovered extractor manifests (`name`, `order`, `from_domains`, `subject_regex`, `requires`, `require_dkim`, `unsigned_before`).
+- `GET /api/extractors` — JSON array of discovered extractor manifests (`name`, `order`, `from_domains`, `subject_regex`, `requires`, `require_dkim`, `unsigned_before`). Responses carry an `ETag`; the add-on uses its cached copy for 5 minutes and then revalidates it with `If-None-Match`, so it never needs a manual refresh.
 - `POST /api/messages` — Accepts a raw `message/rfc822` body (with optional `?source=...&received_at=...&dry_run=true` query parameters), runs the extraction pipeline, and returns a JSON summary of matched extractors and filed artifact counts.
 
 ## Installing into Gmail
