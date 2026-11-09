@@ -3447,6 +3447,19 @@ struct MatchedExtractor {
     receipts: u32,
     tickets: u32,
     subscriptions: u32,
+    /// The JSON artifacts the extractor produced (reservations, bills,
+    /// parcels, receipts, ticket records and subscriptions), as written
+    /// by the extractor before filing.
+    records: Vec<ProducedRecordJson>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct ProducedRecordJson {
+    /// Artifact kind: `reservation`, `bill`, `parcel`, `receipt`,
+    /// `ticket` or `subscription`.
+    kind: &'static str,
+    #[schema(value_type = Object)]
+    data: Value,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -3597,6 +3610,7 @@ async fn api_post_message(
                     receipts,
                     tickets,
                     subscriptions,
+                    records,
                 } => {
                     matched.push(MatchedExtractor {
                         extractor: rec.extractor,
@@ -3607,6 +3621,13 @@ async fn api_post_message(
                         receipts,
                         tickets,
                         subscriptions,
+                        records: records
+                            .into_iter()
+                            .map(|r| ProducedRecordJson {
+                                kind: r.kind.as_str(),
+                                data: r.data,
+                            })
+                            .collect(),
                     });
                 }
                 crate::pipeline::ExplainOutcome::Failed { error } => {
@@ -5917,6 +5938,13 @@ tickets_dir = "/var/mailsift/tickets"
         assert_eq!(parsed["ok"], true);
         assert_eq!(parsed["matched"][0]["extractor"], "dhl");
         assert_eq!(parsed["matched"][0]["parcels"], 1);
+        assert_eq!(
+            parsed["matched"][0]["records"],
+            serde_json::json!([{
+                "kind": "parcel",
+                "data": {"trackingNumber": "DHL999", "deliveryStatus": "OnItsWay"},
+            }])
+        );
         assert!(parcels_dir.join("DHL999.json").exists());
     }
 
