@@ -3374,12 +3374,14 @@ fn extractors_dirs(config: &Config) -> Vec<PathBuf> {
     tag = "ingest",
     responses(
         (status = 200, description = "Extractor manifests, sorted by `order` then name.", body = [crate::extractor::Manifest]),
+        (status = 304, description = "The manifests still match the `If-None-Match` ETag."),
         (status = 500, description = "I/O or YAML parse error reading a manifest."),
     ),
 )]
 async fn api_extractors(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<crate::extractor::Manifest>>, AppError> {
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
     let dirs = extractors_dirs(&state.config);
     let mut manifests: Vec<crate::extractor::Manifest> = Vec::new();
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3412,7 +3414,48 @@ async fn api_extractors(
     }
 
     manifests.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)));
-    Ok(Json(manifests))
+
+    let body = serde_json::to_vec(&manifests).context("serialising manifests")?;
+    let etag = {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(&body);
+        let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+        HeaderValue::from_str(&format!("\"{hex}\"")).expect("hex is a valid header value")
+    };
+    // Clients may cache the list but must revalidate before using it.
+    let cache_control = HeaderValue::from_static("no-cache");
+    if if_none_match_matches(&headers, &etag) {
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [(header::ETAG, etag), (header::CACHE_CONTROL, cache_control)],
+        )
+            .into_response());
+    }
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, cache_control),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+/// Whether an `If-None-Match` header lists `etag` (or `*`), using the weak
+/// comparison RFC 9110 prescribes for it.
+fn if_none_match_matches(headers: &axum::http::HeaderMap, etag: &HeaderValue) -> bool {
+    let etag = etag.as_bytes();
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|tag| tag.trim())
+        .any(|tag| tag == "*" || tag.trim_start_matches("W/").as_bytes() == etag)
 }
 
 #[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
@@ -5868,6 +5911,61 @@ tickets_dir = "/var/mailsift/tickets"
         assert_eq!(parsed[0].name, "acme");
         assert_eq!(parsed[0].order, 20);
         assert_eq!(parsed[0].from_domains, vec!["acme.example"]);
+    }
+
+    async fn get_extractors_if_none_match(
+        app: &Router,
+        if_none_match: Option<&str>,
+    ) -> (StatusCode, Option<String>, String) {
+        let mut req = Request::builder().uri("/api/extractors");
+        if let Some(tag) = if_none_match {
+            req = req.header(header::IF_NONE_MATCH, tag);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, etag, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn api_extractors_revalidates_with_etag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ext_dir = tmp.path().join("extractors");
+        fs::create_dir_all(&ext_dir).unwrap();
+        fs::write(ext_dir.join("acme.yaml"), "name: acme\n").unwrap();
+        let config = Config {
+            extractors_dir: Some(crate::config::ExtractorsDir::Single(ext_dir.clone())),
+            ..Config::default()
+        };
+        let app = router(state_with(config, ""));
+
+        let (status, etag, body) = get_extractors_if_none_match(&app, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.starts_with("[{"), "unexpected body: {body}");
+        let etag = etag.expect("no ETag header");
+
+        let (status, same, body) = get_extractors_if_none_match(&app, Some(&etag)).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+        assert_eq!(same.as_deref(), Some(etag.as_str()));
+        assert_eq!(body, "");
+
+        let listed = format!("\"other\", W/{etag}");
+        let (status, _, _) = get_extractors_if_none_match(&app, Some(&listed)).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+
+        fs::remove_file(ext_dir.join("acme.yaml")).unwrap();
+        let (status, changed, body) = get_extractors_if_none_match(&app, Some(&etag)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "[]");
+        assert_ne!(changed.as_deref(), Some(etag.as_str()));
     }
 
     #[tokio::test]
