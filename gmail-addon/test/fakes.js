@@ -223,7 +223,7 @@ function loadAddon({ threads, manifests, cost, failIds, onUpload }) {
   };
   vm.createContext(context);
   vm.runInContext('Date.now = () => __now();', context);
-  for (const file of ['Matcher.js', 'Code.js']) {
+  for (const file of ['Matcher.js', 'Format.js', 'Code.js']) {
     const src = fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
     vm.runInContext(src, context, { filename: file });
   }

@@ -614,287 +614,108 @@ function onGmailMessageOpen(e) {
 
   card.addSection(section);
 
-  if (uploadResult || matching.length > 0) {
-    const extractedSection = buildExtractedInfoSection(
-      settings,
-      info,
-      matching,
-      uploadResult
+  if (uploadResult) {
+    card.addSection(
+      buildExtractedInfoSection(settings, uploadResult, 'Extracted by Mailsift')
     );
-    if (extractedSection) {
-      card.addSection(extractedSection);
-    }
   }
 
   return card.build();
 }
 
 /**
- * Build a CardSection showing the extracted artifact details and links
- * to Mailsift for the current email.
+ * Build a CardSection listing what Mailsift extracted from a message,
+ * from the `records` in a `POST /api/messages` response, with links to
+ * the records in Mailsift.
  *
  * @param {Object} settings
- * @param {Object} info
- * @param {Array<Object>} matching
- * @param {Object|null} uploadResult
- * @return {GoogleAppsScript.Card_Service.CardSection|null}
+ * @param {Object} result `POST /api/messages` response
+ * @param {string} heading
+ * @return {GoogleAppsScript.Card_Service.CardSection}
  */
-function buildExtractedInfoSection(settings, info, matching, uploadResult) {
-  const section = CardService.newCardSection().setHeader('Extracted in Mailsift');
-  let addedWidgets = 0;
+function buildExtractedInfoSection(settings, result, heading) {
+  const section = CardService.newCardSection().setHeader(heading);
+  let widgets = 0;
+  const link = (path) =>
+    CardService.newOpenLink().setUrl(settings.serverUrl + path);
 
-  if (uploadResult && Array.isArray(uploadResult.matched)) {
+  for (const m of result.matched || []) {
+    const records = m.records || [];
+    for (const record of records) {
+      const summary = summarizeRecord(record.kind, record.data);
+      const widget = CardService.newDecoratedText()
+        .setTopLabel(summary.label)
+        .setText(summary.title)
+        .setWrapText(true)
+        .setOpenLink(link(summary.path));
+      if (summary.subtitle) {
+        widget.setBottomLabel(summary.subtitle);
+      }
+      // Cosmetic: leave the icon out if this Icon name isn't available.
+      if (CardService.Icon[summary.icon]) {
+        widget.setStartIcon(
+          CardService.newIconImage().setIcon(CardService.Icon[summary.icon])
+        );
+      }
+      section.addWidget(widget);
+      widgets++;
+    }
+
+    // Artifacts that come without a JSON record (calendar events, ticket
+    // files), and everything from servers that don't send `records`.
+    for (const kind of UNRECORDED_KINDS) {
+      const shown = records.filter((r) => r.kind === kind.record).length;
+      const extra = kind.counted ? m[kind.key] - shown : m[kind.key];
+      if (extra > 0 && !(kind.key === 'tickets' && shown > 0)) {
+        section.addWidget(
+          CardService.newDecoratedText()
+            .setTopLabel(m.extractor)
+            .setText(`${extra} ${extra === 1 ? kind.one : kind.many}`)
+            .setOpenLink(link(kind.listPath))
+        );
+        widgets++;
+      }
+    }
+  }
+
+  for (const f of result.failed || []) {
     section.addWidget(
-      CardService.newKeyValue()
-        .setTopLabel('Extraction Result')
-        .setContent(formatUploadOutcome(uploadResult))
+      CardService.newDecoratedText()
+        .setTopLabel(`${f.extractor} failed`)
+        .setText(f.error)
+        .setWrapText(true)
     );
-    addedWidgets++;
+    widgets++;
   }
 
-  const kindMeta = [
-    {
-      key: 'events',
-      label: 'Calendar Events',
-      listPath: '/events',
-      apiPath: null,
-    },
-    {
-      key: 'reservations',
-      label: 'Reservations',
-      listPath: '/reservations',
-      apiPath: '/api/reservations.json',
-      viewPath: (item) =>
-        item._year && item._slug
-          ? `/reservations/${encodeURIComponent(item._year)}/${encodeURIComponent(item._slug)}/view`
-          : '/reservations',
-      formatItem: (item) => {
-        const provider = item.provider || item.reservationFor || 'Reservation';
-        const ref = item.reservationNumber || item.identifier || '';
-        const status = item.reservationStatus || '';
-        return {
-          title: ref ? `${provider} (${ref})` : String(provider),
-          subtitle: status ? `Status: ${status}` : '',
-        };
-      },
-    },
-    {
-      key: 'bills',
-      label: 'Bills',
-      listPath: '/bills',
-      apiPath: '/api/bills.json',
-      viewPath: (item) =>
-        item._year && item._slug
-          ? `/bills/${encodeURIComponent(item._year)}/${encodeURIComponent(item._slug)}/view`
-          : '/bills',
-      formatItem: (item) => {
-        const payee = item.payee || item.provider || 'Bill';
-        const amt = formatMoney(item.totalPaymentDue || item.amount, item.currency);
-        const due = item.paymentDueDate ? `Due ${String(item.paymentDueDate).slice(0, 10)}` : '';
-        return {
-          title: amt ? `${payee} — ${amt}` : String(payee),
-          subtitle: [item.invoiceNumber, due].filter(Boolean).join(' · '),
-        };
-      },
-    },
-    {
-      key: 'parcels',
-      label: 'Parcels',
-      listPath: '/parcels',
-      apiPath: '/api/parcels.json',
-      viewPath: (item) =>
-        item.trackingNumber
-          ? `/parcels?q=${encodeURIComponent(item.trackingNumber)}`
-          : '/parcels',
-      formatItem: (item) => {
-        const carrier = item.carrier || 'Parcel';
-        const tn = item.trackingNumber || '';
-        const status = item.status || item.deliveryStatus || '';
-        return {
-          title: tn ? `${carrier}: ${tn}` : String(carrier),
-          subtitle: [item.sender, status].filter(Boolean).join(' · '),
-        };
-      },
-    },
-    {
-      key: 'receipts',
-      label: 'Receipts',
-      listPath: '/receipts',
-      apiPath: '/api/receipts.json',
-      viewPath: (item) =>
-        item._year && item._slug
-          ? `/receipts/${encodeURIComponent(item._year)}/${encodeURIComponent(item._slug)}/view`
-          : '/receipts',
-      formatItem: (item) => {
-        const merchant = item.merchant || item.seller || item.provider || 'Receipt';
-        const amt = formatMoney(item.total || item.totalPrice || item.amount, item.currency);
-        return {
-          title: amt ? `${merchant} — ${amt}` : String(merchant),
-          subtitle: [item.orderNumber, item.date ? String(item.date).slice(0, 10) : '']
-            .filter(Boolean)
-            .join(' · '),
-        };
-      },
-    },
-    {
-      key: 'tickets',
-      label: 'Tickets',
-      listPath: '/tickets',
-      apiPath: null,
-    },
-    {
-      key: 'subscriptions',
-      label: 'Subscriptions',
-      listPath: '/subscriptions',
-      apiPath: '/api/subscriptions.json',
-      viewPath: (item) =>
-        item.provider
-          ? `/subscriptions?q=${encodeURIComponent(item.provider)}`
-          : '/subscriptions',
-      formatItem: (item) => {
-        const provider = item.provider || item.name || 'Subscription';
-        const amt = formatMoney(item.price || item.amount, item.currency);
-        return {
-          title: amt ? `${provider} — ${amt}` : String(provider),
-          subtitle: [item.billingPeriod, item.nextBillingDate]
-            .filter(Boolean)
-            .join(' · '),
-        };
-      },
-    },
-  ];
-
-  const activeKinds = new Set();
-  if (uploadResult && Array.isArray(uploadResult.matched)) {
-    for (const m of uploadResult.matched) {
-      for (const km of kindMeta) {
-        if (m[km.key] > 0) {
-          activeKinds.add(km.key);
-        }
-      }
-    }
+  if (widgets === 0) {
+    section.addWidget(
+      CardService.newTextParagraph().setText(
+        'Nothing was extracted from this message.'
+      )
+    );
   }
-
-  for (const km of kindMeta) {
-    if (!activeKinds.has(km.key)) {
-      continue;
-    }
-
-    let items = [];
-    if (km.apiPath) {
-      items = fetchMatchingArtifacts(settings, km.apiPath, info, matching);
-    }
-
-    if (items.length > 0 && km.formatItem) {
-      for (const item of items.slice(0, 3)) {
-        const formatted = km.formatItem(item);
-        const targetUrl = settings.serverUrl + km.viewPath(item);
-        const widget = CardService.newDecoratedText()
-          .setTopLabel(km.label)
-          .setText(formatted.title)
-          .setOpenLink(CardService.newOpenLink().setUrl(targetUrl));
-        if (formatted.subtitle) {
-          widget.setBottomLabel(formatted.subtitle);
-        }
-        section.addWidget(widget);
-        addedWidgets++;
-      }
-    } else {
-      const targetUrl = settings.serverUrl + km.listPath;
-      section.addWidget(
-        CardService.newDecoratedText()
-          .setTopLabel(km.label)
-          .setText(`View ${km.label.toLowerCase()} in Mailsift`)
-          .setOpenLink(CardService.newOpenLink().setUrl(targetUrl))
-      );
-      addedWidgets++;
-    }
-  }
-
-  const buttonSet = CardService.newButtonSet().addButton(
-    CardService.newTextButton()
-      .setText('Open Mailsift Dashboard')
-      .setOpenLink(CardService.newOpenLink().setUrl(settings.serverUrl + '/all'))
+  section.addWidget(
+    CardService.newButtonSet().addButton(
+      CardService.newTextButton()
+        .setText('Open Mailsift')
+        .setOpenLink(link('/all'))
+    )
   );
-  section.addWidget(buttonSet);
-  addedWidgets++;
-
-  return addedWidgets > 0 ? section : null;
+  return section;
 }
 
-/**
- * Format a numeric or object money value with optional currency.
- *
- * @param {*} amount
- * @param {string=} currency
- * @return {string}
- */
-function formatMoney(amount, currency) {
-  if (amount === null || amount === undefined || amount === '') {
-    return '';
-  }
-  if (typeof amount === 'object') {
-    const val = amount.value || amount.price || amount.amount;
-    const cur = amount.currency || amount.priceCurrency || currency || '';
-    return val !== undefined ? `${val} ${cur}`.trim() : '';
-  }
-  return currency ? `${amount} ${currency}` : String(amount);
-}
-
-/**
- * Fetch artifacts from a Mailsift `/api/<kind>.json` endpoint that
- * correspond to the current email's received date or extractor name.
- *
- * @param {Object} settings
- * @param {string} apiPath
- * @param {Object} info
- * @param {Array<Object>} matching
- * @return {Array<Object>}
- */
-function fetchMatchingArtifacts(settings, apiPath, info, matching) {
-  try {
-    const datePrefix = info.receivedAtEpoch
-      ? new Date(info.receivedAtEpoch * 1000).toISOString().slice(0, 10)
-      : null;
-    const yearParam = datePrefix ? `?year=${datePrefix.slice(0, 4)}` : '';
-    const url = settings.serverUrl + apiPath + yearParam;
-    const resp = UrlFetchApp.fetch(url, {
-      method: 'get',
-      headers: buildHeaders(settings, { Accept: 'application/json' }),
-      muteHttpExceptions: true,
-    });
-    if (resp.getResponseCode() !== 200) {
-      return [];
-    }
-    const all = JSON.parse(resp.getContentText());
-    if (!Array.isArray(all)) {
-      return [];
-    }
-    if (datePrefix) {
-      const byDate = all.filter(
-        (item) =>
-          typeof item.receivedAt === 'string' &&
-          item.receivedAt.startsWith(datePrefix)
-      );
-      if (byDate.length > 0) {
-        return byDate;
-      }
-    }
-    const extractorNames = matching.map((m) => m.name.toLowerCase());
-    if (extractorNames.length > 0) {
-      const bySlug = all.filter((item) => {
-        const text = JSON.stringify(item).toLowerCase();
-        return extractorNames.some((n) => text.includes(n));
-      });
-      if (bySlug.length > 0) {
-        return bySlug;
-      }
-    }
-    return all.slice(0, 2);
-  } catch (_) {
-    return [];
-  }
-}
+// `counted`: the count in the response covers exactly the JSON records
+// of that kind, so only the difference needs a separate line.
+const UNRECORDED_KINDS = [
+  { key: 'events', record: null, counted: false, one: 'calendar event', many: 'calendar events', listPath: '/events' },
+  { key: 'tickets', record: 'ticket', counted: false, one: 'ticket file', many: 'ticket files', listPath: '/tickets' },
+  { key: 'reservations', record: 'reservation', counted: true, one: 'reservation', many: 'reservations', listPath: '/reservations' },
+  { key: 'bills', record: 'bill', counted: true, one: 'bill', many: 'bills', listPath: '/bills' },
+  { key: 'parcels', record: 'parcel', counted: true, one: 'parcel', many: 'parcels', listPath: '/parcels' },
+  { key: 'receipts', record: 'receipt', counted: true, one: 'receipt', many: 'receipts', listPath: '/receipts' },
+  { key: 'subscriptions', record: 'subscription', counted: true, one: 'subscription', many: 'subscriptions', listPath: '/subscriptions' },
+];
 
 /**
  * Format the JSON response from `POST /api/messages` into a compact
@@ -969,7 +790,19 @@ function onUploadCurrentMessage(e) {
     const builder = CardService.newActionResponseBuilder().setNotification(
       CardService.newNotification().setText(formatUploadOutcome(res))
     );
-    if (!dryRun) {
+    if (dryRun) {
+      const preview = CardService.newCardBuilder()
+        .setHeader(
+          CardService.newCardHeader()
+            .setTitle('Dry run')
+            .setSubtitle(message.getSubject() || '(no subject)')
+        )
+        .addSection(
+          buildExtractedInfoSection(getSettings(), res, 'Would extract')
+        )
+        .build();
+      builder.setNavigation(CardService.newNavigation().pushCard(preview));
+    } else {
       builder.setNavigation(
         CardService.newNavigation().updateCard(onGmailMessageOpen(e))
       );
