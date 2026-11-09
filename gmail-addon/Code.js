@@ -13,12 +13,15 @@ const PROP_AUTO_UPLOAD = 'MAILSIFT_AUTO_UPLOAD';
 const PROP_PROCESSED_LABEL = 'MAILSIFT_PROCESSED_LABEL';
 const CACHE_EXTRACTORS_KEY = 'MAILSIFT_EXTRACTORS_JSON_V1';
 const CACHE_CHECKED_IDS_KEY = 'MAILSIFT_CHECKED_IDS_V1';
-const CACHE_SYNC_STATE_KEY = 'MAILSIFT_SYNC_STATE_V1';
+const CACHE_SYNC_STATE_KEY = 'MAILSIFT_SYNC_STATE_V2';
 const CACHE_MSG_RESULT_PREFIX = 'MAILSIFT_MSG_RES_';
 const CACHE_TTL_SECONDS = 3600; // 1 hour
 const MSG_RESULT_TTL_SECONDS = 21600; // 6 hours
 const DEFAULT_PROCESSED_LABEL = 'Mailsift';
-const UI_BATCH_MAX_DURATION_MS = 4000; // ~4s per interactive batch for snappy progress updates
+// Stop starting new messages after this long. Card actions are killed at
+// 30s, and one message (Gmail fetches plus the server running the
+// extraction pipeline) has to fit in the remainder.
+const UI_BATCH_MAX_DURATION_MS = 10000;
 const UI_BATCH_THREADS = 5;
 
 /**
@@ -127,6 +130,18 @@ function getExtractors(forceRefresh) {
 }
 
 /**
+ * The Mailsift server answered a request with a non-2xx status. Network
+ * failures surface as plain `Error`s from `UrlFetchApp` instead.
+ */
+class MailsiftHttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.name = 'MailsiftHttpError';
+    this.status = status;
+  }
+}
+
+/**
  * Upload a raw RFC822 message to `POST <serverUrl>/api/messages`.
  *
  * @param {string} rawRfc822
@@ -165,7 +180,8 @@ function uploadMessageToMailsift(
 
   const status = resp.getResponseCode();
   if (status < 200 || status >= 300) {
-    throw new Error(
+    throw new MailsiftHttpError(
+      status,
       `POST /api/messages failed with HTTP ${status}: ${resp.getContentText().slice(0, 200)}`
     );
   }
@@ -1016,6 +1032,9 @@ function getSyncState(reset) {
     matchedMessages: 0,
     uploadedMessages: 0,
     recentFinds: [],
+    failures: [],
+    failedIds: [],
+    currentThread: null,
     done: false,
   };
 }
@@ -1062,7 +1081,45 @@ function onSyncNow(e) {
 }
 
 /**
+ * Evaluate one message during sync and upload it if it matches.
+ *
+ * An HTTP error from the Mailsift server is returned as `error` rather
+ * than thrown, so one message the server rejects doesn't block every
+ * message after it. Network failures still propagate.
+ *
+ * @param {Array<Object>} extractors
+ * @param {GoogleAppsScript.Gmail.GmailMessage} message
+ * @return {Object} `{ info, matching, result?, error? }`
+ */
+function syncMessage(extractors, message) {
+  const { info, matching } = evaluateGmailMessage(extractors, message, true);
+  if (matching.length === 0) {
+    return { info, matching };
+  }
+  try {
+    const result = uploadMessageToMailsift(
+      info.rawRfc822,
+      info.id,
+      info.receivedAtEpoch,
+      false
+    );
+    return { info, matching, result };
+  } catch (err) {
+    if (!(err instanceof MailsiftHttpError)) {
+      throw err;
+    }
+    console.error(`Uploading Gmail message ${info.id} failed: ${err.message}`);
+    return { info, matching, error: err };
+  }
+}
+
+/**
  * Execute one bounded step of interactive sync and update `SyncState`.
+ *
+ * Card actions are killed after 30 seconds, losing anything not yet
+ * saved, so the time budget is checked before every message rather than
+ * every thread. A thread that doesn't fit is resumed in the next step;
+ * `checkedIds` skips the messages already handled.
  *
  * @param {boolean} reset
  * @return {Object} updated sync state
@@ -1098,55 +1155,78 @@ function runInteractiveSyncStep(reset) {
     return state;
   }
 
-  for (const thread of batchThreads) {
-    if (Date.now() - startMs > UI_BATCH_MAX_DURATION_MS) {
-      break;
-    }
-    let threadHadMatch = false;
-    for (const message of thread.getMessages()) {
-      const msgId = message.getId();
-      if (checkedIds.has(msgId)) {
-        continue;
+  const failedIds = new Set(state.failedIds);
+  // Always handle at least one message, even if setup used up the budget.
+  let handledAny = false;
+  try {
+    for (const thread of batchThreads) {
+      const threadId = thread.getId();
+      if (!state.currentThread || state.currentThread.id !== threadId) {
+        state.currentThread = { id: threadId, matched: false, failed: false };
       }
-      state.scannedMessages++;
-      const { info, matching } = evaluateGmailMessage(
-        extractors,
-        message,
-        true
-      );
-      checkedIds.add(msgId);
-      if (matching.length > 0) {
-        state.matchedMessages++;
-        const res = uploadMessageToMailsift(
-          info.rawRfc822,
-          info.id,
-          info.receivedAtEpoch,
-          false
+      let finished = true;
+      for (const message of thread.getMessages()) {
+        const msgId = message.getId();
+        if (checkedIds.has(msgId) || failedIds.has(msgId)) {
+          continue;
+        }
+        if (handledAny && Date.now() - startMs > UI_BATCH_MAX_DURATION_MS) {
+          finished = false;
+          break;
+        }
+        handledAny = true;
+        state.scannedMessages++;
+        const { info, matching, result, error } = syncMessage(
+          extractors,
+          message
         );
-        state.uploadedMessages++;
-        threadHadMatch = true;
-        state.recentFinds.unshift({
-          subject: info.subject || '(no subject)',
-          extractors: matching.map((m) => m.name).join(', '),
-          outcome: formatUploadOutcome(res),
-        });
-        state.recentFinds = state.recentFinds.slice(0, 8);
+        const subject = info.subject || '(no subject)';
+        const names = matching.map((m) => m.name).join(', ');
+        if (matching.length > 0) {
+          state.matchedMessages++;
+        }
+        if (error) {
+          failedIds.add(msgId);
+          state.currentThread.failed = true;
+          state.failures.unshift({ subject, extractors: names, error: error.message });
+          state.failures = state.failures.slice(0, 8);
+          continue;
+        }
+        checkedIds.add(msgId);
+        if (result) {
+          state.uploadedMessages++;
+          state.currentThread.matched = true;
+          state.recentFinds.unshift({
+            subject,
+            extractors: names,
+            outcome: formatUploadOutcome(result),
+          });
+          state.recentFinds = state.recentFinds.slice(0, 8);
+        }
       }
+      if (!finished) {
+        break;
+      }
+      // A labelled thread drops out of the search results, so only
+      // advance the offset past threads that stay in them. Threads with
+      // a failed upload stay unlabelled so a later sync retries them.
+      if (state.currentThread.matched && !state.currentThread.failed) {
+        markThreadProcessed(thread, settings.processedLabel);
+      } else {
+        state.offset++;
+      }
+      state.currentThread = null;
+      state.threadsDone = Math.min(state.threadsDone + 1, state.totalThreads);
     }
-    if (threadHadMatch) {
-      markThreadProcessed(thread, settings.processedLabel);
-    } else {
-      state.offset++;
+
+    if (state.threadsDone >= state.totalThreads) {
+      state.done = true;
     }
-    state.threadsDone = Math.min(state.threadsDone + 1, state.totalThreads);
+  } finally {
+    state.failedIds = Array.from(failedIds);
+    saveCheckedMessageIds(checkedIds);
+    saveSyncState(state);
   }
-
-  if (state.threadsDone >= state.totalThreads) {
-    state.done = true;
-  }
-
-  saveCheckedMessageIds(checkedIds);
-  saveSyncState(state);
   return state;
 }
 
@@ -1234,6 +1314,22 @@ function buildSyncProgressCard(state) {
     card.addSection(findsSection);
   }
 
+  if (state.failedIds.length > 0) {
+    const failuresSection = CardService.newCardSection().setHeader(
+      `Failed Uploads (${state.failedIds.length}, retried on rescan)`
+    );
+    for (const item of state.failures) {
+      failuresSection.addWidget(
+        CardService.newDecoratedText()
+          .setTopLabel(item.extractors)
+          .setText(item.subject)
+          .setBottomLabel(item.error)
+          .setWrapText(true)
+      );
+    }
+    card.addSection(failuresSection);
+  }
+
   return card.build();
 }
 
@@ -1251,6 +1347,10 @@ function onBackToHome() {
 /**
  * Background time-driven trigger entrypoint: scans recent Gmail threads
  * with a 4-minute budget.
+ *
+ * Messages the server rejects are skipped and their threads left
+ * unlabelled, so the next run retries them; the run then throws so the
+ * failure shows up in the trigger's execution log and failure emails.
  *
  * @return {Object} `{ scanned, matched, uploaded, timedOut }`
  */
@@ -1270,47 +1370,53 @@ function syncMatchingEmails() {
   let matchedCount = 0;
   let uploadedCount = 0;
   let timedOut = false;
+  const failures = [];
 
-  for (const thread of threads) {
-    if (Date.now() - startMs > maxDurationMs) {
-      timedOut = true;
-      break;
-    }
-    let threadHadMatch = false;
-    for (const message of thread.getMessages()) {
-      if (Date.now() - startMs > maxDurationMs) {
-        timedOut = true;
+  try {
+    for (const thread of threads) {
+      if (timedOut) {
         break;
       }
-      const msgId = message.getId();
-      if (checkedIds.has(msgId)) {
-        continue;
+      let threadHadMatch = false;
+      let threadFailed = false;
+      for (const message of thread.getMessages()) {
+        if (Date.now() - startMs > maxDurationMs) {
+          timedOut = true;
+          break;
+        }
+        const msgId = message.getId();
+        if (checkedIds.has(msgId)) {
+          continue;
+        }
+        scanned++;
+        const { matching, result, error } = syncMessage(extractors, message);
+        if (matching.length > 0) {
+          matchedCount++;
+        }
+        if (error) {
+          threadFailed = true;
+          failures.push(`${msgId}: ${error.message}`);
+          continue;
+        }
+        checkedIds.add(msgId);
+        if (result) {
+          uploadedCount++;
+          threadHadMatch = true;
+        }
       }
-      scanned++;
-      const { info, matching } = evaluateGmailMessage(
-        extractors,
-        message,
-        true
-      );
-      checkedIds.add(msgId);
-      if (matching.length > 0) {
-        matchedCount++;
-        uploadMessageToMailsift(
-          info.rawRfc822,
-          info.id,
-          info.receivedAtEpoch,
-          false
-        );
-        uploadedCount++;
-        threadHadMatch = true;
+      if (threadHadMatch && !threadFailed && !timedOut) {
+        markThreadProcessed(thread, settings.processedLabel);
       }
     }
-    if (threadHadMatch) {
-      markThreadProcessed(thread, settings.processedLabel);
-    }
+  } finally {
+    saveCheckedMessageIds(checkedIds);
   }
 
-  saveCheckedMessageIds(checkedIds);
+  if (failures.length > 0) {
+    throw new Error(
+      `${failures.length} message(s) failed to upload:\n${failures.join('\n')}`
+    );
+  }
 
   return {
     scanned,

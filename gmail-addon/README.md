@@ -47,5 +47,5 @@ The server exposes:
 ## Running Unit Tests
 
 ```sh
-node --test gmail-addon/test/matcher.test.js
+cd gmail-addon && npm test
 ```

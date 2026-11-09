@@ -4,7 +4,7 @@
   "private": true,
   "description": "Google Workspace Gmail Add-on for Mailsift",
   "scripts": {
-    "test": "node --test test/matcher.test.js",
+    "test": "node --test test/*.test.js",
     "login": "npx --yes @google/clasp login",
     "create": "npx --yes @google/clasp create --type standalone --title \"Mailsift\" && git checkout -- appsscript.json",
     "push": "npx --yes @google/clasp push --force",
