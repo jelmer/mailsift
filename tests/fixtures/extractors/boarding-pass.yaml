@@ -1,0 +1,5 @@
+name: fixture-boarding-pass
+order: 50
+from_domains:
+  - boarding.fixture.test
+subject_regex: "(?i)^fixture-boarding-pass"

@@ -176,7 +176,8 @@ chronologically.
 | `<slug>.bill.json`         | `bill`         | JSON with `payee`, `amount`, `dueDate`, `invoiceNumber`. |
 | `<slug>.bill.<ext>`        | `bill`         | Companion blob (typically `.pdf`) for a bill. Must ship with a same-slug `.bill.json`; filed beside it under `<payee>-<invoice>.<ext>`. Orphan blobs are dropped. |
 | `<slug>.subscription.json` | `subscription` | schema.org-ish JSON carrying at least `subscriptionDuration`. Downstream tooling synthesises renewal reminders from it. |
-| `<slug>.ticket.<ext>`      | `ticket`       | Any binary blob (PDF, pkpass, image, ...). Dedup is by content hash; `<ext>` is taken literally as the on-disk extension. The slug is the filed name, so make it specific: `ryanair-fr1234-2026-04-10.ticket.pdf`. |
+| `<slug>.ticket.<ext>`      | `ticket`       | Any binary blob (PDF, pkpass, image, ...) other than JSON. Dedup is by content hash; `<ext>` is taken literally as the on-disk extension. The slug is the filed name, so make it specific: `ryanair-fr1234-2026-04-10.ticket.pdf`. |
+| `<slug>.ticket.json`       | `ticket`       | What the same-slug ticket is for: `reservationNumber`, `underName`, `provider` and `date` (`YYYY-MM-DD`), all optional. Never filed itself. |
 
 Dotfiles and other `_*` files are skipped silently; any other
 unrecognised filename in cwd is logged with a warning. Emit as many
@@ -188,6 +189,18 @@ the blob's filename and content type, plus the booking reference and
 passenger from a `.reservation.json` emitted in the same run. Emitting
 both from one message is what makes a ticket traceable back to its
 trip.
+
+A ticket mailed apart from its booking - a boarding pass sent after
+check-in - has no reservation to go with it, and the mail is too thin
+to make one. Name the booking in a same-slug `.ticket.json` instead:
+
+```json
+{"reservationNumber": "ABC123", "provider": "KLM", "date": "2030-06-03"}
+```
+
+Its fields take precedence over a sibling reservation's, which fill in
+any it leaves out, and its `date` decides the year the ticket is filed
+under.
 
 Receipts and bills accept the same `<slug>.<kind>.<ext>` form for
 companion attachments (typically the vendor's PDF). Pair by using the
