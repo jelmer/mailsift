@@ -65,7 +65,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 wait-timeout = "0.2"
 iso_currency = "0.7.1"
-utoipa = { version = "6", optional = true }
+utoipa = { version = "6", features = ["chrono"], optional = true }
 utoipa-axum = { version = "0.3", optional = true }
 utoipa-swagger-ui = { version = "10", default-features = false, features = ["axum", "url"], optional = true }
 

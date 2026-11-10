@@ -35,8 +35,8 @@ use super::FileOutcome;
 use super::json_target::{self, derive_year, first_non_empty, read_and_parse};
 use super::mail_forward::{self, MailForwarder};
 use super::sink::{Merge, sanitize_ext, slugify, update_file};
-use super::tickets::content_type_for;
 use super::webdav::WebdavSink;
+use crate::artifacts::content_type_for;
 
 /// Where to file `receipt` artifacts.
 pub enum ReceiptSink {

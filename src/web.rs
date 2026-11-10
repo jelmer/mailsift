@@ -3001,15 +3001,7 @@ fn content_type_for(name: &str) -> &'static str {
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
-    match ext.to_ascii_lowercase().as_str() {
-        "json" => "application/json",
-        "pdf" => "application/pdf",
-        "pkpass" => "application/vnd.apple.pkpass",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        _ => "application/octet-stream",
-    }
+    crate::artifacts::content_type_for(ext)
 }
 
 /// List all bill artifacts. Year-sharded: each item has `_year` and
@@ -3491,19 +3483,8 @@ struct MatchedExtractor {
     receipts: u32,
     tickets: u32,
     subscriptions: u32,
-    /// The JSON artifacts the extractor produced (reservations, bills,
-    /// parcels, receipts, ticket records and subscriptions), as written
-    /// by the extractor before filing.
-    records: Vec<ProducedRecordJson>,
-}
-
-#[derive(Serialize, utoipa::ToSchema)]
-struct ProducedRecordJson {
-    /// Artifact kind: `reservation`, `bill`, `parcel`, `receipt`,
-    /// `ticket` or `subscription`.
-    kind: &'static str,
-    #[schema(value_type = Object)]
-    data: Value,
+    /// Every artifact the extractor produced, as written before filing.
+    records: Vec<crate::pipeline::ProducedRecord>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -3665,13 +3646,7 @@ async fn api_post_message(
                         receipts,
                         tickets,
                         subscriptions,
-                        records: records
-                            .into_iter()
-                            .map(|r| ProducedRecordJson {
-                                kind: r.kind.as_str(),
-                                data: r.data,
-                            })
-                            .collect(),
+                        records,
                     });
                 }
                 crate::pipeline::ExplainOutcome::Failed { error } => {
@@ -6012,7 +5987,7 @@ tickets_dir = "/var/mailsift/tickets"
         let script = ext_dir.join("dhl.py");
         fs::write(
             &script,
-            "#!/bin/sh\ncat > /dev/null\nprintf '{\"trackingNumber\":\"DHL999\",\"deliveryStatus\":\"OnItsWay\"}' > dhl.parcel.json\n",
+            "#!/bin/sh\ncat > /dev/null\nprintf '{\"trackingNumber\":\"DHL999\",\"deliveryStatus\":\"OnItsWay\"}' > dhl.parcel.json\nprintf '%%PDF-1.4' > label.ticket.pdf\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -6045,10 +6020,19 @@ tickets_dir = "/var/mailsift/tickets"
         assert_eq!(parsed["matched"][0]["parcels"], 1);
         assert_eq!(
             parsed["matched"][0]["records"],
-            serde_json::json!([{
-                "kind": "parcel",
-                "data": {"trackingNumber": "DHL999", "deliveryStatus": "OnItsWay"},
-            }])
+            serde_json::json!([
+                {
+                    "kind": "parcel",
+                    "filename": "dhl.parcel.json",
+                    "content_type": "application/json",
+                    "data": {"trackingNumber": "DHL999", "deliveryStatus": "OnItsWay"},
+                },
+                {
+                    "kind": "ticket",
+                    "filename": "label.ticket.pdf",
+                    "content_type": "application/pdf",
+                },
+            ])
         );
         assert!(parcels_dir.join("DHL999.json").exists());
     }

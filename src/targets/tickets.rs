@@ -51,6 +51,7 @@ use super::FileOutcome;
 use super::json_target;
 use super::sink::{lock_dir, log_file_outcome, log_kept, sanitize_ext, slugify, write_atomic};
 use super::webdav::WebdavSink;
+use crate::artifacts::content_type_for;
 
 /// Identifying fields copied from the sibling reservation artifact, if
 /// there was one. All optional: a ticket can arrive with no
@@ -79,20 +80,6 @@ struct Sidecar<'a> {
     meta: &'a TicketMeta,
     #[serde(skip_serializing_if = "Option::is_none")]
     received_at: Option<String>,
-}
-
-/// Best-guess content-type from the extension. Servers typically
-/// don't care for opaque uploads, but a sensible value is nicer than
-/// application/octet-stream for the common cases.
-pub(super) fn content_type_for(ext: &str) -> &'static str {
-    match ext {
-        "pdf" => "application/pdf",
-        "pkpass" => "application/vnd.apple.pkpass",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        _ => "application/octet-stream",
-    }
 }
 
 /// Filename of the sidecar describing the blob `<slug>.<ext>`.

@@ -2,9 +2,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[cfg_attr(feature = "web", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
 pub enum Kind {
     Event,
     Reservation,
@@ -26,6 +28,20 @@ impl Kind {
             Kind::Ticket => "ticket",
             Kind::Subscription => "subscription",
         }
+    }
+}
+
+/// Best-guess content type for an artifact file extension.
+pub fn content_type_for(ext: &str) -> &'static str {
+    match ext.to_ascii_lowercase().as_str() {
+        "json" => "application/json",
+        "ics" => "text/calendar",
+        "pdf" => "application/pdf",
+        "pkpass" => "application/vnd.apple.pkpass",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
     }
 }
 

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, FixedOffset};
+use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use crate::artifacts::{Artifact, Kind};
@@ -174,47 +175,172 @@ pub enum ExplainOutcome {
         receipts: u32,
         tickets: u32,
         subscriptions: u32,
-        /// The JSON artifacts among them, as the extractor wrote them.
+        /// Every artifact among them, with its parsed contents where
+        /// it has any.
         records: Vec<ProducedRecord>,
     },
 }
 
-/// A JSON artifact an extractor produced, for callers that show what
-/// was extracted.
-#[derive(Debug)]
+/// One artifact an extractor produced, for callers that show what was
+/// extracted. An `.event.ics` yields one record per VEVENT in it.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web", derive(utoipa::ToSchema))]
 pub struct ProducedRecord {
     pub kind: Kind,
-    pub data: serde_json::Value,
+    /// File name as the extractor wrote it.
+    pub filename: String,
+    pub content_type: &'static str,
+    /// The parsed contents, for JSON and iCalendar artifacts. Absent for
+    /// opaque blobs and for files that couldn't be parsed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<RecordData>,
 }
 
-/// Parse the JSON artifacts among `artifacts` for an [`ExplainRecord`].
-/// One that can't be read or parsed is left out with a warning; filing
-/// it fails (and is logged) the same way.
-fn produced_records<'a>(
-    extractor: &str,
-    artifacts: impl IntoIterator<Item = &'a Artifact>,
-) -> Vec<ProducedRecord> {
-    artifacts
-        .into_iter()
-        .filter(|a| a.ext == "json")
-        .filter_map(|a| {
-            let parsed = std::fs::read(&a.path)
-                .map_err(anyhow::Error::from)
-                .and_then(|raw| Ok(serde_json::from_slice(&raw)?));
-            match parsed {
-                Ok(data) => Some(ProducedRecord { kind: a.kind, data }),
-                Err(e) => {
-                    warn!(
-                        extractor,
-                        path = %a.path.display(),
-                        error = format!("{e:#}"),
-                        "unreadable JSON artifact"
-                    );
-                    None
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum RecordData {
+    Event(EventSummary),
+    /// A JSON artifact as the extractor wrote it.
+    #[cfg_attr(feature = "web", schema(value_type = Object))]
+    Json(serde_json::Value),
+}
+
+/// The main fields of a VEVENT.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web", derive(utoipa::ToSchema))]
+pub struct EventSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<EventTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<EventTime>,
+}
+
+/// A DTSTART or DTEND: a whole day, or a date-time in UTC, floating
+/// local time, or local time in a named zone.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum EventTime {
+    Date {
+        date: chrono::NaiveDate,
+    },
+    Utc {
+        datetime: chrono::DateTime<chrono::Utc>,
+    },
+    Floating {
+        datetime: chrono::NaiveDateTime,
+    },
+    Zoned {
+        datetime: chrono::NaiveDateTime,
+        tzid: String,
+    },
+}
+
+impl From<icalendar::DatePerhapsTime> for EventTime {
+    fn from(value: icalendar::DatePerhapsTime) -> Self {
+        use icalendar::{CalendarDateTime, DatePerhapsTime};
+        match value {
+            DatePerhapsTime::Date(date) => EventTime::Date { date },
+            DatePerhapsTime::DateTime(CalendarDateTime::Utc(datetime)) => {
+                EventTime::Utc { datetime }
+            }
+            DatePerhapsTime::DateTime(CalendarDateTime::Floating(datetime)) => {
+                EventTime::Floating { datetime }
+            }
+            DatePerhapsTime::DateTime(CalendarDateTime::WithTimezone { date_time, tzid }) => {
+                EventTime::Zoned {
+                    datetime: date_time,
+                    tzid,
                 }
             }
+        }
+    }
+}
+
+impl From<&icalendar::Event> for EventSummary {
+    fn from(ev: &icalendar::Event) -> Self {
+        use icalendar::{Component, EventLike};
+        EventSummary {
+            uid: ev.get_uid().map(str::to_owned),
+            summary: ev.get_summary().map(str::to_owned),
+            location: ev.get_location().map(str::to_owned),
+            start: ev.get_start().map(EventTime::from),
+            end: ev.get_end().map(EventTime::from),
+        }
+    }
+}
+
+/// Describe every artifact in `artifacts` for an [`ExplainRecord`],
+/// ordered by file name. One that can't be read or parsed is still
+/// listed, without `data`, and logged; filing it fails (and is logged)
+/// the same way.
+fn produced_records(extractor: &str, artifacts: &[Artifact]) -> Vec<ProducedRecord> {
+    let mut sorted: Vec<&Artifact> = artifacts.iter().collect();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path));
+    sorted
+        .into_iter()
+        .flat_map(|a| {
+            artifact_records(a).unwrap_or_else(|e| {
+                warn!(
+                    extractor,
+                    path = %a.path.display(),
+                    error = format!("{e:#}"),
+                    "unreadable artifact"
+                );
+                vec![artifact_record(a, None)]
+            })
         })
         .collect()
+}
+
+fn artifact_record(a: &Artifact, data: Option<RecordData>) -> ProducedRecord {
+    ProducedRecord {
+        kind: a.kind,
+        filename: a
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        content_type: crate::artifacts::content_type_for(&a.ext),
+        data,
+    }
+}
+
+fn artifact_records(a: &Artifact) -> Result<Vec<ProducedRecord>> {
+    match a.ext.as_str() {
+        "json" => {
+            let value = serde_json::from_slice(&std::fs::read(&a.path)?)?;
+            Ok(vec![artifact_record(a, Some(RecordData::Json(value)))])
+        }
+        "ics" => {
+            let body = std::fs::read_to_string(&a.path)?;
+            let calendar: icalendar::Calendar = body.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let records: Vec<_> = calendar
+                .components
+                .iter()
+                .filter_map(|c| match c {
+                    icalendar::CalendarComponent::Event(ev) => Some(artifact_record(
+                        a,
+                        Some(RecordData::Event(EventSummary::from(ev))),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            if records.is_empty() {
+                Ok(vec![artifact_record(a, None)])
+            } else {
+                Ok(records)
+            }
+        }
+        _ => Ok(vec![artifact_record(a, None)]),
+    }
 }
 
 /// Run every discovered extractor against `raw` and route the artifacts
@@ -486,17 +612,7 @@ pub fn run(
                     receipts: (receipt_arts.len() + receipt_blob_arts.len()) as u32,
                     tickets: ticket_arts.len() as u32,
                     subscriptions: subscription_arts.len() as u32,
-                    records: produced_records(
-                        &run.extractor,
-                        reservations
-                            .iter()
-                            .chain(&bill_arts)
-                            .chain(&parcel_arts)
-                            .chain(&receipt_arts)
-                            .chain(&ticket_records)
-                            .chain(&subscription_arts)
-                            .copied(),
-                    ),
+                    records: produced_records(&run.extractor, &run.result.artifacts),
                 },
             });
         }
@@ -967,6 +1083,101 @@ fn file_or_drop<S: Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn artifact_in(dir: &Path, name: &str, kind: Kind, ext: &str, body: &[u8]) -> Artifact {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        Artifact {
+            kind,
+            path,
+            slug: name.split('.').next().unwrap().to_owned(),
+            ext: ext.to_owned(),
+        }
+    }
+
+    #[test]
+    fn produced_records_describe_every_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifacts = vec![
+            artifact_in(
+                tmp.path(),
+                "trip.event.ics",
+                Kind::Event,
+                "ics",
+                b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n\
+                  BEGIN:VEVENT\r\nUID:leg1@example.org\r\nSUMMARY:XY100 AAA-BBB\r\n\
+                  LOCATION:Airport A\r\nDTSTAMP:20260101T000000Z\r\n\
+                  DTSTART;TZID=Europe/Dublin:20261201T070500\r\n\
+                  DTEND:20261201T093000Z\r\nEND:VEVENT\r\n\
+                  BEGIN:VEVENT\r\nUID:day@example.org\r\nDTSTAMP:20260101T000000Z\r\n\
+                  DTSTART;VALUE=DATE:20261203\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+            ),
+            artifact_in(
+                tmp.path(),
+                "x1.parcel.json",
+                Kind::Parcel,
+                "json",
+                br#"{"trackingNumber":"X1"}"#,
+            ),
+            artifact_in(
+                tmp.path(),
+                "pass.ticket.PDF",
+                Kind::Ticket,
+                "PDF",
+                b"%PDF-1.4",
+            ),
+        ];
+        let records = serde_json::to_value(produced_records("test", &artifacts)).unwrap();
+        assert_eq!(
+            records,
+            serde_json::json!([
+                {"kind": "ticket", "filename": "pass.ticket.PDF", "content_type": "application/pdf"},
+                {
+                    "kind": "event",
+                    "filename": "trip.event.ics",
+                    "content_type": "text/calendar",
+                    "data": {
+                        "uid": "leg1@example.org",
+                        "summary": "XY100 AAA-BBB",
+                        "location": "Airport A",
+                        "start": {"datetime": "2026-12-01T07:05:00", "tzid": "Europe/Dublin"},
+                        "end": {"datetime": "2026-12-01T09:30:00Z"},
+                    },
+                },
+                {
+                    "kind": "event",
+                    "filename": "trip.event.ics",
+                    "content_type": "text/calendar",
+                    "data": {"uid": "day@example.org", "start": {"date": "2026-12-03"}},
+                },
+                {
+                    "kind": "parcel",
+                    "filename": "x1.parcel.json",
+                    "content_type": "application/json",
+                    "data": {"trackingNumber": "X1"},
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn produced_records_keep_unparseable_artifacts_without_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifacts = vec![artifact_in(
+            tmp.path(),
+            "broken.bill.json",
+            Kind::Bill,
+            "json",
+            b"{not json",
+        )];
+        let records = serde_json::to_value(produced_records("test", &artifacts)).unwrap();
+        assert_eq!(
+            records,
+            serde_json::json!([
+                {"kind": "bill", "filename": "broken.bill.json", "content_type": "application/json"},
+            ])
+        );
+    }
 
     #[test]
     fn pipeline_parse_from_domain_bare_address() {
