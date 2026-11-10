@@ -290,7 +290,20 @@ fn is_same_snapshot(a: &Value, b: &Value) -> bool {
         "actualDeliveryTime",
     ]
     .iter()
-    .all(|k| a.get(*k) == b.get(*k))
+    .all(|k| same_value(a.get(*k), b.get(*k)))
+}
+
+/// Whether two field values are equal, comparing RFC 3339 timestamps
+/// as instants so the same moment written in another offset matches.
+fn same_value(a: Option<&Value>, b: Option<&Value>) -> bool {
+    let instant = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+    };
+    match (instant(a), instant(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 /// Whether a record's `deliveryStatus` is a terminal one.
@@ -876,6 +889,16 @@ mod tests {
         assert_eq!(history_statuses(&merged), vec!["OnItsWay", "Delivered"]);
         // The first sighting of each mail is the one kept.
         assert_eq!(merged["history"][1]["seen_at"], "2026-08-28T23:32:37Z");
+    }
+
+    /// The same mail may be dated in a different offset on a later
+    /// scan, e.g. once `receivedAt` keeps the Date header's offset.
+    #[test]
+    fn replay_dated_in_another_offset_adds_no_history() {
+        let mut parcel = with_initial_history(status_at("OnItsWay", "2025-09-24T12:56:20Z"));
+        parcel = merge(parcel, status_at("Delivered", "2025-09-27T14:37:31Z"));
+        parcel = merge(parcel, status_at("Delivered", "2025-09-27T15:37:31+01:00"));
+        assert_eq!(history_statuses(&parcel), vec!["OnItsWay", "Delivered"]);
     }
 
     /// Without dates a return to an earlier status can't be told from
