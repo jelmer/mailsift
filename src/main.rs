@@ -713,6 +713,33 @@ enum Command {
         #[arg(long)]
         extractors: Option<PathBuf>,
     },
+    /// Run extractors over saved messages and compare what they write
+    /// against the `<stem>.expected.json` file next to each message.
+    ///
+    /// Also checks that the manifest's dispatch rules let each message
+    /// through to its extractor. Exits non-zero if any fixture fails or
+    /// lacks an expected file.
+    TestExtractor {
+        /// Fixture messages to test.
+        #[arg(required = true, value_name = "FIXTURE")]
+        fixtures: Vec<PathBuf>,
+        /// Directory containing extractor scripts. Repeat to search
+        /// several, as with `extractors_dir`.
+        #[arg(long = "extractors", value_name = "DIR")]
+        extractors: Vec<PathBuf>,
+        /// The extractor to run. Needed to create an expected file;
+        /// otherwise it must match the one the file names.
+        #[arg(long = "extractor", value_name = "NAME")]
+        extractor: Option<String>,
+        /// Write the expected files from the current output instead of
+        /// comparing against them.
+        #[arg(long)]
+        update: bool,
+        /// Enforce `require_dkim`. Off by default since saved fixtures
+        /// rarely carry an `Authentication-Results:` header.
+        #[arg(long)]
+        check_dkim: bool,
+    },
     /// Rename archived flight and train legs to the name they are filed
     /// under now (`<provider>-<reference>-<flight or train>.json`),
     /// merging copies of one leg filed under several names and keeping
@@ -1311,6 +1338,80 @@ fn print_explain(
     }
 }
 
+/// Run `test-extractor` over each fixture, printing a line per fixture
+/// and a summary. Fails if any fixture failed.
+fn run_test_extractor(
+    fixtures: &[PathBuf],
+    extractors: &[mailsift::extractor::Extractor],
+    opts: &mailsift::golden::Options,
+) -> Result<()> {
+    use mailsift::golden::{ArtifactDiff, Outcome};
+
+    let (mut passed, mut failed, mut created, mut updated) = (0, 0, 0, 0);
+    for fixture in fixtures {
+        let shown = fixture.display();
+        let report = match mailsift::golden::test_fixture(fixture, extractors, opts) {
+            Ok(report) => report,
+            Err(e) => {
+                failed += 1;
+                println!("FAIL  {shown}: {e:#}");
+                continue;
+            }
+        };
+        let extractor = report.extractor.as_deref().unwrap_or("?");
+        let expected = report.expected_path.display();
+        match report.outcome {
+            Outcome::Pass | Outcome::Unchanged => {
+                passed += 1;
+                println!("ok    {shown} ({extractor})");
+            }
+            Outcome::Written { created: true } => {
+                created += 1;
+                println!("new   {shown} ({extractor}): wrote {expected}");
+            }
+            Outcome::Written { created: false } => {
+                updated += 1;
+                println!("upd   {shown} ({extractor}): updated {expected}");
+            }
+            Outcome::NoExpected => {
+                failed += 1;
+                println!(
+                    "FAIL  {shown}: no expected file {expected}; run with --update to create it"
+                );
+            }
+            Outcome::Mismatch(diffs) => {
+                failed += 1;
+                println!("FAIL  {shown} ({extractor})");
+                for diff in diffs {
+                    match diff {
+                        ArtifactDiff::Missing(name) => println!("      missing: {name}"),
+                        ArtifactDiff::Unexpected(name) => println!("      unexpected: {name}"),
+                        ArtifactDiff::Changed { name, details } => {
+                            println!("      changed: {name}");
+                            for line in details {
+                                println!("        {line}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut summary = vec![format!("{passed} passed")];
+    if opts.update {
+        summary.push(format!("{created} created"));
+        summary.push(format!("{updated} updated"));
+    }
+    summary.push(format!("{failed} failed"));
+    println!("{}", summary.join(", "));
+    if failed > 0 {
+        let noun = if failed == 1 { "fixture" } else { "fixtures" };
+        anyhow::bail!("{failed} {noun} failed")
+    }
+    Ok(())
+}
+
 /// Print the `stats` subcommand's per-extractor summary table. One
 /// row per extractor, sorted by [`mailsift::stats::aggregate`]
 /// (most-run first), with totals + counts + mean wall-clock + the
@@ -1558,6 +1659,35 @@ fn run() -> Result<()> {
                 let noun = if n == 1 { "issue" } else { "issues" };
                 anyhow::bail!("{n} {noun} found")
             }
+        }
+        Command::TestExtractor {
+            fixtures,
+            extractors,
+            extractor,
+            update,
+            check_dkim,
+        } => {
+            let extractors_dir = if extractors.is_empty() {
+                resolve_extractors(None, &config)
+            } else {
+                extractors
+            };
+            let discovered = discover_required(&extractors_dir)?;
+            if let Some(name) = &extractor
+                && !discovered.iter().any(|ex| &ex.name == name)
+            {
+                return Err(usage_error!(
+                    "unknown extractor {name} under {}",
+                    render_paths(&extractors_dir)
+                ));
+            }
+            let opts = mailsift::golden::Options {
+                extractor: extractor.as_deref(),
+                update,
+                check_dkim,
+                timeout: pipeline::DEFAULT_EXTRACTOR_TIMEOUT,
+            };
+            run_test_extractor(&fixtures, &discovered, &opts)
         }
         Command::ReindexReservations {
             reservations_dir,

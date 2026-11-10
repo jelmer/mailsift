@@ -127,6 +127,46 @@ pub enum FilenamePattern {
     Prefix(String),
 }
 
+impl std::fmt::Display for FilenamePattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FilenamePattern::Exact(s) => f.write_str(s),
+            FilenamePattern::Suffix(s) => write!(f, "*{s}"),
+            FilenamePattern::Prefix(s) => write!(f, "{s}*"),
+        }
+    }
+}
+
+impl BodyRequirement {
+    fn satisfied_by(&self, parts: &BodyParts) -> bool {
+        match self {
+            BodyRequirement::Html => parts.has_html,
+            BodyRequirement::Text => parts.has_text,
+            BodyRequirement::AttachmentMime { ty, subtype } => parts
+                .mime_types
+                .iter()
+                .any(|(t, s)| t == ty && s == subtype),
+            BodyRequirement::AttachmentFilename(pat) => {
+                parts.attachment_filenames.iter().any(|f| pat.matches(f))
+            }
+        }
+    }
+}
+
+/// Renders the `requires:` entry this was parsed from (lowercased).
+impl std::fmt::Display for BodyRequirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BodyRequirement::Html => f.write_str("html"),
+            BodyRequirement::Text => f.write_str("text"),
+            BodyRequirement::AttachmentMime { ty, subtype } => {
+                write!(f, "attachment:{ty}/{subtype}")
+            }
+            BodyRequirement::AttachmentFilename(pat) => write!(f, "attachment:filename:{pat}"),
+        }
+    }
+}
+
 impl FilenamePattern {
     fn matches(&self, name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
@@ -195,6 +235,15 @@ enum FromDomainPattern {
     /// `*.example.com`-style wildcard: matches `example.com` and any
     /// subdomain.
     Wildcard(String),
+}
+
+impl std::fmt::Display for FromDomainPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FromDomainPattern::Exact(d) => f.write_str(d),
+            FromDomainPattern::Wildcard(d) => write!(f, "*.{d}"),
+        }
+    }
 }
 
 impl FromDomainPattern {
@@ -310,17 +359,66 @@ impl Extractor {
     /// are satisfied by the given parts summary. Every requirement
     /// must hold; an empty requirement list always matches.
     pub fn body_could_match(&self, parts: &BodyParts) -> bool {
-        self.body_requirements.iter().all(|r| match r {
-            BodyRequirement::Html => parts.has_html,
-            BodyRequirement::Text => parts.has_text,
-            BodyRequirement::AttachmentMime { ty, subtype } => parts
-                .mime_types
+        self.body_requirements.iter().all(|r| r.satisfied_by(parts))
+    }
+
+    /// The `requires:` entries the given parts summary fails, for
+    /// telling a user why [`body_could_match`] refused a message.
+    ///
+    /// [`body_could_match`]: Self::body_could_match
+    pub fn unmet_body_requirements(&self, parts: &BodyParts) -> Vec<String> {
+        self.body_requirements
+            .iter()
+            .filter(|r| !r.satisfied_by(parts))
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// Why [`matches_headers`] rules this extractor out for the given
+    /// message, or `None` when it doesn't. Same inputs and semantics;
+    /// kept apart so the hot path doesn't build strings.
+    ///
+    /// [`matches_headers`]: Self::matches_headers
+    pub fn header_mismatch(
+        &self,
+        from_domain: Option<&str>,
+        subject: Option<&str>,
+    ) -> Option<String> {
+        if !self.from_domains.is_empty() {
+            let patterns = self
+                .from_domains
                 .iter()
-                .any(|(t, s)| t == ty && s == subtype),
-            BodyRequirement::AttachmentFilename(pat) => {
-                parts.attachment_filenames.iter().any(|f| pat.matches(f))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            match from_domain {
+                None => return Some(format!("no From: domain, but from_domains is [{patterns}]")),
+                Some(domain) if !self.from_domains.iter().any(|p| p.matches(domain)) => {
+                    return Some(format!(
+                        "From: domain {domain:?} matches none of from_domains [{patterns}]"
+                    ));
+                }
+                Some(_) => {}
             }
-        })
+        }
+        if let Some(re) = &self.subject_regex {
+            match subject {
+                None => {
+                    return Some(format!(
+                        "no Subject:, but subject_regex is {:?}",
+                        re.as_str()
+                    ));
+                }
+                Some(subj) if !re.is_match(subj) => {
+                    return Some(format!(
+                        "Subject: {subj:?} does not match subject_regex {:?}",
+                        re.as_str()
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        None
     }
 }
 
@@ -1104,6 +1202,64 @@ mod tests {
         assert!(!e.body_could_match(&parts(true, false, &[("text", "html")], &[])));
         // calendar attachment present but no html part; must fail
         assert!(!e.body_could_match(&parts(false, false, &[("text", "calendar")], &[])));
+    }
+
+    #[test]
+    fn unmet_body_requirements_names_each_failing_entry() {
+        let e = ex_full(
+            vec![],
+            None,
+            [
+                "html",
+                "attachment:Text/Calendar",
+                "attachment:filename:*.ICS",
+            ]
+            .into_iter()
+            .map(|r| parse_body_requirement(r).unwrap())
+            .collect(),
+        );
+        assert_eq!(
+            e.unmet_body_requirements(&parts(true, false, &[("text", "html")], &[])),
+            vec!["attachment:text/calendar", "attachment:filename:*.ics"]
+        );
+        assert_eq!(
+            e.unmet_body_requirements(&parts(true, false, &[("text", "calendar")], &["a.ics"])),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn header_mismatch_explains_matches_headers() {
+        let e = ex(vec!["*.vendor.example"], Some("(?i)booking"));
+        let cases = [
+            (Some("mail.vendor.example"), Some("Your Booking"), None),
+            (
+                None,
+                Some("Booking"),
+                Some("no From: domain, but from_domains is [*.vendor.example]"),
+            ),
+            (
+                Some("other.example"),
+                Some("Booking"),
+                Some(
+                    "From: domain \"other.example\" matches none of from_domains [*.vendor.example]",
+                ),
+            ),
+            (
+                Some("vendor.example"),
+                None,
+                Some("no Subject:, but subject_regex is \"(?i)booking\""),
+            ),
+            (
+                Some("vendor.example"),
+                Some("Newsletter"),
+                Some("Subject: \"Newsletter\" does not match subject_regex \"(?i)booking\""),
+            ),
+        ];
+        for (from, subject, why) in cases {
+            assert_eq!(e.header_mismatch(from, subject).as_deref(), why);
+            assert_eq!(e.matches_headers(from, subject), why.is_none());
+        }
     }
 
     /// An [`Extractor`] backed by a checked-in script from
