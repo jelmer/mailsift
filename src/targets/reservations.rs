@@ -19,6 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
+use chrono::{DateTime, FixedOffset};
 use serde::Deserialize;
 use tracing::warn;
 
@@ -297,7 +298,7 @@ pub fn identifying_fields(path: &Path) -> Option<IdentifyingFields> {
 pub fn file_reservation(
     src: &Path,
     dir: &Path,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
 ) -> Result<Vec<FileOutcome>> {
     let (_body, doc) = read_and_parse::<serde_json::Value>(src, "reservation")?;
     // Each leg is kept as generic JSON so it can be written back out
@@ -334,7 +335,7 @@ pub fn file_reservation(
             dir,
             &reservation,
             &leg_body,
-            received_at_epoch,
+            message_date,
             leg_number.as_deref(),
             multi_leg,
         ) {
@@ -363,7 +364,7 @@ fn file_one(
     dir: &Path,
     reservation: &Reservation,
     body: &str,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
     leg_number: Option<&str>,
     distinguish_by_day: bool,
 ) -> Result<FileOutcome> {
@@ -375,7 +376,7 @@ fn file_one(
     // under it, as its calendar event is, whichever mail it came from;
     // otherwise the leg's own date keeps them apart.
     if let Some(target) = leg_target(dir, year, &stem, leg_number) {
-        let body_out = super::json_target::body_with_received_at(body, received_at_epoch);
+        let body_out = super::json_target::body_with_received_at(body, message_date);
         return write_unless_newer(&target, &body_out, "reservation");
     }
     if distinguish_by_day && let Some(day) = reservation.day() {
@@ -393,7 +394,7 @@ fn file_one(
     }
 
     let target = dir.join(format!("{year:04}")).join(format!("{stem}.json"));
-    let body_out = super::json_target::body_with_received_at(body, received_at_epoch);
+    let body_out = super::json_target::body_with_received_at(body, message_date);
     write_unless_newer(&target, &body_out, "reservation")
 }
 
@@ -552,7 +553,7 @@ pub const COMPLETE_ITINERARY_KEY: &str = "mailsift:itineraryComplete";
 pub fn cancel_superseded_legs(
     src: &Path,
     dir: &Path,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
 ) -> Result<Vec<(PathBuf, serde_json::Value)>> {
     let (_body, doc) = read_and_parse::<serde_json::Value>(src, "reservation")?;
     let legs = split_legs(doc);
@@ -564,8 +565,7 @@ pub fn cancel_superseded_legs(
     if complete.is_empty() {
         return Ok(Vec::new());
     }
-    let Some(received_at) = received_at_epoch.and_then(|e| chrono::DateTime::from_timestamp(e, 0))
-    else {
+    let Some(received_at) = message_date else {
         warn!(
             source = %src.display(),
             "complete itinerary without a message date; not cancelling the legs it drops"
@@ -616,9 +616,7 @@ pub fn cancel_superseded_legs(
         obj.insert("reservationStatus".into(), "ReservationCancelled".into());
         // Dated by the mail that dropped it, so replaying the original
         // confirmation doesn't put the leg back.
-        if let Some(stamp) = format_received_at(received_at.timestamp()) {
-            obj.insert("receivedAt".into(), stamp.into());
-        }
+        obj.insert("receivedAt".into(), format_received_at(received_at).into());
         write_atomic(&path, serde_json::to_string_pretty(&record)?.as_bytes())?;
         cancelled.push((path, record));
     }
@@ -662,6 +660,7 @@ fn archived_records(dir: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::targets::json_target::date_at;
 
     fn parse(json: serde_json::Value) -> Reservation {
         serde_json::from_value(json).expect("valid reservation")
@@ -871,8 +870,8 @@ mod tests {
     fn file_mail(tmp: &Path, dir: &Path, legs: &[serde_json::Value], epoch: i64) -> usize {
         let src = tmp.join(format!("mail-{epoch}.reservation.json"));
         fs::write(&src, serde_json::to_vec(legs).unwrap()).unwrap();
-        file_reservation(&src, dir, Some(epoch)).unwrap();
-        cancel_superseded_legs(&src, dir, Some(epoch))
+        file_reservation(&src, dir, Some(date_at(epoch))).unwrap();
+        cancel_superseded_legs(&src, dir, Some(date_at(epoch)))
             .unwrap()
             .len()
     }
@@ -1248,7 +1247,7 @@ mod tests {
         let dir = tmp.path().join("out");
 
         // 2024-11-01T00:00:00Z
-        file_reservation(&src, &dir, Some(1730419200)).unwrap();
+        file_reservation(&src, &dir, Some(date_at(1730419200))).unwrap();
         let body = fs::read_to_string(dir.join("2024/abc123.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["receivedAt"], "2024-11-01T00:00:00Z");
@@ -1266,14 +1265,14 @@ mod tests {
             br#"{"reservationNumber":"ABC123","checkinTime":"2024-11-06"}"#,
         )
         .unwrap();
-        file_reservation(&src, &dir, Some(1730419200)).unwrap();
+        file_reservation(&src, &dir, Some(date_at(1730419200))).unwrap();
         // The original, sent a day earlier, turns up afterwards.
         fs::write(
             &src,
             br#"{"reservationNumber":"ABC123","checkinTime":"2024-11-05"}"#,
         )
         .unwrap();
-        let outcomes = file_reservation(&src, &dir, Some(1730332800)).unwrap();
+        let outcomes = file_reservation(&src, &dir, Some(date_at(1730332800))).unwrap();
         assert!(matches!(outcomes[..], [FileOutcome::Kept(_)]));
 
         let body = fs::read_to_string(dir.join("2024/abc123.json")).unwrap();

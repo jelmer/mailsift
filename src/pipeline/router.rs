@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
+use chrono::{DateTime, FixedOffset};
 use tracing::{debug, info, warn};
 
 use crate::artifacts::{Artifact, Kind};
@@ -108,7 +109,7 @@ pub(super) fn file_event_artifact(
     artifact: &Artifact,
     event_sink: &EventSinkKind,
     seen: Option<&SeenStore>,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
     summary: &mut Summary,
 ) {
     let body = match fs::read_to_string(&artifact.path) {
@@ -147,14 +148,7 @@ pub(super) fn file_event_artifact(
     }
 
     for event in &singles {
-        file_single(
-            extractor,
-            event,
-            event_sink,
-            seen,
-            received_at_epoch,
-            summary,
-        );
+        file_single(extractor, event, event_sink, seen, message_date, summary);
     }
 }
 
@@ -168,14 +162,14 @@ pub(super) fn file_reservation_json(
     extractor: &str,
     artifact: &Artifact,
     reservations_dir: &Path,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
     summary: &mut Summary,
 ) {
     if summary.dry_run {
         summary.bump(extractor, KIND_RESERVATION);
         return;
     }
-    match reservations::file_reservation(&artifact.path, reservations_dir, received_at_epoch) {
+    match reservations::file_reservation(&artifact.path, reservations_dir, message_date) {
         // One bump per record written, matching the event side, where
         // a multi-leg itinerary counts as several events.
         Ok(outcomes) => {
@@ -205,7 +199,7 @@ pub(super) fn cancel_superseded_legs(
     reservations_dir: &Path,
     event_sink: &EventSinkKind,
     seen: Option<&SeenStore>,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
     summary: &mut Summary,
 ) {
     if summary.dry_run {
@@ -214,7 +208,7 @@ pub(super) fn cancel_superseded_legs(
     let cancelled = match reservations::cancel_superseded_legs(
         &artifact.path,
         reservations_dir,
-        received_at_epoch,
+        message_date,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -242,14 +236,7 @@ pub(super) fn cancel_superseded_legs(
             }
         };
         for event in &events {
-            file_single(
-                extractor,
-                event,
-                event_sink,
-                seen,
-                received_at_epoch,
-                summary,
-            );
+            file_single(extractor, event, event_sink, seen, message_date, summary);
         }
     }
 }
@@ -259,7 +246,7 @@ pub(super) fn file_reservation_artifact(
     artifact: &Artifact,
     event_sink: &EventSinkKind,
     seen: Option<&SeenStore>,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
     summary: &mut Summary,
 ) {
     let singles = match reservation::convert_file(&artifact.path) {
@@ -283,14 +270,7 @@ pub(super) fn file_reservation_artifact(
         return;
     }
     for single in &singles {
-        file_single(
-            extractor,
-            single,
-            event_sink,
-            seen,
-            received_at_epoch,
-            summary,
-        );
+        file_single(extractor, single, event_sink, seen, message_date, summary);
     }
 }
 
@@ -299,14 +279,14 @@ pub(super) fn file_bill_artifact(
     artifact: &Artifact,
     bills_dir: &Path,
     firefly: Option<&crate::targets::firefly::FireflySink>,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
     summary: &mut Summary,
 ) {
     if summary.dry_run {
         summary.bump(extractor, KIND_BILL);
         return;
     }
-    match bills::file_bill(&artifact.path, bills_dir, firefly, received_at_epoch) {
+    match bills::file_bill(&artifact.path, bills_dir, firefly, message_date) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_BILL);
         }
@@ -332,7 +312,7 @@ pub(super) fn file_bill_blob_artifact(
     artifact: &Artifact,
     all_artifacts: &[Artifact],
     bills_dir: &Path,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
     summary: &mut Summary,
 ) {
     if summary.dry_run {
@@ -342,7 +322,7 @@ pub(super) fn file_bill_blob_artifact(
     let Some((pair, received_at)) = sibling_json_body(all_artifacts, Kind::Bill, &artifact.slug)
         .and_then(|body| {
             let pair = bills::paired_name_from_json(&body)?;
-            Some((pair, sibling_received_at(&body, received_at_epoch)))
+            Some((pair, sibling_received_at(&body, message_date)))
         })
     else {
         warn!(
@@ -380,14 +360,14 @@ pub(super) fn file_parcel_artifact(
     artifact: &Artifact,
     parcels_dir: &Path,
     trackers: Option<&crate::targets::trackers::Trackers>,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
     summary: &mut Summary,
 ) {
     if summary.dry_run {
         summary.bump(extractor, KIND_PARCEL);
         return;
     }
-    match parcels::file_parcel(&artifact.path, parcels_dir, trackers, received_at_epoch) {
+    match parcels::file_parcel(&artifact.path, parcels_dir, trackers, message_date) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_PARCEL);
         }
@@ -408,7 +388,7 @@ fn file_single(
     event: &SingleEvent,
     event_sink: &EventSinkKind,
     seen: Option<&SeenStore>,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
     summary: &mut Summary,
 ) {
     if summary.dry_run {
@@ -419,8 +399,9 @@ fn file_single(
     // the message it arrived in. That lets the sink order it against
     // other takes on the same UID, and makes its body the same every
     // time the message is processed.
-    let dated = match received_at_epoch
-        .and_then(|epoch| chrono::DateTime::from_timestamp(epoch, 0))
+    // DTSTAMP is always UTC (RFC 5545 section 3.8.7.2).
+    let dated = match message_date
+        .map(|date| date.with_timezone(&chrono::Utc))
         .filter(|_| event.dtstamp.is_none())
         .map(|message_date| event.with_dtstamp(message_date))
         .transpose()
@@ -479,7 +460,7 @@ pub(super) fn file_receipt_artifact(
     artifact: &Artifact,
     raw_message: &[u8],
     sink: &receipts::ReceiptSink,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
     summary: &mut Summary,
     recorder: &crate::stats::Recorder,
     now_ts: i64,
@@ -488,7 +469,7 @@ pub(super) fn file_receipt_artifact(
         summary.bump(extractor, KIND_RECEIPT);
         return;
     }
-    match sink.file_receipt(&artifact.path, raw_message, received_at_epoch) {
+    match sink.file_receipt(&artifact.path, raw_message, message_date) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_RECEIPT);
         }
@@ -537,7 +518,7 @@ pub(super) fn file_receipt_blob_artifact(
     artifact: &Artifact,
     all_artifacts: &[Artifact],
     sink: &receipts::ReceiptSink,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
     summary: &mut Summary,
 ) {
     if summary.dry_run {
@@ -547,7 +528,7 @@ pub(super) fn file_receipt_blob_artifact(
     let Some((pair, received_at)) = sibling_json_body(all_artifacts, Kind::Receipt, &artifact.slug)
         .and_then(|body| {
             let pair = receipts::paired_name_from_json(&body)?;
-            Some((pair, sibling_received_at(&body, received_at_epoch)))
+            Some((pair, sibling_received_at(&body, message_date)))
         })
     else {
         warn!(
@@ -598,27 +579,25 @@ fn sibling_json_body(all_artifacts: &[Artifact], kind: Kind, slug: &str) -> Opti
 /// like the record it belongs to.
 fn sibling_received_at(
     body: &str,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     // `body` already parsed as a bill or receipt, so this can't fail.
-    json_target::received_at_in(
-        json_target::body_with_received_at(body, received_at_epoch).as_bytes(),
-    )
-    .expect("sibling JSON parsed a moment ago")
+    json_target::received_at_in(json_target::body_with_received_at(body, message_date).as_bytes())
+        .expect("sibling JSON parsed a moment ago")
 }
 
 pub(super) fn file_subscription_artifact(
     extractor: &str,
     artifact: &Artifact,
     subscriptions_dir: &Path,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
     summary: &mut Summary,
 ) {
     if summary.dry_run {
         summary.bump(extractor, KIND_SUBSCRIPTION);
         return;
     }
-    match subscriptions::file_subscription(&artifact.path, subscriptions_dir, received_at_epoch) {
+    match subscriptions::file_subscription(&artifact.path, subscriptions_dir, message_date) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_SUBSCRIPTION);
         }
@@ -640,7 +619,7 @@ pub(super) fn file_ticket_artifact(
     year: i32,
     sink: &tickets::TicketSink,
     meta: &tickets::TicketMeta,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
     summary: &mut Summary,
 ) {
     if summary.dry_run {
@@ -653,7 +632,7 @@ pub(super) fn file_ticket_artifact(
         &artifact.ext,
         year,
         meta,
-        received_at_epoch,
+        message_date,
     ) {
         Ok(FileOutcome::Created(_) | FileOutcome::Updated(_)) => {
             summary.bump(extractor, KIND_TICKET);
@@ -895,6 +874,7 @@ fn year_from_reservation_artifact(path: &Path) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::targets::json_target::date_at;
     use std::path::PathBuf;
 
     #[test]
@@ -1141,8 +1121,8 @@ END:VCALENDAR\r
         let mut summary = Summary::default();
 
         // Sent 2026-01-28 and 2026-01-20 respectively.
-        let rebooked = (event_about("Rebooked"), Some(1769594400));
-        let original = (event_about("Original"), Some(1768903200));
+        let rebooked = (event_about("Rebooked"), Some(date_at(1769594400)));
+        let original = (event_about("Original"), Some(date_at(1768903200)));
 
         file_single("ex", &rebooked.0, &sink, None, rebooked.1, &mut summary);
         file_single("ex", &original.0, &sink, None, original.1, &mut summary);
@@ -1183,7 +1163,7 @@ END:VCALENDAR\r
             &event_about("Rebooked"),
             &sink,
             None,
-            Some(1769594400),
+            Some(date_at(1769594400)),
             &mut summary,
         );
         let mut summary = Summary::default();
@@ -1192,7 +1172,7 @@ END:VCALENDAR\r
             &event_about("Original"),
             &sink,
             Some(&store),
-            Some(1768903200),
+            Some(date_at(1768903200)),
             &mut summary,
         );
         assert_eq!(store.len().unwrap(), 0);
@@ -1208,9 +1188,21 @@ END:VCALENDAR\r
         let art = artifact(Kind::Subscription, path);
         let mut summary = Summary::default();
 
-        file_subscription_artifact("ex", &art, out.path(), Some(1769594400), &mut summary);
+        file_subscription_artifact(
+            "ex",
+            &art,
+            out.path(),
+            Some(date_at(1769594400)),
+            &mut summary,
+        );
         assert_eq!(summary.render(), "ex=1 subscription");
-        file_subscription_artifact("ex", &art, out.path(), Some(1768903200), &mut summary);
+        file_subscription_artifact(
+            "ex",
+            &art,
+            out.path(),
+            Some(date_at(1768903200)),
+            &mut summary,
+        );
         assert_eq!(summary.render(), "ex=1 subscription");
     }
 
@@ -1246,7 +1238,7 @@ END:VCALENDAR\r
         ];
         let mut summary = Summary::default();
         // The message itself was sent 2024-11-01.
-        let sent = Some(1730419200);
+        let sent = Some(date_at(1730419200));
 
         file_bill_artifact("ex", &arts[0], out.path(), None, sent, &mut summary);
         file_bill_blob_artifact("ex", &arts[1], &arts, out.path(), sent, &mut summary);
@@ -1267,7 +1259,7 @@ END:VCALENDAR\r
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = SeenStore::open(&store_dir.path().join("seen.db")).unwrap();
         let mut summary = Summary::default();
-        let sent = Some(1769594400);
+        let sent = Some(date_at(1769594400));
 
         file_single(
             "ex",
@@ -1317,7 +1309,7 @@ END:VCALENDAR\r
             &event_about("Original"),
             &sink,
             None,
-            Some(1768903200),
+            Some(date_at(1768903200)),
             &mut summary,
         );
         file_single(
@@ -1325,7 +1317,7 @@ END:VCALENDAR\r
             &event_about("Rebooked"),
             &sink,
             None,
-            Some(1769594400),
+            Some(date_at(1769594400)),
             &mut summary,
         );
         assert_eq!(filed_summary(out_dir.path()), "SUMMARY:Rebooked");

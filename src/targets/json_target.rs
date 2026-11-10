@@ -14,7 +14,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use serde_json::{Map, Value};
 use tracing::warn;
 
@@ -68,24 +68,29 @@ where
     chrono::Utc::now().year()
 }
 
-/// Format a unix timestamp as an RFC3339 string for use as a
-/// `receivedAt` field.
-pub fn format_received_at(epoch: i64) -> Option<String> {
-    let dt = chrono::DateTime::from_timestamp(epoch, 0)?;
-    Some(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+/// Format a message date as an RFC3339 string for use as a
+/// `receivedAt` field, keeping its offset (`Z` for UTC).
+pub fn format_received_at(date: DateTime<FixedOffset>) -> String {
+    date.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// A message date in UTC, for tests that only care about ordering.
+#[cfg(test)]
+pub(crate) fn date_at(epoch: i64) -> DateTime<FixedOffset> {
+    DateTime::from_timestamp(epoch, 0)
+        .expect("epoch in range")
+        .fixed_offset()
 }
 
 /// Inject `receivedAt = <RFC3339 string>` into the JSON body iff the
 /// field isn't already set (extractor precedence wins). Silently
 /// returns the input untouched when the body isn't a JSON object or
-/// when no epoch is supplied.
-pub fn body_with_received_at(body: &str, received_at_epoch: Option<i64>) -> String {
-    let Some(epoch) = received_at_epoch else {
+/// when no date is supplied.
+pub fn body_with_received_at(body: &str, message_date: Option<DateTime<FixedOffset>>) -> String {
+    let Some(date) = message_date else {
         return body.to_string();
     };
-    let Some(stamped) = format_received_at(epoch) else {
-        return body.to_string();
-    };
+    let stamped = format_received_at(date);
     let mut value: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => return body.to_string(),
@@ -304,15 +309,43 @@ mod tests {
     fn format_received_at_produces_rfc3339() {
         // 2026-08-27T09:30:00Z
         assert_eq!(
-            format_received_at(1787823000).as_deref(),
-            Some("2026-08-27T09:30:00Z")
+            format_received_at(date_at(1787823000)),
+            "2026-08-27T09:30:00Z"
         );
+    }
+
+    #[test]
+    fn format_received_at_keeps_the_offset() {
+        let date = DateTime::parse_from_rfc3339("2026-11-06T00:30:00+01:00").unwrap();
+        assert_eq!(format_received_at(date), "2026-11-06T00:30:00+01:00");
+    }
+
+    #[test]
+    fn write_unless_newer_orders_records_by_instant_across_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("spotify.json");
+        // 23:45Z on the 5th is later than 00:30+01:00 (23:30Z), although
+        // its string sorts first.
+        write_unless_newer(
+            &target,
+            &record("2026-11-05T23:45:00Z", 9.99),
+            "subscription",
+        )
+        .unwrap();
+        let outcome = write_unless_newer(
+            &target,
+            &record("2026-11-06T00:30:00+01:00", 12.99),
+            "subscription",
+        )
+        .unwrap();
+        assert!(matches!(outcome, FileOutcome::Kept(_)));
+        assert_eq!(price_at(&target), 9.99);
     }
 
     #[test]
     fn body_with_received_at_injects_field_once() {
         let body = r#"{"payee":"Acme","invoiceNumber":"INV1"}"#;
-        let stamped = body_with_received_at(body, Some(1787823000));
+        let stamped = body_with_received_at(body, Some(date_at(1787823000)));
         let v: serde_json::Value = serde_json::from_str(&stamped).unwrap();
         assert_eq!(v["receivedAt"], "2026-08-27T09:30:00Z");
         assert_eq!(v["payee"], "Acme");
@@ -321,13 +354,13 @@ mod tests {
     #[test]
     fn body_with_received_at_preserves_existing() {
         let body = r#"{"payee":"Acme","receivedAt":"2020-01-01T00:00:00Z"}"#;
-        let stamped = body_with_received_at(body, Some(1787823000));
+        let stamped = body_with_received_at(body, Some(date_at(1787823000)));
         let v: serde_json::Value = serde_json::from_str(&stamped).unwrap();
         assert_eq!(v["receivedAt"], "2020-01-01T00:00:00Z");
     }
 
     #[test]
-    fn body_with_received_at_noop_without_epoch() {
+    fn body_with_received_at_noop_without_date() {
         let body = r#"{"payee":"Acme"}"#;
         assert_eq!(body_with_received_at(body, None), body);
     }
@@ -335,7 +368,7 @@ mod tests {
     #[test]
     fn body_with_received_at_noop_when_not_object() {
         let body = "42";
-        let stamped = body_with_received_at(body, Some(1787823000));
+        let stamped = body_with_received_at(body, Some(date_at(1787823000)));
         assert_eq!(stamped, "42");
     }
 }

@@ -24,7 +24,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -91,7 +91,7 @@ pub fn file_bill(
     src: &Path,
     dir: &Path,
     firefly: Option<&FireflySink>,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
 ) -> Result<FileOutcome> {
     let (body, bill) = read_and_parse::<Bill>(src, "bill")?;
 
@@ -116,7 +116,7 @@ pub fn file_bill(
         .join(format!("{year:04}"))
         .join(format!("{payee_slug}-{invoice_slug}.json"));
 
-    let body_out = super::json_target::body_with_received_at(&body, received_at_epoch);
+    let body_out = super::json_target::body_with_received_at(&body, message_date);
     let outcome = write_unless_newer(&target, &body_out, "bill")?;
     if matches!(outcome, FileOutcome::Kept(_)) {
         return Ok(outcome);
@@ -275,6 +275,7 @@ pub fn paired_name_from_json(body: &str) -> Option<(String, String, i32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::targets::json_target::date_at;
 
     #[test]
     fn year_from_due_date() {
@@ -295,7 +296,7 @@ mod tests {
         let dir = tmp.path().join("out");
         std::fs::create_dir_all(&dir).unwrap();
         // 2024-11-01T00:00:00Z
-        file_bill(&src, &dir, None, Some(1730419200)).unwrap();
+        file_bill(&src, &dir, None, Some(date_at(1730419200))).unwrap();
         let body = std::fs::read_to_string(dir.join("2024/acme-inv1.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["receivedAt"], "2024-11-01T00:00:00Z");
@@ -351,12 +352,12 @@ mod tests {
 
         write_bill(&src, 120.0);
         fs::write(&blob, b"reminder").unwrap();
-        file_bill(&src, &dir, None, Some(REMINDER_SENT)).unwrap();
+        file_bill(&src, &dir, None, Some(date_at(REMINDER_SENT))).unwrap();
         file_bill_blob(&blob, "pdf", pair, &dir, at(REMINDER_SENT)).unwrap();
 
         write_bill(&src, 100.0);
         fs::write(&blob, b"invoice").unwrap();
-        let outcome = file_bill(&src, &dir, None, Some(INVOICE_SENT)).unwrap();
+        let outcome = file_bill(&src, &dir, None, Some(date_at(INVOICE_SENT))).unwrap();
         assert!(matches!(outcome, FileOutcome::Kept(_)));
         let outcome = file_bill_blob(&blob, "pdf", pair, &dir, at(INVOICE_SENT)).unwrap();
         assert!(matches!(outcome, FileOutcome::Kept(_)));
@@ -380,7 +381,7 @@ mod tests {
             let body =
                 serde_json::json!({"payee": payee, "invoiceNumber": invoice, "dueDate": due});
             fs::write(&src, body.to_string()).unwrap();
-            file_bill(&src, &dir, None, Some(sent)).unwrap();
+            file_bill(&src, &dir, None, Some(date_at(sent))).unwrap();
         };
 
         file("Acme", "INV1", "2024-12-05", INVOICE_SENT);
@@ -412,7 +413,7 @@ mod tests {
                 "totalPaymentDue": {"price": 42.5, "priceCurrency": "GBP"},
             });
             fs::write(&src, body.to_string()).unwrap();
-            file_bill(&src, &dir, Some(&firefly), Some(sent)).unwrap()
+            file_bill(&src, &dir, Some(&firefly), Some(date_at(sent))).unwrap()
         };
         const LOOKUP: &str = "GET /api/v1/bills?query=Acme";
 
@@ -436,7 +437,7 @@ mod tests {
             "payee": "Acme Corp", "invoiceNumber": "INV9", "dueDate": "2024-12-05",
         });
         fs::write(&src, body.to_string()).unwrap();
-        file_bill(&src, &dir, None, Some(REMINDER_SENT)).unwrap();
+        file_bill(&src, &dir, None, Some(date_at(REMINDER_SENT))).unwrap();
 
         let invoice_sent = DateTime::from_timestamp(INVOICE_SENT, 0);
         assert!(!payee_has_newer_bill(&dir, "acme", invoice_sent).unwrap());
@@ -454,12 +455,12 @@ mod tests {
 
         write_bill(&src, 100.0);
         fs::write(&blob, b"invoice").unwrap();
-        file_bill(&src, &dir, None, Some(INVOICE_SENT)).unwrap();
+        file_bill(&src, &dir, None, Some(date_at(INVOICE_SENT))).unwrap();
         file_bill_blob(&blob, "pdf", pair, &dir, at(INVOICE_SENT)).unwrap();
 
         write_bill(&src, 120.0);
         fs::write(&blob, b"reminder").unwrap();
-        let outcome = file_bill(&src, &dir, None, Some(REMINDER_SENT)).unwrap();
+        let outcome = file_bill(&src, &dir, None, Some(date_at(REMINDER_SENT))).unwrap();
         assert!(matches!(outcome, FileOutcome::Updated(_)));
         let outcome = file_bill_blob(&blob, "pdf", pair, &dir, at(REMINDER_SENT)).unwrap();
         assert!(matches!(outcome, FileOutcome::Updated(_)));

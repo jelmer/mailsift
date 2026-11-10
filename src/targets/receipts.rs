@@ -28,7 +28,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use serde::Deserialize;
 
 use super::FileOutcome;
@@ -85,7 +85,7 @@ impl ReceiptSink {
         &self,
         src: &Path,
         raw_message: &[u8],
-        received_at_epoch: Option<i64>,
+        message_date: Option<DateTime<FixedOffset>>,
     ) -> Result<FileOutcome> {
         let (body, receipt) = read_and_parse::<Receipt>(src, "receipt")?;
 
@@ -111,7 +111,7 @@ impl ReceiptSink {
             fwd.forward(raw_message, &hint)?;
             return Ok(FileOutcome::Created(format!("forwarded ({hint})")));
         }
-        let body_out = json_target::body_with_received_at(&body, received_at_epoch);
+        let body_out = json_target::body_with_received_at(&body, message_date);
         let filename = format!("{merchant_slug}-{order_slug}.json");
         let received_at = json_target::received_at_in(body_out.as_bytes())?;
         self.update(
@@ -243,6 +243,7 @@ pub fn paired_name_from_json(body: &str) -> Option<(String, String, i32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::targets::json_target::date_at;
 
     #[test]
     fn year_from_order_date() {
@@ -331,13 +332,16 @@ mod tests {
 
         write_receipt(&src, 12.0);
         std::fs::write(&blob, b"correction").unwrap();
-        sink.file_receipt(&src, b"", Some(CORRECTION_SENT)).unwrap();
+        sink.file_receipt(&src, b"", Some(date_at(CORRECTION_SENT)))
+            .unwrap();
         sink.file_receipt_blob(&blob, "pdf", pair, at(CORRECTION_SENT))
             .unwrap();
 
         write_receipt(&src, 10.0);
         std::fs::write(&blob, b"invoice").unwrap();
-        let outcome = sink.file_receipt(&src, b"", Some(INVOICE_SENT)).unwrap();
+        let outcome = sink
+            .file_receipt(&src, b"", Some(date_at(INVOICE_SENT)))
+            .unwrap();
         assert!(matches!(outcome, FileOutcome::Kept(_)));
         let outcome = sink
             .file_receipt_blob(&blob, "pdf", pair, at(INVOICE_SENT))
@@ -366,13 +370,16 @@ mod tests {
 
         write_receipt(&src, 10.0);
         std::fs::write(&blob, b"invoice").unwrap();
-        sink.file_receipt(&src, b"", Some(INVOICE_SENT)).unwrap();
+        sink.file_receipt(&src, b"", Some(date_at(INVOICE_SENT)))
+            .unwrap();
         sink.file_receipt_blob(&blob, "pdf", pair, at(INVOICE_SENT))
             .unwrap();
 
         write_receipt(&src, 12.0);
         std::fs::write(&blob, b"correction").unwrap();
-        let outcome = sink.file_receipt(&src, b"", Some(CORRECTION_SENT)).unwrap();
+        let outcome = sink
+            .file_receipt(&src, b"", Some(date_at(CORRECTION_SENT)))
+            .unwrap();
         assert!(matches!(outcome, FileOutcome::Updated(_)));
         let outcome = sink
             .file_receipt_blob(&blob, "pdf", pair, at(CORRECTION_SENT))
@@ -418,13 +425,16 @@ mod tests {
 
         write_receipt(&src, 12.0);
         std::fs::write(&blob, b"correction").unwrap();
-        sink.file_receipt(&src, b"", Some(CORRECTION_SENT)).unwrap();
+        sink.file_receipt(&src, b"", Some(date_at(CORRECTION_SENT)))
+            .unwrap();
         sink.file_receipt_blob(&blob, "pdf", pair, at(CORRECTION_SENT))
             .unwrap();
 
         write_receipt(&src, 10.0);
         std::fs::write(&blob, b"invoice").unwrap();
-        let outcome = sink.file_receipt(&src, b"", Some(INVOICE_SENT)).unwrap();
+        let outcome = sink
+            .file_receipt(&src, b"", Some(date_at(INVOICE_SENT)))
+            .unwrap();
         assert!(matches!(outcome, FileOutcome::Kept(_)));
         let outcome = sink
             .file_receipt_blob(&blob, "pdf", pair, at(INVOICE_SENT))
@@ -450,13 +460,16 @@ mod tests {
 
         write_receipt(&src, 10.0);
         std::fs::write(&blob, b"invoice").unwrap();
-        sink.file_receipt(&src, b"", Some(INVOICE_SENT)).unwrap();
+        sink.file_receipt(&src, b"", Some(date_at(INVOICE_SENT)))
+            .unwrap();
         sink.file_receipt_blob(&blob, "pdf", pair, at(INVOICE_SENT))
             .unwrap();
 
         write_receipt(&src, 12.0);
         std::fs::write(&blob, b"correction").unwrap();
-        let outcome = sink.file_receipt(&src, b"", Some(CORRECTION_SENT)).unwrap();
+        let outcome = sink
+            .file_receipt(&src, b"", Some(date_at(CORRECTION_SENT)))
+            .unwrap();
         assert!(matches!(outcome, FileOutcome::Updated(_)));
         let outcome = sink
             .file_receipt_blob(&blob, "pdf", pair, at(CORRECTION_SENT))

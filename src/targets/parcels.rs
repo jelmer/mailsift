@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -60,7 +60,7 @@ pub fn file_parcel(
     src: &Path,
     dir: &Path,
     trackers: Option<&super::trackers::Trackers>,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
 ) -> Result<FileOutcome> {
     let (body, parcel) = read_and_parse::<Parcel>(src, "parcel")?;
     let tracking = parcel
@@ -79,12 +79,14 @@ pub fn file_parcel(
         .with_context(|| format!("parsing parcel JSON {}", src.display()))?;
     // Stamp incoming with `receivedAt` before merge/init so that the
     // history entry we mint from it inherits the same timestamp.
-    if let Some(epoch) = received_at_epoch
-        && let Some(stamped) = super::json_target::format_received_at(epoch)
+    if let Some(date) = message_date
         && let Some(obj) = incoming.as_object_mut()
         && !obj.contains_key("receivedAt")
     {
-        obj.insert("receivedAt".into(), Value::String(stamped));
+        obj.insert(
+            "receivedAt".into(),
+            Value::String(super::json_target::format_received_at(date)),
+        );
     }
     // Synthesise a trackingUrl for well-known carriers when the
     // extractor didn't supply one. Extractor-provided URLs always win.
@@ -398,6 +400,7 @@ fn history_entry_from(obj: &Map<String, Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::targets::json_target::date_at;
 
     #[test]
     fn tracking_url_synthesised_for_known_carrier() {
@@ -909,7 +912,8 @@ mod tests {
                             "trackingNumber": "X1", "deliveryStatus": status, "step": n,
                         });
                         std::fs::write(&src, body.to_string()).unwrap();
-                        file_parcel(&src, dir, None, Some(1_700_000_000 + n as i64)).unwrap();
+                        file_parcel(&src, dir, None, Some(date_at(1_700_000_000 + n as i64)))
+                            .unwrap();
                     });
                 }
             });
@@ -932,7 +936,7 @@ mod tests {
         let dir = tmp.path().join("out");
         std::fs::create_dir_all(&dir).unwrap();
         // First filing: 2024-11-01T00:00:00Z
-        file_parcel(&src, &dir, None, Some(1730419200)).unwrap();
+        file_parcel(&src, &dir, None, Some(date_at(1730419200))).unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("XYZ.json")).unwrap()).unwrap();
         assert_eq!(v["receivedAt"], "2024-11-01T00:00:00Z");
@@ -947,7 +951,7 @@ mod tests {
             br#"{"trackingNumber":"XYZ","deliveryStatus":"OutForDelivery"}"#,
         )
         .unwrap();
-        file_parcel(&src, &dir, None, Some(1731628800)).unwrap();
+        file_parcel(&src, &dir, None, Some(date_at(1731628800))).unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("XYZ.json")).unwrap()).unwrap();
         assert_eq!(

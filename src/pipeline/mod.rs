@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::{DateTime, FixedOffset};
 use tracing::{debug, info, warn};
 
 use crate::artifacts::{Artifact, Kind};
@@ -262,7 +263,7 @@ pub fn run(
     // every filed artifact (`receivedAt` in the JSON ones) so the web
     // UI can sort by it, and so the sinks can tell which of two
     // messages about the same thing is the newer one.
-    let received_at_epoch = message_epoch(&parsed_headers);
+    let message_date = message_date(&parsed_headers);
 
     // Stamp every recorded event with the same `ts` so a single
     // message's per-extractor lines cluster in the log. SystemTime
@@ -467,7 +468,7 @@ pub fn run(
                 artifact,
                 event_sink,
                 seen,
-                received_at_epoch,
+                message_date,
                 &mut summary,
             );
         }
@@ -478,7 +479,7 @@ pub fn run(
                 artifact,
                 event_sink,
                 seen,
-                received_at_epoch,
+                message_date,
                 &mut summary,
             );
         }
@@ -492,7 +493,7 @@ pub fn run(
                     &run.extractor,
                     artifact,
                     dir,
-                    received_at_epoch,
+                    message_date,
                     &mut summary,
                 );
             }
@@ -503,7 +504,7 @@ pub fn run(
                     dir,
                     event_sink,
                     seen,
-                    received_at_epoch,
+                    message_date,
                     &mut summary,
                 );
             }
@@ -520,7 +521,7 @@ pub fn run(
                     artifact,
                     dir,
                     firefly,
-                    received_at_epoch,
+                    message_date,
                     &mut summary,
                 );
             },
@@ -541,7 +542,7 @@ pub fn run(
                     artifact,
                     &run.result.artifacts,
                     dir,
-                    received_at_epoch,
+                    message_date,
                     &mut summary,
                 );
             },
@@ -558,7 +559,7 @@ pub fn run(
                     artifact,
                     dir,
                     trackers,
-                    received_at_epoch,
+                    message_date,
                     &mut summary,
                 );
             },
@@ -574,7 +575,7 @@ pub fn run(
                     &run.extractor,
                     artifact,
                     dir,
-                    received_at_epoch,
+                    message_date,
                     &mut summary,
                 );
             },
@@ -591,7 +592,7 @@ pub fn run(
                     artifact,
                     raw,
                     sink,
-                    received_at_epoch,
+                    message_date,
                     &mut summary,
                     recorder,
                     now_ts,
@@ -614,7 +615,7 @@ pub fn run(
                     artifact,
                     &run.result.artifacts,
                     sink,
-                    received_at_epoch,
+                    message_date,
                     &mut summary,
                 );
             },
@@ -667,7 +668,7 @@ pub fn run(
                     year,
                     sink,
                     &meta,
-                    received_at_epoch,
+                    message_date,
                     &mut summary,
                 );
             },
@@ -781,48 +782,61 @@ fn collect_parts(mail: &mailparse::ParsedMail<'_>, out: &mut extractor::BodyPart
     }
 }
 
-/// Read the message's `Date:` header as unix seconds. Best-effort;
-/// returns `None` if the header is missing or unparseable.
-fn message_date_epoch(headers: &[mailparse::MailHeader<'_>]) -> Option<i64> {
+/// Parse an RFC 5322 date, keeping its UTC offset. chrono handles the
+/// common forms; mailparse is more lenient (e.g. a `UTC` zone name or a
+/// spelled-out weekday) but only yields an instant, which is then taken
+/// as UTC.
+fn parse_mail_date(value: &str) -> Option<DateTime<FixedOffset>> {
+    let value = value.trim();
+    chrono::DateTime::parse_from_rfc2822(value)
+        .ok()
+        .or_else(|| {
+            let epoch = mailparse::dateparse(value).ok()?;
+            Some(chrono::DateTime::from_timestamp(epoch, 0)?.fixed_offset())
+        })
+}
+
+/// Read the message's `Date:` header. Best-effort; returns `None` if
+/// the header is missing or unparseable.
+fn message_date_header(headers: &[mailparse::MailHeader<'_>]) -> Option<DateTime<FixedOffset>> {
     let date_value = headers
         .iter()
         .find(|h| h.get_key_ref().eq_ignore_ascii_case("date"))?
         .get_value();
-    mailparse::dateparse(&date_value).ok()
+    parse_mail_date(&date_value)
 }
 
 /// When the newest `Received:` header says the message was handed
-/// over, as unix seconds. Each hop prepends its own header, so the
-/// first one is the final delivery. The timestamp follows the last
-/// `;` (RFC 5322 section 3.6.7).
-fn message_received_epoch(headers: &[mailparse::MailHeader<'_>]) -> Option<i64> {
+/// over. Each hop prepends its own header, so the first one is the
+/// final delivery. The timestamp follows the last `;` (RFC 5322
+/// section 3.6.7).
+fn message_received_header(headers: &[mailparse::MailHeader<'_>]) -> Option<DateTime<FixedOffset>> {
     let received = headers
         .iter()
         .find(|h| h.get_key_ref().eq_ignore_ascii_case("received"))?
         .get_value();
     let (_, stamp) = received.rsplit_once(';')?;
-    mailparse::dateparse(stamp.trim()).ok()
+    parse_mail_date(stamp)
 }
 
-/// When the message was sent (`Date:`), or failing that when it was
-/// received, as unix seconds. This is what orders two messages about
-/// the same thing.
 /// Whether the message reached us before the vendor started signing.
 /// Unknown on either side means no.
 fn received_before(received_at: Option<i64>, unsigned_before: Option<i64>) -> bool {
     matches!((received_at, unsigned_before), (Some(r), Some(cutoff)) if r < cutoff)
 }
 
-pub(crate) fn message_epoch(headers: &[mailparse::MailHeader<'_>]) -> Option<i64> {
-    message_date_epoch(headers).or_else(|| message_received_epoch(headers))
+/// When the message was sent (`Date:`), or failing that when it was
+/// received, in the offset the header gave. This is what orders two
+/// messages about the same thing.
+pub(crate) fn message_date(headers: &[mailparse::MailHeader<'_>]) -> Option<DateTime<FixedOffset>> {
+    message_date_header(headers).or_else(|| message_received_header(headers))
 }
 
-/// Read a year from the message's date. Best-effort; returns `None`
-/// if the message carries no usable date.
+/// Read a year from the message's date, as the sender saw it.
+/// Best-effort; returns `None` if the message carries no usable date.
 fn message_date_year(headers: &[mailparse::MailHeader<'_>]) -> Option<i32> {
     use chrono::Datelike;
-    let dt = chrono::DateTime::from_timestamp(message_epoch(headers)?, 0)?;
-    Some(dt.year())
+    Some(message_date(headers)?.year())
 }
 
 fn current_year() -> i32 {
@@ -976,28 +990,70 @@ mod tests {
         assert_eq!(message_date_year(&h), Some(2026));
     }
 
-    #[test]
-    fn message_epoch_prefers_date_header() {
-        let raw = b"Received: by mx.example.org; Sun, 28 Jun 2026 08:00:00 +0000\r\n\
-Date: Sat, 27 Jun 2026 12:00:00 +0000\r\n\r\n";
-        // 2026-06-27T12:00:00Z
-        assert_eq!(message_epoch(&parsed_headers(raw)), Some(1782561600));
+    fn rfc3339(date: Option<DateTime<FixedOffset>>) -> Option<String> {
+        date.map(|d| d.to_rfc3339())
     }
 
     #[test]
-    fn message_epoch_falls_back_to_newest_received_header() {
+    fn message_date_prefers_date_header() {
+        let raw = b"Received: by mx.example.org; Sun, 28 Jun 2026 08:00:00 +0000\r\n\
+Date: Sat, 27 Jun 2026 12:00:00 +0000\r\n\r\n";
+        assert_eq!(
+            rfc3339(message_date(&parsed_headers(raw))).as_deref(),
+            Some("2026-06-27T12:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn message_date_keeps_the_date_header_offset() {
+        let raw = b"Date: Fri, 6 Nov 2026 00:30:00 +0100 (CET)\r\n\r\n";
+        assert_eq!(
+            rfc3339(message_date(&parsed_headers(raw))).as_deref(),
+            Some("2026-11-06T00:30:00+01:00")
+        );
+    }
+
+    #[test]
+    fn message_date_reads_a_date_without_seconds() {
+        let raw = b"Date: Fri, 06 Nov 2026 00:30 +0100\r\n\r\n";
+        assert_eq!(
+            rfc3339(message_date(&parsed_headers(raw))).as_deref(),
+            Some("2026-11-06T00:30:00+01:00")
+        );
+    }
+
+    #[test]
+    fn message_date_falls_back_to_utc_for_forms_chrono_rejects() {
+        let raw = b"Date: Friday, 06 Nov 2026 00:30:00 UTC\r\n\r\n";
+        assert_eq!(
+            rfc3339(message_date(&parsed_headers(raw))).as_deref(),
+            Some("2026-11-06T00:30:00+00:00")
+        );
+    }
+
+    #[test]
+    fn message_date_year_is_the_senders_year() {
+        // 2025-12-31T23:30:00Z, but the first of January where it was sent.
+        let raw = b"Date: Thu, 1 Jan 2026 00:30:00 +0100\r\n\r\n";
+        assert_eq!(message_date_year(&parsed_headers(raw)), Some(2026));
+    }
+
+    #[test]
+    fn message_date_falls_back_to_newest_received_header() {
         let raw = b"Received: by 2002:a05:6402:1e8f with SMTP id f15csp123;\r\n\
 \x20       Sun, 28 Jun 2026 01:00:00 -0700 (PDT)\r\n\
 Received: from mail.example.org by mx.google.com; Sat, 27 Jun 2026 23:59:00 +0000\r\n\
 From: x\r\n\r\n";
-        // 2026-06-28T08:00:00Z
-        assert_eq!(message_epoch(&parsed_headers(raw)), Some(1782633600));
+        assert_eq!(
+            rfc3339(message_date(&parsed_headers(raw))).as_deref(),
+            Some("2026-06-28T01:00:00-07:00")
+        );
     }
 
     #[test]
-    fn message_epoch_is_none_without_any_date() {
+    fn message_date_is_none_without_any_date() {
         let raw = b"Received: from somewhere without a timestamp\r\nFrom: x\r\n\r\n";
-        assert_eq!(message_epoch(&parsed_headers(raw)), None);
+        assert_eq!(message_date(&parsed_headers(raw)), None);
     }
 
     #[test]

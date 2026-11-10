@@ -19,6 +19,7 @@ use std::path::Path;
 use std::fs;
 
 use anyhow::{Result, anyhow, bail};
+use chrono::{DateTime, FixedOffset};
 use serde::Deserialize;
 
 use super::FileOutcome;
@@ -47,7 +48,7 @@ impl Subscription {
 pub fn file_subscription(
     src: &Path,
     dir: &Path,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
 ) -> Result<FileOutcome> {
     let (body, parsed) = read_and_parse::<Subscription>(src, "subscription")?;
 
@@ -64,13 +65,14 @@ pub fn file_subscription(
     }
 
     let target = dir.join(format!("{slug}.json"));
-    let body_out = super::json_target::body_with_received_at(&body, received_at_epoch);
+    let body_out = super::json_target::body_with_received_at(&body, message_date);
     write_unless_newer(&target, &body_out, "subscription")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::targets::json_target::date_at;
 
     #[test]
     fn identifier_prefers_name() {
@@ -122,7 +124,7 @@ mod tests {
                     let src = tmp.path().join(format!("{n}.subscription.json"));
                     scope.spawn(move || {
                         fs::write(&src, format!(r#"{{"name":"Hinge","n":{n}}}"#)).unwrap();
-                        file_subscription(&src, dir, Some(1_700_000_000 + n)).unwrap();
+                        file_subscription(&src, dir, Some(date_at(1_700_000_000 + n))).unwrap();
                     });
                 }
             });
@@ -140,10 +142,10 @@ mod tests {
 
         // 2026-01-28 renewal, processed first.
         fs::write(&src, r#"{"name":"Hinge","orderDate":"2026-01-28"}"#).unwrap();
-        file_subscription(&src, &dir, Some(1769594400)).unwrap();
+        file_subscription(&src, &dir, Some(date_at(1769594400))).unwrap();
         // 2025-10-28 renewal, processed afterwards by a rescan.
         fs::write(&src, r#"{"name":"Hinge","orderDate":"2025-10-28"}"#).unwrap();
-        let outcome = file_subscription(&src, &dir, Some(1761645600)).unwrap();
+        let outcome = file_subscription(&src, &dir, Some(date_at(1761645600))).unwrap();
 
         assert!(matches!(outcome, FileOutcome::Kept(_)));
         let v: serde_json::Value =
