@@ -14,7 +14,8 @@ use crate::targets::EventSinkKind;
 
 mod router;
 
-const DEFAULT_EXTRACTOR_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long an extractor may run before it is killed.
+pub const DEFAULT_EXTRACTOR_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Upper bound on message size accepted by [`run`] and on HTML fragments
 /// pulled out of inline forwards. 25 MiB comfortably covers personal
@@ -746,7 +747,7 @@ fn parse_from_domain(value: &str) -> Option<String> {
 /// extractor `requires:` check consumes. Mirrors the IMAP-prefilter
 /// walker in [`crate::imap_scan`], so a message can be filtered the
 /// same way regardless of which path it arrived on.
-fn body_parts_from_mail(mail: mailparse::ParsedMail<'_>) -> extractor::BodyParts {
+pub(crate) fn body_parts_from_mail(mail: mailparse::ParsedMail<'_>) -> extractor::BodyParts {
     let mut parts = extractor::BodyParts::default();
     collect_parts(&mail, &mut parts);
     parts

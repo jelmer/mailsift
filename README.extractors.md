@@ -294,3 +294,45 @@ Add `--explain` for a per-extractor dispatch table showing which
 extractors matched, which were prefiltered out and why, and what each
 producing extractor emitted - the quickest way to work out why your new
 extractor did or didn't fire on a given message.
+
+### Golden-file tests
+
+`mailsift test-extractor` checks an extractor against saved messages
+without any test code. Each fixture `<stem>.eml` has a
+`<stem>.expected.json` next to it naming the extractor and the files it
+should write:
+
+```json
+{
+  "extractor": "my-vendor",
+  "artifacts": {
+    "my-vendor-ab123-2026-04-10.receipt.json": {"orderNumber": "AB123", "merchant": "My Vendor"},
+    "my-vendor-ab123-2026-04-10.event.ics": "BEGIN:VCALENDAR\r\n...",
+    "my-vendor-ab123-2026-04-10.receipt.pdf": {"sha256": "3f1a..."}
+  }
+}
+```
+
+`.json` artifacts are stored as parsed JSON, other text files as a
+string and binary files by their SHA-256. A message that should produce
+nothing has an empty `artifacts` object.
+
+Create or refresh expected files with `--update`, review the result,
+and commit it alongside the fixture:
+
+```sh
+mailsift test-extractor --extractors extractors --extractor my-vendor \
+    --update tests/corpus/my-vendor-receipt.eml
+mailsift test-extractor --extractors extractors tests/corpus/*.eml
+```
+
+`--extractor` is only needed when creating a file; afterwards the
+extractor named in it is used. For each fixture the command first
+checks that the manifest's `from_domains`, `subject_regex` and
+`requires:` would dispatch the message to the extractor at all, then
+runs it and reports every missing, unexpected or changed artifact, with
+the differing values for JSON and a line diff for text. Files with an
+unrecognised suffix and a non-zero exit count as failures.
+`require_dkim` is skipped unless you pass `--check-dkim`, since saved
+fixtures rarely carry an `Authentication-Results:` header. The exit
+status is non-zero if any fixture fails or has no expected file.
