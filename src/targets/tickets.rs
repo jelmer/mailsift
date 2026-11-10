@@ -44,7 +44,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::DateTime;
+use chrono::{DateTime, FixedOffset, Utc};
 use serde::Serialize;
 
 use super::FileOutcome;
@@ -105,14 +105,14 @@ fn sidecar_body(
     slug: &str,
     ext: &str,
     meta: &TicketMeta,
-    received_at_epoch: Option<i64>,
+    message_date: Option<DateTime<FixedOffset>>,
 ) -> Result<String> {
     let sidecar = Sidecar {
         slug,
         file: format!("{slug}.{ext}"),
         content_type: content_type_for(ext),
         meta,
-        received_at: received_at_epoch.and_then(json_target::format_received_at),
+        received_at: message_date.map(json_target::format_received_at),
     };
     serde_json::to_string_pretty(&sidecar).context("serialising ticket sidecar")
 }
@@ -138,21 +138,21 @@ impl TicketSink {
         ext: &str,
         year: i32,
         meta: &TicketMeta,
-        received_at_epoch: Option<i64>,
+        message_date: Option<DateTime<FixedOffset>>,
     ) -> Result<FileOutcome> {
         let slug = slugify(slug, false);
         if slug.is_empty() {
             bail!("{}: empty slug after sanitisation", src.display());
         }
         let ext = sanitize_ext(ext)?;
-        let sidecar = sidecar_body(&slug, &ext, meta, received_at_epoch)?;
+        let sidecar = sidecar_body(&slug, &ext, meta, message_date)?;
         let body =
             fs::read(src).with_context(|| format!("reading ticket source {}", src.display()))?;
         let sidecar_filename = sidecar_name(&slug);
         let blob_filename = format!("{slug}.{ext}");
         // The blob can't say which message it came from; its sidecar
         // can, so the pair is ordered by the sidecar's date.
-        let received_at = received_at_epoch.and_then(|epoch| DateTime::from_timestamp(epoch, 0));
+        let received_at = message_date.map(|date| date.with_timezone(&Utc));
 
         match self {
             TicketSink::LocalDir(dir) => {
@@ -201,6 +201,7 @@ impl TicketSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::targets::json_target::date_at;
 
     #[test]
     fn local_dir_files_under_year() {
@@ -256,8 +257,8 @@ mod tests {
         let sink = TicketSink::LocalDir(tmp.path().to_path_buf());
         let meta = TicketMeta::default();
         // 2026-08-27T09:30:00Z, and the pass as first issued a day earlier.
-        let reissued = Some(1787823000);
-        let issued = Some(1787736600);
+        let reissued = Some(date_at(1787823000));
+        let issued = Some(date_at(1787736600));
 
         std::fs::write(&src, b"reissued").unwrap();
         sink.file_ticket(&src, "flight", "pdf", 2026, &meta, reissued)
@@ -287,11 +288,25 @@ mod tests {
         let meta = TicketMeta::default();
 
         std::fs::write(&src, b"reissued").unwrap();
-        sink.file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787823000))
-            .unwrap();
+        sink.file_ticket(
+            &src,
+            "flight",
+            "pdf",
+            2026,
+            &meta,
+            Some(date_at(1787823000)),
+        )
+        .unwrap();
         std::fs::write(&src, b"issued").unwrap();
         let outcome = sink
-            .file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787736600))
+            .file_ticket(
+                &src,
+                "flight",
+                "pdf",
+                2026,
+                &meta,
+                Some(date_at(1787736600)),
+            )
             .unwrap();
         assert!(matches!(outcome, FileOutcome::Kept(_)));
         assert_eq!(server.resource("/2026/flight.pdf").unwrap(), b"reissued");
@@ -311,12 +326,26 @@ mod tests {
 
         std::fs::write(&src, b"issued").unwrap();
         let first = sink
-            .file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787736600))
+            .file_ticket(
+                &src,
+                "flight",
+                "pdf",
+                2026,
+                &meta,
+                Some(date_at(1787736600)),
+            )
             .unwrap();
         assert!(matches!(first, FileOutcome::Created(_)));
         std::fs::write(&src, b"reissued").unwrap();
         let second = sink
-            .file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787823000))
+            .file_ticket(
+                &src,
+                "flight",
+                "pdf",
+                2026,
+                &meta,
+                Some(date_at(1787823000)),
+            )
             .unwrap();
         assert!(matches!(second, FileOutcome::Updated(_)));
 
@@ -346,7 +375,7 @@ mod tests {
                 "pdf",
                 2026,
                 &TicketMeta::default(),
-                Some(1787736600),
+                Some(date_at(1787736600)),
             )
             .unwrap();
         assert!(matches!(outcome, FileOutcome::Kept(_)));
@@ -376,8 +405,15 @@ mod tests {
                             reservation_number: Some(format!("R{n}")),
                             ..TicketMeta::default()
                         };
-                        sink.file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787736600 + n))
-                            .unwrap();
+                        sink.file_ticket(
+                            &src,
+                            "flight",
+                            "pdf",
+                            2026,
+                            &meta,
+                            Some(date_at(1787736600 + n)),
+                        )
+                        .unwrap();
                     });
                 }
             });
@@ -399,11 +435,25 @@ mod tests {
         let meta = TicketMeta::default();
 
         std::fs::write(&src, b"issued").unwrap();
-        sink.file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787736600))
-            .unwrap();
+        sink.file_ticket(
+            &src,
+            "flight",
+            "pdf",
+            2026,
+            &meta,
+            Some(date_at(1787736600)),
+        )
+        .unwrap();
         std::fs::write(&src, b"reissued").unwrap();
         let outcome = sink
-            .file_ticket(&src, "flight", "pdf", 2026, &meta, Some(1787823000))
+            .file_ticket(
+                &src,
+                "flight",
+                "pdf",
+                2026,
+                &meta,
+                Some(date_at(1787823000)),
+            )
             .unwrap();
         assert!(matches!(outcome, FileOutcome::Updated(_)));
 
@@ -435,7 +485,7 @@ mod tests {
             "pdf",
             2026,
             &meta,
-            Some(1787823000),
+            Some(date_at(1787823000)),
         )
         .unwrap();
 

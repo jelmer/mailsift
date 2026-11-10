@@ -250,8 +250,10 @@ When two messages collapse onto one record, the one sent last wins,
 whatever order they are processed in: a rescan of older mail doesn't
 roll a record back. mailsift takes the date from the message's `Date:`
 header, falling back to its newest `Received:` header, and stamps it on
-the JSON records it files as `receivedAt`. Set `receivedAt` yourself
-only if the message date is the wrong one to order by.
+the JSON records it files as `receivedAt`, keeping the header's UTC
+offset (e.g. `2026-11-06T00:30:00+01:00`). Records are ordered by the
+instant, so offsets don't affect which one wins. Set `receivedAt`
+yourself only if the message date is the wrong one to order by.
 
 Calendar events are ordered by their `DTSTAMP`. Leave it out of an
 `.event.ics` you build yourself and mailsift fills in the message date;
