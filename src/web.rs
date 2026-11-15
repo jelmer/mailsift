@@ -2227,7 +2227,8 @@ fn parse_iso_duration_days(iso: &str) -> Option<u32> {
     if rest.is_empty() {
         return None;
     }
-    let (num_str, unit) = rest.split_at(rest.len() - 1);
+    // None when the last char is multi-byte, which is no valid unit.
+    let (num_str, unit) = rest.split_at_checked(rest.len() - 1)?;
     let n: u32 = num_str.parse().ok()?;
     match unit {
         "D" => Some(n),
@@ -4627,6 +4628,12 @@ mod tests {
         assert_eq!(parse_iso_duration_days("P1Y"), Some(365));
         assert_eq!(parse_iso_duration_days("P7D"), Some(7));
         assert_eq!(parse_iso_duration_days("PT1H"), None); // time part unsupported
+    }
+
+    #[test]
+    fn parse_iso_duration_rejects_non_ascii_unit() {
+        assert_eq!(parse_iso_duration_days("P1é"), None);
+        assert_eq!(parse_iso_duration_days("Pé"), None);
     }
 
     #[tokio::test]
