@@ -28,7 +28,7 @@ use super::json_target::{
     derive_year, first_non_empty, format_received_at, read_and_parse, received_at_in,
     received_at_of, write_unless_newer, year_from_iso_prefix,
 };
-use super::sink::{slugify, write_atomic};
+use super::sink::{lock_dir, slugify, update_file, write_atomic};
 
 /// Identifying fields we pull out of a `.reservation.json` artifact.
 ///
@@ -517,12 +517,12 @@ pub fn reindex(dir: &Path, dry_run: bool) -> Result<Vec<Reindexed>> {
         let merged = target.exists() || !claimed.insert(target.clone());
         if !dry_run {
             let incoming = received_at_in(&body)?;
-            if !merged || !super::json_target::filed_from_newer(&target, incoming)? {
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                write_atomic(&target, &body)?;
-            }
+            let label = target.display().to_string();
+            update_file(
+                &target,
+                "reservation",
+                &super::json_target::replace_unless_newer(&label, &body, incoming),
+            )?;
             fs::remove_file(&path).map_err(|e| anyhow!("removing {}: {e}", path.display()))?;
         }
         let (from, to) = (path, target);
@@ -581,6 +581,12 @@ pub fn cancel_superseded_legs(
 
     let mut cancelled = Vec::new();
     for path in archived_records(dir)? {
+        // Held until the cancellation is written, so a leg filed in the
+        // meantime isn't overwritten with the stale copy read here.
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("{} has no parent dir", path.display()))?;
+        let _lock = lock_dir(parent)?;
         let body = fs::read(&path).map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
         let mut record: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
@@ -1021,6 +1027,69 @@ mod tests {
         let kept: serde_json::Value = serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
         assert_eq!(kept["receivedAt"], "2046-02-01T00:00:00Z");
         assert_eq!(reindex(&dir, false).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn cancelling_waits_for_a_concurrent_filing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out");
+        let booked = [
+            flight("100", "2046-03-01T08:00:00Z", true),
+            flight("200", "2046-03-08T18:00:00Z", true),
+        ];
+        file_mail(tmp.path(), &dir, &booked, 1_000);
+        let changed = [
+            flight("100", "2046-03-01T08:00:00Z", true),
+            flight("300", "2046-03-08T20:00:00Z", true),
+        ];
+        let src = tmp.path().join("changed.reservation.json");
+        fs::write(&src, serde_json::to_vec(&changed).unwrap()).unwrap();
+        file_reservation(&src, &dir, Some(date_at(2_000))).unwrap();
+
+        // Hold the lock as a filing of a newer mail about the dropped
+        // leg would, and land that filing while the pass is running.
+        let lock = lock_dir(&dir.join("2046")).unwrap();
+        let pass = {
+            let (src, dir) = (src.clone(), dir.clone());
+            std::thread::spawn(move || cancel_superseded_legs(&src, &dir, Some(date_at(2_000))))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut refiled = flight("200", "2046-03-08T18:00:00Z", false);
+        refiled["receivedAt"] = format_received_at(date_at(3_000)).into();
+        let leg = dir.join("2046/british-airways-aaa111-ba200.json");
+        fs::write(&leg, serde_json::to_vec(&refiled).unwrap()).unwrap();
+        drop(lock);
+
+        assert_eq!(pass.join().unwrap().unwrap(), vec![]);
+        let on_file: serde_json::Value = serde_json::from_slice(&fs::read(&leg).unwrap()).unwrap();
+        assert_eq!(on_file, refiled);
+    }
+
+    #[test]
+    fn reindex_waits_for_the_directory_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out");
+        fs::create_dir_all(dir.join("2046")).unwrap();
+        let mut old = flight("100", "2046-03-01T08:00:00Z", false);
+        old["receivedAt"] = "2046-01-01T00:00:00Z".into();
+        fs::write(
+            dir.join("2046/british-airways-aaa111.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let target = dir.join("2046/british-airways-aaa111-ba100.json");
+
+        let lock = lock_dir(&dir.join("2046")).unwrap();
+        let pass = {
+            let dir = dir.clone();
+            std::thread::spawn(move || reindex(&dir, false))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!target.exists());
+        drop(lock);
+
+        pass.join().unwrap().unwrap();
+        assert_eq!(archived_records(&dir).unwrap(), vec![target]);
     }
 
     /// The realistic return trip: same airline, same booking
