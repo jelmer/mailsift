@@ -27,7 +27,9 @@
 //! through the normal pipeline against the outer envelope.
 
 use mailparse::{ParsedMail, parse_mail};
+use regex::Regex;
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 use tracing::debug;
 
 /// Result of a successful unwrap.
@@ -209,12 +211,23 @@ const ATTRIBUTION_MARKERS: &[&str] = &[
     "mensaje original",
 ];
 
+/// Case-insensitive matcher for [`ATTRIBUTION_MARKERS`]. Matching on the
+/// original text keeps offsets valid; a lowercased copy can differ in
+/// byte length (e.g. U+0130).
+fn attribution_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        let alternation = ATTRIBUTION_MARKERS
+            .iter()
+            .map(|m| regex::escape(m))
+            .collect::<Vec<_>>()
+            .join("|");
+        Regex::new(&format!("(?i){alternation}")).expect("attribution markers form a valid regex")
+    })
+}
+
 fn detect_attribution(plain: &str) -> Option<Attribution> {
-    let lower = plain.to_lowercase();
-    let idx = ATTRIBUTION_MARKERS
-        .iter()
-        .filter_map(|m| lower.find(m))
-        .min()?;
+    let idx = attribution_regex().find(plain)?.start();
     // Advance to the end of the attribution line so `header_start`
     // points at the first pseudo-header line.
     let after = plain[idx..].find('\n').map(|n| idx + n + 1)?;
@@ -335,7 +348,9 @@ fn extract_inner_html(html: &str) -> Option<String> {
     }
     for tag in &["div", "blockquote"] {
         let marker = format!("<{tag} class=\"gmail_quote");
-        let lower = html.to_lowercase();
+        // ASCII-only folding keeps byte offsets aligned with `html`;
+        // the markers searched for are all ASCII.
+        let lower = html.to_ascii_lowercase();
         let Some(start) = lower.find(&marker) else {
             continue;
         };
@@ -736,6 +751,34 @@ body
         let unwrapped = try_unwrap_forwarded(&raw, &trusted).expect("should unwrap");
         let text = String::from_utf8(unwrapped.inner).unwrap();
         assert!(!text.contains("X-Injected"));
+    }
+
+    // 'İ' (U+0130) is two bytes but lowercases to three, so offsets
+    // taken from a lowercased copy drift when it precedes the marker.
+    #[test]
+    fn attribution_offset_survives_case_folding_that_changes_length() {
+        let prefix = "\u{0130}".repeat(60);
+        let plain = format!("{prefix}\n{GMAIL_PLAIN}");
+        let attribution = detect_attribution(&plain).expect("attribution");
+        let headers_at = plain.find("From: Vendor").unwrap();
+        assert_eq!(attribution.header_start, headers_at);
+    }
+
+    #[test]
+    fn attribution_marker_matches_non_ascii_uppercase() {
+        let plain = "URSPR\u{00dc}NGLICHE NACHRICHT\nVon: Vendor <vendor@example.com>\n\nbody\n";
+        let attribution = detect_attribution(plain).expect("attribution");
+        assert_eq!(
+            &plain[attribution.header_start..],
+            "Von: Vendor <vendor@example.com>\n\nbody\n"
+        );
+    }
+
+    #[test]
+    fn extract_inner_html_survives_case_folding_that_changes_length() {
+        let quote = "<DIV class=\"gmail_quote\"><div>inner \u{0130}</div></DIV>";
+        let html = format!("<p>{}</p>{quote}<p>after</p>", "\u{0130}".repeat(10));
+        assert_eq!(extract_inner_html(&html).as_deref(), Some(quote));
     }
 
     #[test]
