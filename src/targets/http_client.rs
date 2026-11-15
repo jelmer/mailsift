@@ -40,12 +40,13 @@ pub fn build_client_with_timeout(context_label: &str, timeout: Duration) -> Resu
 
 /// Truncate a string for inclusion in an error message. Adds a `...`
 /// suffix when truncation happens so the reader can tell the message
-/// isn't complete.
+/// isn't complete. Cuts at the last char boundary at or before `max`
+/// bytes, since error bodies are arbitrary server-supplied text.
 pub fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        format!("{}...", &s[..s.floor_char_boundary(max)])
     }
 }
 
@@ -111,6 +112,12 @@ mod tests {
     #[test]
     fn truncate_appends_ellipsis_when_clipping() {
         assert_eq!(truncate("abcdefghij", 5), "abcde...");
+    }
+
+    #[test]
+    fn truncate_backs_off_to_char_boundary() {
+        // Byte 2 falls inside the two-byte 'é'.
+        assert_eq!(truncate("aébc", 2), "a...");
     }
 
     #[test]
