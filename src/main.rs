@@ -378,6 +378,9 @@ struct ScanSetup {
     sink: EventSinkKind,
     seen: Option<mailsift::seen::Store>,
     extractors: Vec<mailsift::extractor::Extractor>,
+    /// Directories the extractors were discovered from. Passed through
+    /// to `imap-scan --watch` so it can watch them for manifest edits.
+    extractors_dir: Vec<PathBuf>,
     dirs: ResolvedArtifactTargets,
     trackers: mailsift::targets::trackers::Trackers,
     firefly: Option<mailsift::targets::firefly::FireflySink>,
@@ -412,6 +415,7 @@ impl ScanArgs {
             sink,
             seen,
             extractors,
+            extractors_dir,
             dirs,
             trackers,
             firefly,
@@ -1778,6 +1782,16 @@ fn run() -> Result<()> {
             } else {
                 None
             };
+            // With `--only`, the user has locked the extractor set;
+            // don't let the fs watcher broaden it on the fly.
+            // Otherwise pass through the discovery dirs so extractor
+            // edits picked up by the watcher retrigger against the
+            // scan window.
+            let watched_dirs: &[PathBuf] = if watch && only.is_empty() {
+                &setup.extractors_dir
+            } else {
+                &[]
+            };
             imap_scan::run(imap_scan::ImapScanConfig {
                 host: &target_imap.host,
                 port: target_imap.port,
@@ -1787,6 +1801,7 @@ fn run() -> Result<()> {
                 before: before.as_deref(),
                 limit,
                 extractors: &setup.extractors,
+                extractor_dirs: watched_dirs,
                 targets: setup.targets(&config),
                 dry_run,
                 watch,
