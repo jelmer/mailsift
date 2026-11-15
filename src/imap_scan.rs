@@ -256,18 +256,16 @@ pub fn run(config: ImapScanConfig<'_>) -> Result<()> {
     };
     let initial_uids = &uids[..take];
 
-    // Cursor for --watch: highest UID we've already considered.
-    // Initialised from the EXAMINE response so messages that appeared
-    // between SEARCH and the first IDLE aren't skipped; we re-search
-    // from `cursor+1` on every wakeup, and uid_validity ensures the
-    // cursor is meaningful (if it changes we bail rather than chase a
-    // renumbered mailbox).
-    let mut cursor = initial_uids
-        .iter()
-        .copied()
-        .max()
-        .max(resume_after)
-        .unwrap_or(0);
+    // Cursor for --watch: highest UID we've already considered. We
+    // re-search from `cursor+1` on every wakeup, and uid_validity
+    // ensures the cursor is meaningful (if it changes we bail rather
+    // than chase a renumbered mailbox).
+    if config.watch && mbox.uid_next.is_none() {
+        warn!(
+            "server reports no UIDNEXT; messages excluded from the initial scan, or that arrived between EXAMINE and SEARCH, may be processed once watching starts"
+        );
+    }
+    let mut cursor = initial_watch_cursor(initial_uids, resume_after, mbox.uid_next);
     let checkpoint = |last_uid: u32| {
         save_cursor(
             config.cursor_file,
@@ -1009,6 +1007,24 @@ fn watch_loop(
     }
 }
 
+/// Where the watch loop starts: past everything the initial scan
+/// handled and everything that already existed at EXAMINE time, so
+/// messages excluded by `--since`, `--before` or `--limit` aren't
+/// picked up on the first tick.
+fn initial_watch_cursor(
+    processed: &[u32],
+    resume_after: Option<u32>,
+    uid_next: Option<u32>,
+) -> u32 {
+    processed
+        .iter()
+        .copied()
+        .max()
+        .max(resume_after)
+        .max(uid_next.map(|next| next.saturating_sub(1)))
+        .unwrap_or(0)
+}
+
 /// Return UIDs strictly greater than `cursor`. Uses IMAP's `UID N:*`
 /// search syntax; `*` matches the highest assigned UID, so a quiet
 /// mailbox returns an empty set.
@@ -1490,6 +1506,42 @@ mod tests {
             "SINCE 1-Jan-2020"
         );
         assert_eq!(initial_search_query(None, None, None), "ALL");
+    }
+
+    #[test]
+    fn initial_watch_cursor_skips_existing_unmatched() {
+        // --since matched nothing: don't fall back to `UID 1:*`.
+        assert_eq!(initial_watch_cursor(&[], None, Some(500)), 499);
+    }
+
+    #[test]
+    fn initial_watch_cursor_skips_beyond_limit() {
+        // --limit 2 took the oldest two; the rest were deliberately
+        // left out and must not be processed on the first watch tick.
+        assert_eq!(initial_watch_cursor(&[10, 20], None, Some(500)), 499);
+    }
+
+    #[test]
+    fn initial_watch_cursor_keeps_uids_past_uid_next() {
+        // A message that arrived between EXAMINE and SEARCH was
+        // processed by the initial scan.
+        assert_eq!(initial_watch_cursor(&[10, 501], None, Some(500)), 501);
+    }
+
+    #[test]
+    fn initial_watch_cursor_resume_after() {
+        assert_eq!(initial_watch_cursor(&[], Some(42), Some(43)), 42);
+    }
+
+    #[test]
+    fn initial_watch_cursor_empty_mailbox() {
+        assert_eq!(initial_watch_cursor(&[], None, Some(1)), 0);
+    }
+
+    #[test]
+    fn initial_watch_cursor_without_uid_next() {
+        assert_eq!(initial_watch_cursor(&[10, 20], Some(5), None), 20);
+        assert_eq!(initial_watch_cursor(&[], None, None), 0);
     }
 
     #[test]
