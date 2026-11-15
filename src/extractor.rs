@@ -864,12 +864,10 @@ pub fn run_one(extractor: &Extractor, raw: &[u8], timeout: Duration) -> Result<E
     // With the group gone stderr reaches EOF promptly. If it doesn't,
     // a helper escaped the group; carry on without its output rather
     // than hang. A helper that panics just costs us that stream.
-    let stderr_buf = stderr_rx
-        .recv_timeout(STDERR_GRACE)
-        .unwrap_or_else(|e| {
-            warn!(extractor = %extractor.name, "stderr still open after exit: {e}");
-            Vec::new()
-        });
+    let stderr_buf = stderr_rx.recv_timeout(STDERR_GRACE).unwrap_or_else(|e| {
+        warn!(extractor = %extractor.name, "stderr still open after exit: {e}");
+        Vec::new()
+    });
 
     let stderr = String::from_utf8_lossy(&stderr_buf);
     let trimmed_stderr = stderr.trim();
