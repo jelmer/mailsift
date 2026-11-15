@@ -82,10 +82,13 @@ pub struct Config {
     #[serde(default)]
     pub firefly: Option<FireflyConfig>,
     /// Email addresses that are allowed to forward vendor mail to us.
-    /// When the outer `From:` matches one of these and the mail
-    /// carries a `message/rfc822` attachment, the pipeline acts on the
-    /// inner message instead of the wrapper. DKIM is rechecked against
-    /// the inner mail's own `Authentication-Results` header.
+    /// When the outer `From:` matches one of these, the outer message
+    /// passes DKIM for that address's domain, and the mail carries a
+    /// forward (`message/rfc822` attachment or inline), the pipeline
+    /// acts on the inner message instead of the wrapper. Extractors'
+    /// `require_dkim` is not checked against the inner message: the
+    /// authenticated forwarder vouches for it. The milter, which runs
+    /// before the MTA has verified DKIM, checks the `From:` alone.
     #[serde(default)]
     pub trusted_forwarders: Vec<String>,
 }

@@ -17,35 +17,51 @@
 //!    synthesized message also carries a stable synthetic
 //!    `Message-ID` derived from the pseudo-headers, so downstream
 //!    dedup / bookkeeping keyed on Message-ID has something
-//!    deterministic to grip. DKIM cannot be verified on
-//!    inline-forwarded mail; no signature survives. The trust here
-//!    comes entirely from the outer sender being on
-//!    `trusted_forwarders`, which is why the caller is told to bypass
-//!    `require_dkim` when we return `from_trusted_forwarder`.
+//!    deterministic to grip.
 //!
-//! Random forwarded mail from senders not on the list keeps flowing
-//! through the normal pipeline against the outer envelope.
+//! In neither form can the vendor's DKIM signature be checked: an
+//! attachment's `Authentication-Results` were written by the
+//! forwarder's MTA, not ours, and inline forwards carry no signature
+//! at all. The trust comes from the forwarder instead, which is why
+//! the caller is told to bypass `require_dkim` on the inner message.
+//! That makes the outer `From:` load-bearing, so under
+//! [`DkimPolicy::Enforce`] it must be backed by a passing DKIM
+//! signature aligned with the forwarder's domain.
+//!
+//! Random forwarded mail from senders not on the list, or whose
+//! signature doesn't check out, keeps flowing through the normal
+//! pipeline against the outer envelope.
 
 use mailparse::{ParsedMail, parse_mail};
 use sha2::{Digest, Sha256};
-use tracing::debug;
+use tracing::{debug, warn};
+
+use crate::dkim;
+use crate::pipeline::DkimPolicy;
 
 /// Result of a successful unwrap.
 pub struct Unwrapped {
     /// Synthesized or extracted RFC822 bytes of the inner message.
     pub inner: Vec<u8>,
-    /// True when the unwrap was authorized purely by the outer sender
-    /// being on `trusted_forwarders`. Callers should treat this as
+    /// True when the unwrap was authorized by the outer sender being
+    /// on `trusted_forwarders` (and, under [`DkimPolicy::Enforce`],
+    /// DKIM-authenticated as such). Callers should treat this as
     /// permission to bypass extractors' `require_dkim` checks: the
     /// forwarder is standing in for the vendor's signature.
     pub from_trusted_forwarder: bool,
 }
 
 /// Try to detect a forwarded mail and return the inner RFC822 bytes if
-/// the outer sender is on the allow-list. Returns `None` when the mail
-/// isn't a forward or when no inner part is recognised; the caller
-/// then processes the original.
-pub fn try_unwrap_forwarded(raw: &[u8], trusted_senders: &[String]) -> Option<Unwrapped> {
+/// the outer sender is on the allow-list. Under [`DkimPolicy::Enforce`]
+/// the outer message must also pass DKIM for the sender's domain,
+/// according to the topmost `Authentication-Results`. Returns `None`
+/// when the mail isn't a trusted forward or when no inner part is
+/// recognised; the caller then processes the original.
+pub fn try_unwrap_forwarded(
+    raw: &[u8],
+    trusted_senders: &[String],
+    dkim_policy: DkimPolicy,
+) -> Option<Unwrapped> {
     if trusted_senders.is_empty() {
         return None;
     }
@@ -63,31 +79,31 @@ pub fn try_unwrap_forwarded(raw: &[u8], trusted_senders: &[String]) -> Option<Un
         return None;
     }
 
-    if let Some(bytes) = unwrap_attachment_form(&parsed) {
-        debug!(
+    let (form, inner) = if let Some(bytes) = unwrap_attachment_form(&parsed) {
+        ("attachment", bytes)
+    } else {
+        ("inline", unwrap_inline_form(&parsed)?)
+    };
+    if matches!(dkim_policy, DkimPolicy::Enforce { .. })
+        && !signed_by_sender(&parsed.headers, &outer_from)
+    {
+        warn!(
             outer_from = %outer_from,
-            bytes = bytes.len(),
-            "unwrapped attachment forward; re-running pipeline on inner message"
+            form,
+            "forward not unwrapped: outer message lacks a passing DKIM signature for the forwarder's domain"
         );
-        return Some(Unwrapped {
-            inner: bytes,
-            from_trusted_forwarder: true,
-        });
+        return None;
     }
-
-    if let Some(bytes) = unwrap_inline_form(&parsed) {
-        debug!(
-            outer_from = %outer_from,
-            bytes = bytes.len(),
-            "unwrapped inline forward; re-running pipeline on inner message"
-        );
-        return Some(Unwrapped {
-            inner: bytes,
-            from_trusted_forwarder: true,
-        });
-    }
-
-    None
+    debug!(
+        outer_from = %outer_from,
+        form,
+        bytes = inner.len(),
+        "unwrapped forward; re-running pipeline on inner message"
+    );
+    Some(Unwrapped {
+        inner,
+        from_trusted_forwarder: true,
+    })
 }
 
 /// Whether the `From:` of a raw header block is on `trusted`.
@@ -116,6 +132,19 @@ fn is_trusted(from_header: &str, trusted: &[String]) -> bool {
     trusted
         .iter()
         .any(|t| extract_email_address(t).eq_ignore_ascii_case(&addr))
+}
+
+/// Whether the topmost `Authentication-Results` reports a passing DKIM
+/// signature aligned with the domain of `from_header`.
+fn signed_by_sender(headers: &[mailparse::MailHeader<'_>], from_header: &str) -> bool {
+    let addr = extract_email_address(from_header);
+    let Some((_, domain)) = addr.rsplit_once('@') else {
+        return false;
+    };
+    dkim::signed_for(
+        &dkim::passing_dkim_domains(headers),
+        &domain.to_ascii_lowercase(),
+    )
 }
 
 /// Pull the email address out of a header value like
@@ -475,23 +504,43 @@ mod tests {
     fn unwraps_attachment_form_when_outer_sender_is_trusted() {
         let raw = make_attachment_forward("Joe <joe@example.com>", INNER_MAIL);
         let trusted = vec!["joe@example.com".to_string()];
-        let unwrapped = try_unwrap_forwarded(&raw, &trusted).expect("should unwrap");
+        let unwrapped =
+            try_unwrap_forwarded(&raw, &trusted, DkimPolicy::Skip).expect("should unwrap");
         assert!(unwrapped.inner.starts_with(b"From: vendor@example.com"));
         assert!(unwrapped.from_trusted_forwarder);
+    }
+
+    const ENFORCE: DkimPolicy = DkimPolicy::Enforce { received_at: None };
+
+    #[test]
+    fn enforce_declines_forward_without_forwarder_dkim() {
+        let raw = make_attachment_forward("Joe <joe@example.com>", INNER_MAIL);
+        let trusted = vec!["joe@example.com".to_string()];
+        assert!(try_unwrap_forwarded(&raw, &trusted, ENFORCE).is_none());
+    }
+
+    #[test]
+    fn enforce_unwraps_forward_signed_by_forwarder_domain() {
+        let mut raw =
+            b"Authentication-Results: mx.example.org; dkim=pass header.d=example.com\r\n".to_vec();
+        raw.extend(make_attachment_forward("Joe <joe@example.com>", INNER_MAIL));
+        let trusted = vec!["joe@example.com".to_string()];
+        let unwrapped = try_unwrap_forwarded(&raw, &trusted, ENFORCE).expect("should unwrap");
+        assert!(unwrapped.inner.starts_with(b"From: vendor@example.com"));
     }
 
     #[test]
     fn declines_when_outer_sender_is_not_trusted() {
         let raw = make_attachment_forward("attacker@spam.example", INNER_MAIL);
         let trusted = vec!["joe@example.com".to_string()];
-        assert!(try_unwrap_forwarded(&raw, &trusted).is_none());
+        assert!(try_unwrap_forwarded(&raw, &trusted, DkimPolicy::Skip).is_none());
     }
 
     #[test]
     fn declines_when_no_forward_recognised() {
         let raw = b"From: joe@example.com\r\nSubject: Hi\r\n\r\nplain mail, no forward\r\n";
         let trusted = vec!["joe@example.com".to_string()];
-        assert!(try_unwrap_forwarded(raw, &trusted).is_none());
+        assert!(try_unwrap_forwarded(raw, &trusted, DkimPolicy::Skip).is_none());
     }
 
     #[test]
@@ -514,7 +563,7 @@ mod tests {
     #[test]
     fn declines_when_trusted_list_is_empty() {
         let raw = make_attachment_forward("Joe <joe@example.com>", INNER_MAIL);
-        assert!(try_unwrap_forwarded(&raw, &[]).is_none());
+        assert!(try_unwrap_forwarded(&raw, &[], DkimPolicy::Skip).is_none());
     }
 
     #[test]
@@ -568,7 +617,8 @@ line two of the body
     fn unwraps_gmail_inline_forward() {
         let raw = make_inline_forward("Joe <joe@example.com>", GMAIL_PLAIN, None);
         let trusted = vec!["joe@example.com".to_string()];
-        let unwrapped = try_unwrap_forwarded(&raw, &trusted).expect("should unwrap");
+        let unwrapped =
+            try_unwrap_forwarded(&raw, &trusted, DkimPolicy::Skip).expect("should unwrap");
         assert!(unwrapped.from_trusted_forwarder);
         let text = String::from_utf8(unwrapped.inner).unwrap();
         assert!(text.contains("From: Vendor <vendor@example.com>"));
@@ -591,7 +641,8 @@ body
 ";
         let raw = make_inline_forward("Joe <joe@example.com>", plain, None);
         let trusted = vec!["joe@example.com".to_string()];
-        let unwrapped = try_unwrap_forwarded(&raw, &trusted).expect("should unwrap");
+        let unwrapped =
+            try_unwrap_forwarded(&raw, &trusted, DkimPolicy::Skip).expect("should unwrap");
         let text = String::from_utf8(unwrapped.inner).unwrap();
         assert!(text.contains("From: Vendor <vendor@example.com>"));
         assert!(text.contains("Subject: Your order"));
@@ -612,7 +663,8 @@ de bestelling is bevestigd
 ";
         let raw = make_inline_forward("Joe <joe@example.com>", plain, None);
         let trusted = vec!["joe@example.com".to_string()];
-        let unwrapped = try_unwrap_forwarded(&raw, &trusted).expect("should unwrap");
+        let unwrapped =
+            try_unwrap_forwarded(&raw, &trusted, DkimPolicy::Skip).expect("should unwrap");
         let text = String::from_utf8(unwrapped.inner).unwrap();
         assert!(text.contains("From: Vendor <vendor@example.com>"));
         assert!(text.contains("Subject: Je bestelling"));
@@ -631,7 +683,8 @@ body
 ";
         let raw = make_inline_forward("Joe <joe@example.com>", plain, None);
         let trusted = vec!["joe@example.com".to_string()];
-        let unwrapped = try_unwrap_forwarded(&raw, &trusted).expect("should unwrap");
+        let unwrapped =
+            try_unwrap_forwarded(&raw, &trusted, DkimPolicy::Skip).expect("should unwrap");
         let text = String::from_utf8(unwrapped.inner).unwrap();
         assert!(text.contains("From: Vendor <vendor@example.com>"));
         assert!(text.contains("Subject: Deine Bestellung"));
@@ -648,7 +701,8 @@ body
 ";
         let raw = make_inline_forward("Joe <joe@example.com>", GMAIL_PLAIN, Some(html));
         let trusted = vec!["joe@example.com".to_string()];
-        let unwrapped = try_unwrap_forwarded(&raw, &trusted).expect("should unwrap");
+        let unwrapped =
+            try_unwrap_forwarded(&raw, &trusted, DkimPolicy::Skip).expect("should unwrap");
         let text = String::from_utf8(unwrapped.inner).unwrap();
         assert!(text.contains("Content-Type: multipart/alternative"));
         assert!(text.contains("inner html body"));
@@ -664,13 +718,14 @@ body
 ";
         let raw = make_inline_forward("Joe <joe@example.com>", plain, None);
         let trusted = vec!["joe@example.com".to_string()];
-        assert!(try_unwrap_forwarded(&raw, &trusted).is_none());
+        assert!(try_unwrap_forwarded(&raw, &trusted, DkimPolicy::Skip).is_none());
     }
 
     fn synth_from_inline(plain: &str) -> String {
         let raw = make_inline_forward("Joe <joe@example.com>", plain, None);
         let trusted = vec!["joe@example.com".to_string()];
-        let unwrapped = try_unwrap_forwarded(&raw, &trusted).expect("should unwrap");
+        let unwrapped =
+            try_unwrap_forwarded(&raw, &trusted, DkimPolicy::Skip).expect("should unwrap");
         String::from_utf8(unwrapped.inner).unwrap()
     }
 
@@ -733,7 +788,8 @@ body
 ";
         let raw = make_inline_forward("Joe <joe@example.com>", plain, None);
         let trusted = vec!["joe@example.com".to_string()];
-        let unwrapped = try_unwrap_forwarded(&raw, &trusted).expect("should unwrap");
+        let unwrapped =
+            try_unwrap_forwarded(&raw, &trusted, DkimPolicy::Skip).expect("should unwrap");
         let text = String::from_utf8(unwrapped.inner).unwrap();
         assert!(!text.contains("X-Injected"));
     }

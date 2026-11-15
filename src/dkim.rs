@@ -133,6 +133,12 @@ fn aligned(a: &str, b: &str) -> bool {
     a == b || is_subdomain(a, b) || is_subdomain(b, a)
 }
 
+/// Whether one of `passing` is `domain`, a subdomain of it, or a parent
+/// of it (DMARC relaxed alignment). `domain` is expected lowercased.
+pub fn signed_for(passing: &HashSet<String>, domain: &str) -> bool {
+    passing.iter().any(|p| aligned(p, domain))
+}
+
 /// Check whether at least one of `wanted` is in `passing`.
 ///
 /// A `wanted` entry starting with `.` is a suffix match: e.g.
@@ -159,10 +165,7 @@ fn aligned(a: &str, b: &str) -> bool {
 pub fn satisfies(wanted: &[String], passing: &HashSet<String>, from_domain: Option<&str>) -> bool {
     wanted.iter().any(|w| {
         if w == FROM_DOMAIN {
-            let Some(from) = from_domain else {
-                return false;
-            };
-            return passing.iter().any(|p| aligned(p, from));
+            return from_domain.is_some_and(|from| signed_for(passing, from));
         }
         if let Some(suffix) = w.strip_prefix('.') {
             passing.iter().any(|p| is_subdomain(p, suffix))

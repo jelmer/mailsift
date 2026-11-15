@@ -72,11 +72,13 @@ reservations_dir = "/home/jelmer/Documents/reservations"
 # # smtp_password_file = "/etc/mailsift/smtp.pass"
 
 # Email addresses we trust to forward vendor mail to us. When the outer
-# `From:` matches one of these AND the mail carries a `message/rfc822`
-# attachment, the pipeline acts on the inner message instead of the
-# forwarder's wrapper. DKIM is rechecked against the inner mail's own
-# `Authentication-Results` header. Empty by default; forwarded mail
-# otherwise flows through the normal pipeline against the outer envelope.
+# `From:` matches one of these, the outer message passes DKIM for that
+# address's domain, AND the mail is a forward (`message/rfc822`
+# attachment or inline), the pipeline acts on the inner message instead
+# of the forwarder's wrapper, without checking extractors' require_dkim
+# against it. The milter checks the `From:` alone. Empty by default;
+# forwarded mail otherwise flows through the normal pipeline against the
+# outer envelope.
 # trusted_forwarders = ["joe@example.com"]
 
 # CalDAV server for `event` artifacts. Mutually exclusive with

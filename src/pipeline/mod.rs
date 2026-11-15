@@ -61,10 +61,11 @@ pub struct PipelineTargets<'a> {
     /// to register the tracking number with its upstream service.
     pub trackers: Option<&'a crate::targets::trackers::Trackers>,
     /// Email addresses we trust to forward vendor mail to us. When the
-    /// outer `From:` matches one of these and the mail carries a
-    /// `message/rfc822` attachment, the pipeline acts on the inner
-    /// message instead; DKIM is rechecked against the inner mail's
-    /// own `Authentication-Results` header.
+    /// outer `From:` matches one of these, the mail is a forward
+    /// (`message/rfc822` attachment or inline), and, under
+    /// [`DkimPolicy::Enforce`], the outer message passes DKIM for the
+    /// forwarder's domain, the pipeline acts on the inner message
+    /// instead and skips extractors' `require_dkim` for it.
     pub trusted_forwarders: &'a [String],
     /// Per-run event recorder. Each extractor decision (matched /
     /// produced / skipped / failed) is appended to the recorder for
@@ -229,15 +230,14 @@ pub fn run(
         return Ok(());
     }
 
-    // If the message is a forward from a trusted sender, swap `raw`
-    // for the inner RFC822 bytes so DKIM checks, prefilter matching,
-    // and extractor stdin all see the original vendor mail. The
-    // `_unwrapped` binding keeps the inner bytes alive for the rest of
-    // `run`. When the unwrap was authorized purely by the outer
-    // sender's trust (attachment form has DKIM stripped, inline forwards
-    // have no signature at all), also bypass `require_dkim` below: the
-    // trust list is standing in for the vendor's signature.
-    let _unwrapped = crate::unforward::try_unwrap_forwarded(raw, trusted_forwarders);
+    // If the message is a forward from a trusted sender (DKIM-verified
+    // as such under `Enforce`), swap `raw` for the inner RFC822 bytes so
+    // prefilter matching and extractor stdin see the original vendor
+    // mail. The `_unwrapped` binding keeps the inner bytes alive for the
+    // rest of `run`. The vendor's own signature can't be checked on the
+    // inner mail, so also bypass `require_dkim` below: the authenticated
+    // forwarder is standing in for it.
+    let _unwrapped = crate::unforward::try_unwrap_forwarded(raw, trusted_forwarders, dkim_policy);
     let (raw, dkim_via_forwarder): (&[u8], bool) = match &_unwrapped {
         Some(u) => (u.inner.as_slice(), u.from_trusted_forwarder),
         None => (raw, false),
