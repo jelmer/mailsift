@@ -1475,11 +1475,13 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
         // A dead refresh token (Google's 7-day cutoff for testing-mode
-        // apps, or a manual revocation) can't be fixed by retrying, only
-        // by re-consent. Print one clear actionable line and exit with a
-        // dedicated code so systemd's Restart=on-failure can be filtered
-        // against it if desired (e.g. RestartPreventExitStatus=75).
-        Err(err) if err.is::<mailsift::oauth2::PermanentRefreshError>() => {
+        // apps, or a manual revocation) or rejected credentials can't be
+        // fixed by retrying, only by re-consent or a new password, whether
+        // on the first connect or a reconnect under --watch. Print one
+        // clear actionable line and exit with a dedicated code so
+        // systemd's Restart=on-failure can be filtered against it if
+        // desired (e.g. RestartPreventExitStatus=75).
+        Err(err) if imap_scan::is_permanent_auth_failure(&err) => {
             eprintln!("error: {err}");
             std::process::exit(75);
         }

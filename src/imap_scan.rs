@@ -55,6 +55,41 @@ impl std::fmt::Display for MailboxNotFound {
 
 impl std::error::Error for MailboxNotFound {}
 
+/// The server answered LOGIN or AUTHENTICATE with NO or BAD. Retrying
+/// with the same credentials won't help.
+#[derive(Debug)]
+pub struct AuthRejected {
+    pub mechanism: &'static str,
+    pub response: String,
+}
+
+impl std::fmt::Display for AuthRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IMAP {} rejected: {}", self.mechanism, self.response)
+    }
+}
+
+impl std::error::Error for AuthRejected {}
+
+/// Is this an authentication failure that only a human can fix (new
+/// password, re-consent for a refresh token), as opposed to a transport
+/// problem worth retrying?
+pub fn is_permanent_auth_failure(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| e.is::<AuthRejected>() || e.is::<crate::oauth2::PermanentRefreshError>())
+}
+
+fn auth_error(mechanism: &'static str, e: imap::Error) -> anyhow::Error {
+    match e {
+        imap::Error::No(_) | imap::Error::Bad(_) => AuthRejected {
+            mechanism,
+            response: e.to_string(),
+        }
+        .into(),
+        e => anyhow::Error::new(e).context(format!("IMAP {mechanism}")),
+    }
+}
+
 /// How to authenticate to the IMAP server.
 #[derive(Clone, Copy)]
 pub enum AuthMethod<'a> {
@@ -399,7 +434,7 @@ fn process_uids_with_resume(
                         checkpoint(uid);
                     }
                 }
-                *session_slot = match reconnect(config, &mut reconnect_backoff, interrupted) {
+                *session_slot = match reconnect(config, &mut reconnect_backoff, interrupted)? {
                     Some(s) => s,
                     None => return Ok(total),
                 };
@@ -427,7 +462,7 @@ fn process_uids_with_resume(
                     return Ok(total);
                 }
                 fetch_backoff = grow_backoff(fetch_backoff, FETCH_BACKOFF_MAX);
-                *session_slot = match reconnect(config, &mut reconnect_backoff, interrupted) {
+                *session_slot = match reconnect(config, &mut reconnect_backoff, interrupted)? {
                     Some(s) => s,
                     None => return Ok(total),
                 };
@@ -587,10 +622,11 @@ fn connect_and_authenticate(config: &ImapScanConfig<'_>) -> Result<Session<imap:
     let session = match &config.auth {
         AuthMethod::Login { user, password } => client
             .login(user, password)
-            .map_err(|(e, _)| e)
-            .context("IMAP LOGIN")?,
+            .map_err(|(e, _)| auth_error("LOGIN", e))?,
         #[cfg(feature = "gssapi")]
         AuthMethod::Gssapi { authzid } => {
+            // Left retryable: an expired ticket is usually renewed by
+            // something outside mailsift (k5start, sssd).
             let authenticator = imap::gssapi::GssapiAuthenticator::new(
                 "imap",
                 config.host,
@@ -617,7 +653,7 @@ fn connect_and_authenticate(config: &ImapScanConfig<'_>) -> Result<Session<imap:
             };
             client
                 .authenticate("XOAUTH2", &authenticator)
-                .map_err(|(e, _)| anyhow::anyhow!("IMAP AUTHENTICATE XOAUTH2: {e}"))?
+                .map_err(|(e, _)| auth_error("AUTHENTICATE XOAUTH2", e))?
         }
     };
 
@@ -928,7 +964,7 @@ fn watch_loop(
             Ok(WaitOutcome::MailboxChanged) | Ok(WaitOutcome::TimedOut) => {}
             Err(e) => {
                 warn!(error = format!("{e:#}"), "IDLE failed; reconnecting");
-                session = match reconnect(config, &mut backoff, interrupted) {
+                session = match reconnect(config, &mut backoff, interrupted)? {
                     Some(s) => s,
                     None => return Ok(()),
                 };
@@ -950,7 +986,7 @@ fn watch_loop(
                     error = format!("{e:#}"),
                     "UID SEARCH after cursor failed; reconnecting"
                 );
-                session = match reconnect(config, &mut backoff, interrupted) {
+                session = match reconnect(config, &mut backoff, interrupted)? {
                     Some(s) => s,
                     None => return Ok(()),
                 };
@@ -1044,26 +1080,37 @@ fn search_after_query(cursor: u32, from_restriction: Option<&str>) -> String {
 
 /// Reconnect with exponential backoff up to [`RECONNECT_BACKOFF_MAX`].
 /// Honours the interrupt flag during sleeps; Ctrl-C while waiting to
-/// retry exits cleanly. Returns `None` if interrupted.
+/// retry exits cleanly. Returns `None` if interrupted, and gives up
+/// with the error if authentication is permanently refused, rather
+/// than hammering the server or token endpoint forever.
 fn reconnect(
     config: &ImapScanConfig<'_>,
     backoff: &mut Duration,
     interrupted: &Arc<AtomicBool>,
-) -> Option<Session<imap::Connection>> {
+) -> Result<Option<Session<imap::Connection>>> {
+    reconnect_with(|| connect_and_authenticate(config), backoff, interrupted)
+}
+
+fn reconnect_with<S>(
+    mut connect: impl FnMut() -> Result<S>,
+    backoff: &mut Duration,
+    interrupted: &AtomicBool,
+) -> Result<Option<S>> {
     loop {
         if interrupted.load(Ordering::SeqCst) {
-            return None;
+            return Ok(None);
         }
         warn!(?backoff, "reconnect attempt");
         std::thread::sleep(*backoff);
         if interrupted.load(Ordering::SeqCst) {
-            return None;
+            return Ok(None);
         }
-        match connect_and_authenticate(config) {
+        match connect() {
             Ok(s) => {
                 info!("reconnected");
-                return Some(s);
+                return Ok(Some(s));
             }
+            Err(e) if is_permanent_auth_failure(&e) => return Err(e),
             Err(e) => {
                 warn!(error = format!("{e:#}"), "reconnect failed");
                 *backoff = grow_backoff(*backoff, RECONNECT_BACKOFF_MAX);
@@ -1490,6 +1537,89 @@ mod tests {
             "SINCE 1-Jan-2020"
         );
         assert_eq!(initial_search_query(None, None, None), "ALL");
+    }
+
+    #[test]
+    fn reconnect_gives_up_on_permanent_refresh_error() {
+        let interrupted = AtomicBool::new(false);
+        let mut attempts = 0;
+        let mut backoff = Duration::ZERO;
+        let result = reconnect_with(
+            || -> Result<()> {
+                attempts += 1;
+                if attempts == 3 {
+                    interrupted.store(true, Ordering::SeqCst);
+                }
+                Err(anyhow::anyhow!(crate::oauth2::PermanentRefreshError {
+                    error: "invalid_grant".to_string(),
+                    description: None,
+                }))
+            },
+            &mut backoff,
+            &interrupted,
+        );
+        assert!(is_permanent_auth_failure(&result.unwrap_err()));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn reconnect_retries_transport_errors() {
+        let interrupted = AtomicBool::new(false);
+        let mut attempts = 0;
+        let mut backoff = Duration::ZERO;
+        let result = reconnect_with(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(anyhow::Error::new(imap::Error::ConnectionLost))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut backoff,
+            &interrupted,
+        );
+        assert_eq!(result.unwrap(), Some(()));
+        assert_eq!(attempts, 3);
+    }
+
+    /// Replays a canned server response and discards what we send.
+    struct CannedStream(std::io::Cursor<&'static [u8]>);
+
+    impl std::io::Read for CannedStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl std::io::Write for CannedStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn login_error(response: &'static [u8]) -> imap::Error {
+        let client = imap::Client::new(CannedStream(std::io::Cursor::new(response)));
+        match client.login("user", "pass") {
+            Ok(_) => panic!("login unexpectedly succeeded"),
+            Err((e, _)) => e,
+        }
+    }
+
+    #[test]
+    fn auth_error_classification() {
+        let no = login_error(b"a1 NO [AUTHENTICATIONFAILED] Invalid credentials\r\n");
+        assert!(matches!(no, imap::Error::No(_)));
+        assert!(is_permanent_auth_failure(&auth_error("LOGIN", no)));
+        let bye = login_error(b"* BYE server shutting down\r\n");
+        assert!(!is_permanent_auth_failure(&auth_error("LOGIN", bye)));
+        assert!(!is_permanent_auth_failure(&auth_error(
+            "LOGIN",
+            imap::Error::ConnectionLost
+        )));
     }
 
     #[test]
