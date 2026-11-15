@@ -762,10 +762,36 @@ fn cap_log_line(line: &str, max: usize) -> String {
     format!("{}...", &line[..end])
 }
 
+/// How long to wait for the stderr pipe to close once the extractor's
+/// process group has been killed. Only a helper that moved itself out
+/// of the group can keep it open past that.
+const STDERR_GRACE: Duration = Duration::from_secs(1);
+
+/// SIGKILL every process in the group led by `pgid`. An already-empty
+/// group is not an error.
+fn kill_process_group(pgid: u32) -> std::io::Result<()> {
+    let pgid = libc::pid_t::try_from(pgid).map_err(std::io::Error::other)?;
+    if unsafe { libc::kill(-pgid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err)
+}
+
 /// Run one extractor with the raw RFC822 on stdin and a fresh tempdir as
 /// cwd. Returns the discovered artifacts; the tempdir is kept alive in the
 /// returned struct so the caller can read the artifact files before drop.
+///
+/// The extractor runs in its own process group, which is killed once
+/// the extractor exits or times out. Background helpers it leaves
+/// behind would otherwise outlive the run and, by holding the output
+/// pipes open, keep us waiting for EOF indefinitely.
 pub fn run_one(extractor: &Extractor, raw: &[u8], timeout: Duration) -> Result<ExtractorRun> {
+    use std::os::unix::process::CommandExt;
+
     let tempdir = TempDir::new().context("creating extractor tempdir")?;
 
     let mut child = Command::new(&extractor.script)
@@ -773,8 +799,10 @@ pub fn run_one(extractor: &Extractor, raw: &[u8], timeout: Duration) -> Result<E
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .with_context(|| format!("spawning extractor {}", extractor.name))?;
+    let pgid = child.id();
 
     // Feed stdin and drain both output pipes on their own threads.
     // All three have to happen concurrently with the wait: pipes hold
@@ -785,54 +813,61 @@ pub fn run_one(extractor: &Extractor, raw: &[u8], timeout: Duration) -> Result<E
     // was working fine.
     let mut stdin = child.stdin.take().expect("piped stdin");
     let raw_owned = raw.to_vec();
-    let writer = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         // Best-effort: if the extractor exits before reading all of
         // stdin we don't want to crash the parent on the resulting
         // EPIPE.
         let _ = stdin.write_all(&raw_owned);
-        drop(stdin);
     });
+    // Extractors communicate through artifact files rather than
+    // stdout, so its contents are discarded; we drain it only to keep
+    // a chatty extractor from blocking on a full pipe.
     let mut stdout_pipe = child.stdout.take().expect("piped stdout");
-    let stdout_reader = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut stdout_pipe, &mut std::io::sink());
     });
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
     let mut stderr_pipe = child.stderr.take().expect("piped stderr");
-    let stderr_reader = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = Vec::new();
         let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
+        let _ = stderr_tx.send(buf);
     });
 
     // `wait_timeout` is a real blocking wait with a deadline, so the
     // happy path returns the moment the extractor finishes; no more
     // 50ms-per-extractor floor.
-    let status = match child
+    let status = child
         .wait_timeout(timeout)
-        .context("waiting for extractor")?
-    {
+        .context("waiting for extractor")?;
+    if status.is_none() {
+        warn!(extractor = %extractor.name, "extractor timed out, killing");
+    }
+    // On the timeout path the leader is still unreaped, so its pid
+    // can't have been recycled. On the happy path the leader is reaped
+    // but the kernel reserves its pid as the pgid while the group has
+    // any member, so `kill(-pgid)` either hits a surviving member or
+    // returns ESRCH.
+    let killed = kill_process_group(pgid);
+    let timed_out = status.is_none();
+    let status = match status {
         Some(status) => status,
-        None => {
-            warn!(extractor = %extractor.name, "extractor timed out, killing");
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("extractor {} timed out", extractor.name);
-        }
+        None => child.wait().context("reaping timed out extractor")?,
     };
+    if let Err(e) = killed {
+        // A failed kill of our own group is odd but shouldn't throw
+        // away artifacts we already produced.
+        warn!(extractor = %extractor.name, "killing process group failed: {e}");
+    }
 
-    // The child has exited, so every pipe is at EOF and the helper
-    // threads are finishing or done. A panicked helper just means we
-    // lose that stream's contents, not the run.
-    //
-    // Extractors communicate through artifact files rather than
-    // stdout, so its contents are discarded; we drain it only to keep
-    // a chatty extractor from blocking on a full pipe.
-    drop(stdout_reader.join());
-    let stderr_buf = stderr_reader.join().unwrap_or_default();
-    let _ = writer.join();
+    // With the group gone stderr reaches EOF promptly. If it doesn't,
+    // a helper escaped the group; carry on without its output rather
+    // than hang. A helper that panics just costs us that stream.
+    let stderr_buf = stderr_rx.recv_timeout(STDERR_GRACE).unwrap_or_else(|e| {
+        warn!(extractor = %extractor.name, "stderr still open after exit: {e}");
+        Vec::new()
+    });
 
     let stderr = String::from_utf8_lossy(&stderr_buf);
     let trimmed_stderr = stderr.trim();
@@ -846,16 +881,18 @@ pub fn run_one(extractor: &Extractor, raw: &[u8], timeout: Duration) -> Result<E
             }
         }
     }
-    if !status.success() {
+    let failure = if timed_out {
+        format!("extractor {} timed out", extractor.name)
+    } else if !status.success() {
+        format!("extractor {} failed ({})", extractor.name, status)
+    } else {
+        String::new()
+    };
+    if !failure.is_empty() {
         if trimmed_stderr.is_empty() {
-            bail!("extractor {} failed ({})", extractor.name, status);
+            bail!("{failure}");
         }
-        bail!(
-            "extractor {} failed ({}): {}",
-            extractor.name,
-            status,
-            trimmed_stderr
-        );
+        bail!("{failure}: {trimmed_stderr}");
     }
 
     let (result, unknown) = scan(tempdir.path())?;
@@ -1450,6 +1487,92 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("kaboom detail line"), "got: {msg}");
         assert!(msg.contains("fails-with-stderr"), "got: {msg}");
+    }
+
+    /// Write `body` as an executable shell script in `dir` and wrap it
+    /// in an `Extractor`.
+    #[cfg(unix)]
+    fn shell_extractor(dir: &Path, name: &str, body: &str) -> Extractor {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join(name);
+        fs::write(&script, format!("#!/bin/sh\n{body}")).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        Extractor {
+            name: name.into(),
+            script,
+            order: 100,
+            require_dkim: Vec::new(),
+            unsigned_before: None,
+            fingerprint: String::new(),
+            from_domains: Vec::new(),
+            subject_regex: None,
+            body_requirements: Vec::new(),
+        }
+    }
+
+    /// Run `run_one` on another thread so a hang fails the test instead
+    /// of wedging the suite.
+    #[cfg(unix)]
+    fn run_one_bounded(ex: Extractor, timeout: Duration) -> Result<ExtractorRun> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_one(&ex, b"From: x\r\n\r\n", timeout));
+        });
+        rx.recv_timeout(timeout + Duration::from_secs(10))
+            .expect("run_one did not return")
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_gone(pidfile: &Path) {
+        let pid: libc::pid_t = fs::read_to_string(pidfile).unwrap().trim().parse().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // The orphan is reparented and reaped by init, which may lag
+        // slightly behind our kill.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background process {pid} survived the extractor"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_one_does_not_wait_for_background_children_holding_stdout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pidfile = dir.path().join("pid");
+        let ex = shell_extractor(
+            dir.path(),
+            "leaves-helper",
+            &format!("sleep 60 &\necho $! > {}\nexit 0\n", pidfile.display()),
+        );
+        run_one_bounded(ex, Duration::from_secs(5)).expect("extractor exited cleanly");
+        wait_for_pid_gone(&pidfile);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_one_timeout_kills_whole_process_group_and_reports_stderr() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pidfile = dir.path().join("pid");
+        let ex = shell_extractor(
+            dir.path(),
+            "stuck",
+            &format!(
+                "sleep 60 &\necho $! > {}\necho stuck on step 3 >&2\nsleep 60\n",
+                pidfile.display()
+            ),
+        );
+        let err = match run_one_bounded(ex, Duration::from_secs(1)) {
+            Err(e) => e,
+            Ok(_) => panic!("timeout must be an error"),
+        };
+        assert_eq!(
+            format!("{err}"),
+            "extractor stuck timed out: stuck on step 3"
+        );
+        wait_for_pid_gone(&pidfile);
     }
 
     #[test]
