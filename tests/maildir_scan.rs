@@ -34,7 +34,7 @@ fn maildir_scan_processes_flat_maildir() {
         .assert()
         .success();
 
-    let path = out.path().join("fixture-ics-1@example.ics");
+    let path = out.path().join("fixture-ics-1@example.com.ics");
     assert!(path.exists(), "expected {} to exist", path.display());
     let actual = fs::read_to_string(&path).unwrap();
     assert!(actual.contains("UID:fixture-ics-1@example.com"), "{actual}");
@@ -64,7 +64,7 @@ fn maildir_scan_recurse_processes_subfolders() {
         .assert()
         .success();
     assert!(
-        !out.path().join("fixture-ics-1@example.ics").exists(),
+        !out.path().join("fixture-ics-1@example.com.ics").exists(),
         "expected no artifact without --recurse"
     );
 
@@ -80,7 +80,7 @@ fn maildir_scan_recurse_processes_subfolders() {
         .assert()
         .success();
     assert!(
-        out.path().join("fixture-ics-1@example.ics").exists(),
+        out.path().join("fixture-ics-1@example.com.ics").exists(),
         "expected artifact with --recurse"
     );
 }
@@ -150,7 +150,7 @@ fn maildir_scan_extractor_flag_selects_one_extractor() {
         .success();
 
     assert!(
-        !out.path().join("fixture-ics-1@example.ics").exists(),
+        !out.path().join("fixture-ics-1@example.com.ics").exists(),
         "fixture-ics-pass should not have run"
     );
     let filed: Vec<_> = fs::read_dir(reservations.path())

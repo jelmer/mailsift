@@ -24,7 +24,7 @@ fn replay_files_ics_passthrough_event() {
         .assert()
         .success();
 
-    let path = out.path().join("fixture-ics-1@example.ics");
+    let path = out.path().join("fixture-ics-1@example.com.ics");
     let actual = std::fs::read_to_string(&path).expect("read event");
     // split_calendar re-serializes with its own PRODID and orders
     // fields alphabetically, which is why DTEND precedes DTSTART here.

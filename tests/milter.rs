@@ -144,7 +144,7 @@ async fn milter_files_event_from_ics_attachment() {
     shutdown_tx.send(()).unwrap();
     milter.await.unwrap().unwrap();
 
-    let expected = out.path().join("fixture-ics-1@example.ics");
+    let expected = out.path().join("fixture-ics-1@example.com.ics");
     assert!(
         expected.exists(),
         "expected event file at {} not found",
@@ -266,7 +266,7 @@ hello from an unsigned inner mail\r\n\
     shutdown_tx.send(()).unwrap();
     milter.await.unwrap().unwrap();
 
-    let expected = out.path().join("dkim-marker@example.ics");
+    let expected = out.path().join("dkim-marker@example.com.ics");
     assert!(
         expected.exists(),
         "expected fixture extractor artifact at {} not found; \

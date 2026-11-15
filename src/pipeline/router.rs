@@ -1106,7 +1106,7 @@ END:VCALENDAR\r
     }
 
     fn filed_summary(dir: &Path) -> String {
-        let body = fs::read_to_string(dir.join("evt-1@example.ics")).unwrap();
+        let body = fs::read_to_string(dir.join("evt-1@example.com.ics")).unwrap();
         let line = body.lines().find(|l| l.starts_with("SUMMARY:")).unwrap();
         line.to_string()
     }
