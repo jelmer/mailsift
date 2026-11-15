@@ -12,7 +12,7 @@ use super::sink::{sanitize_uid, update_file};
 use super::{FileOutcome, SingleEvent, event_is_newer};
 
 pub fn file_single(event: &SingleEvent, dir: &Path) -> Result<FileOutcome> {
-    let target = dir.join(sanitize_uid(&event.uid)).with_extension("ics");
+    let target = dir.join(format!("{}.ics", sanitize_uid(&event.uid)));
     let label = target.display().to_string();
     update_file(&target, "event", &|existing| {
         Ok(match existing {
@@ -28,9 +28,13 @@ mod tests {
     use crate::targets::split_calendar;
 
     fn event(summary: &str, dtstamp: &str) -> SingleEvent {
+        event_with_uid("train-1@mailsift", summary, dtstamp)
+    }
+
+    fn event_with_uid(uid: &str, summary: &str, dtstamp: &str) -> SingleEvent {
         let ics = format!(
             "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\nBEGIN:VEVENT\r\n\
-UID:train-1@mailsift\r\nDTSTART:20260201T100000Z\r\n\
+UID:{uid}\r\nDTSTART:20260201T100000Z\r\n\
 SUMMARY:{summary}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
         );
         split_calendar(&ics)
@@ -68,6 +72,25 @@ SUMMARY:{summary}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("train-1@mailsift.ics")).unwrap(),
             rebooked.body
+        );
+    }
+
+    #[test]
+    fn dotted_uids_get_distinct_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nl = event_with_uid("ABC123@airline.nl", "NL", "2026-01-20T10:00:00Z");
+        let com = event_with_uid("ABC123@airline.com", "COM", "2026-01-20T10:00:00Z");
+
+        file_single(&nl, tmp.path()).unwrap();
+        let second = file_single(&com, tmp.path()).unwrap();
+        assert!(matches!(second, FileOutcome::Created(_)));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("ABC123@airline.nl.ics")).unwrap(),
+            nl.body
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("ABC123@airline.com.ics")).unwrap(),
+            com.body
         );
     }
 }

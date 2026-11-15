@@ -67,7 +67,7 @@ fn signed_message_produces_artifact() {
         .success();
 
     assert!(
-        out.path().join("dkim-marker@example.ics").exists(),
+        out.path().join("dkim-marker@example.com.ics").exists(),
         "expected dkim-marker event on the legitimately signed message"
     );
 }
