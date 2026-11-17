@@ -289,9 +289,11 @@ fn maildir_scan_to_caldav_uses_the_dedup_store() {
     assert!(scan_to_caldav_opens_seen_store(&[]));
 }
 
+/// `--no-dedup` only resends events; what each message produced is
+/// still recorded in the store.
 #[test]
-fn maildir_scan_no_dedup_leaves_the_dedup_store_alone() {
-    assert!(!scan_to_caldav_opens_seen_store(&["--no-dedup"]));
+fn maildir_scan_no_dedup_still_records_messages() {
+    assert!(scan_to_caldav_opens_seen_store(&["--no-dedup"]));
 }
 
 #[test]

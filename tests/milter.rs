@@ -87,6 +87,7 @@ async fn milter_files_event_from_ics_attachment() {
             trusted_forwarders: vec![],
             recorder: mailsift::stats::Recorder::Disabled,
             seen: None,
+            message_index: None,
         },
         deadline: Duration::from_secs(10),
     };
@@ -205,6 +206,7 @@ hello from an unsigned inner mail\r\n\
             trusted_forwarders: vec!["joe@example.com".to_string()],
             recorder: mailsift::stats::Recorder::Disabled,
             seen: None,
+            message_index: None,
         },
         deadline: Duration::from_secs(10),
     };

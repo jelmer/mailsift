@@ -316,6 +316,11 @@ views for scripting live at `/api/bills.json`, `/api/parcels.json`,
 `/api/reservations.json`; raw `.ics` and ticket blobs are served with
 their proper Content-Type.
 
+The milter and the scans also note in the dedup store what each message
+produced, so `GET /api/messages?message_id=<Message-ID>` can tell what
+was extracted from a message (`404` if no extractor ran on it). The web
+server must run as the same user to share the store.
+
 No authentication is built in; bind to loopback (or put it behind a
 reverse proxy) if the artifacts are personal.
 

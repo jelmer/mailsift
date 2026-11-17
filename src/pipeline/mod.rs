@@ -79,6 +79,10 @@ pub struct PipelineTargets<'a> {
     /// back to the original "always issue, server figures it out"
     /// behaviour; fine for one-off replays and tests.
     pub seen: Option<&'a SeenStore>,
+    /// Where to keep what was extracted from each message, by
+    /// Message-ID, for the web UI to look up. Only written for messages
+    /// at least one extractor ran on, and never on a dry run.
+    pub message_index: Option<&'a SeenStore>,
 }
 
 /// Long-lived counterpart to [`PipelineTargets`] for callers that hand
@@ -102,6 +106,8 @@ pub struct OwnedTargets {
     pub recorder: Recorder,
     /// See [`PipelineTargets::seen`].
     pub seen: Option<SeenStore>,
+    /// See [`PipelineTargets::message_index`].
+    pub message_index: Option<SeenStore>,
 }
 
 impl OwnedTargets {
@@ -119,6 +125,7 @@ impl OwnedTargets {
             trusted_forwarders: &self.trusted_forwarders,
             recorder: &self.recorder,
             seen: self.seen.as_ref(),
+            message_index: self.message_index.as_ref(),
         }
     }
 }
@@ -378,6 +385,7 @@ pub fn run(
         trusted_forwarders,
         recorder,
         seen,
+        message_index,
     } = targets;
 
     if raw.len() > MAX_MESSAGE_BYTES {
@@ -394,6 +402,13 @@ pub fn run(
         warn!("no extractors configured; nothing to do");
         return Ok(());
     }
+
+    // The outer message's ID even when a trusted forward is unwrapped
+    // below: that is the message the mailbox shows.
+    let index_key = message_index
+        .filter(|_| !dry_run)
+        .and_then(|store| Some((store, message_id_header(raw)?)));
+    let mut indexed: Vec<serde_json::Value> = Vec::new();
 
     // If the message is a forward from a trusted sender, swap `raw`
     // for the inner RFC822 bytes so DKIM checks, prefilter matching,
@@ -532,6 +547,12 @@ pub fn run(
                         },
                     });
                 }
+                if index_key.is_some() {
+                    indexed.push(serde_json::json!({
+                        "extractor": ex.name,
+                        "error": format!("{e:#}"),
+                    }));
+                }
                 let err_snippet = stats::error_snippet(&format!("{e:#}"));
                 recorder.record(&stats::Event {
                     ts: now_ts,
@@ -601,6 +622,17 @@ pub fn run(
             + receipt_blob_arts.len()
             + ticket_arts.len()
             + subscription_arts.len();
+        let records = if explain.is_some() || index_key.is_some() {
+            produced_records(&run.extractor, &run.result.artifacts)
+        } else {
+            Vec::new()
+        };
+        if index_key.is_some() {
+            indexed.push(serde_json::json!({
+                "extractor": run.extractor,
+                "records": records,
+            }));
+        }
         if let Some(buf) = explain.as_deref_mut() {
             buf.push(ExplainRecord {
                 extractor: run.extractor.clone(),
@@ -612,7 +644,7 @@ pub fn run(
                     receipts: (receipt_arts.len() + receipt_blob_arts.len()) as u32,
                     tickets: ticket_arts.len() as u32,
                     subscriptions: subscription_arts.len() as u32,
-                    records: produced_records(&run.extractor, &run.result.artifacts),
+                    records,
                 },
             });
         }
@@ -842,6 +874,17 @@ pub fn run(
         );
     }
 
+    if let Some((store, message_id)) = index_key
+        && !indexed.is_empty()
+        && let Err(e) = store.record_message(&message_id, now_ts, indexed)
+    {
+        warn!(
+            source,
+            error = format!("{e:#}"),
+            "seen.db: failed to record what was extracted from the message"
+        );
+    }
+
     if !summary.is_empty() {
         if dry_run {
             info!(
@@ -854,6 +897,15 @@ pub fn run(
     }
 
     Ok(())
+}
+
+/// The message's `Message-ID`, unless it has none (or an empty one).
+fn message_id_header(raw: &[u8]) -> Option<String> {
+    use mailparse::MailHeaderMap;
+    let (headers, _) = mailparse::parse_headers(raw).ok()?;
+    headers
+        .get_first_value("Message-ID")
+        .filter(|id| !crate::seen::normalize_message_id(id).is_empty())
 }
 
 /// Same as [`parse_match_headers_from_parsed`] but accepts raw RFC822
@@ -1485,6 +1537,7 @@ Content-Type: application/pdf; name=\"invoice.pdf\"\r\n\
                 trusted_forwarders: &[],
                 recorder: &recorder,
                 seen: None,
+                message_index: None,
             },
             DkimPolicy::Skip,
             false,
@@ -1504,6 +1557,108 @@ Content-Type: application/pdf; name=\"invoice.pdf\"\r\n\
             .expect("read events dir")
             .collect();
         assert!(events.is_empty(), "no artifacts should have been filed");
+    }
+
+    /// Write an executable extractor `name` matching mail from
+    /// `example.org`, whose script is `body`.
+    fn write_extractor(dir: &Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            dir.join(format!("{name}.yaml")),
+            format!("name: {name}\nfrom_domains:\n  - example.org\n"),
+        )
+        .unwrap();
+        let script = dir.join(format!("{name}.py"));
+        std::fs::write(&script, format!("#!/bin/sh\ncat > /dev/null\n{body}")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn run_indexed(raw: &[u8], extractors_dir: &Path, index: &SeenStore, dry_run: bool) {
+        let extractors = extractor::discover(&[extractors_dir.to_path_buf()]).unwrap();
+        let sink = EventSinkKind::Disabled;
+        run(
+            raw,
+            "test",
+            &extractors,
+            PipelineTargets {
+                event_sink: &sink,
+                bills_dir: None,
+                parcels_dir: None,
+                subscriptions_dir: None,
+                reservations_dir: None,
+                receipts: None,
+                tickets: None,
+                firefly: None,
+                trackers: None,
+                trusted_forwarders: &[],
+                recorder: &stats::Recorder::Disabled,
+                seen: None,
+                message_index: Some(index),
+            },
+            DkimPolicy::Skip,
+            dry_run,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn run_indexes_what_each_extractor_did_by_message_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ext_dir = tmp.path().join("extractors");
+        std::fs::create_dir(&ext_dir).unwrap();
+        write_extractor(&ext_dir, "broken", "echo oops >&2\nexit 3\n");
+        write_extractor(&ext_dir, "quiet", "");
+        let index = SeenStore::open(&tmp.path().join("seen.db")).unwrap();
+
+        run_indexed(
+            b"Message-ID: <m1@example.org>\r\nFrom: a@example.org\r\nSubject: hi\r\n\r\nbody\r\n",
+            &ext_dir,
+            &index,
+            false,
+        );
+
+        let mut entry = index.message("m1@example.org").unwrap().unwrap();
+        let entry = entry.as_object_mut().unwrap();
+        assert!(entry.remove("processed_at").unwrap().as_i64().unwrap() > 0);
+        let extractors = entry.remove("extractors").unwrap();
+        assert!(entry.is_empty(), "unexpected fields: {entry:?}");
+        let extractors = extractors.as_array().unwrap();
+        assert_eq!(extractors.len(), 2);
+        assert_eq!(extractors[0]["extractor"], "broken");
+        assert!(
+            extractors[0]["error"].as_str().unwrap().contains("oops"),
+            "{extractors:?}"
+        );
+        assert_eq!(
+            extractors[1],
+            serde_json::json!({"extractor": "quiet", "records": []})
+        );
+    }
+
+    #[test]
+    fn run_indexes_nothing_without_a_run_extractor_or_on_a_dry_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ext_dir = tmp.path().join("extractors");
+        std::fs::create_dir(&ext_dir).unwrap();
+        write_extractor(&ext_dir, "quiet", "");
+        let index = SeenStore::open(&tmp.path().join("seen.db")).unwrap();
+
+        run_indexed(
+            b"Message-ID: <m2@elsewhere.example>\r\nFrom: a@elsewhere.example\r\n\r\nbody\r\n",
+            &ext_dir,
+            &index,
+            false,
+        );
+        assert_eq!(index.message("m2@elsewhere.example").unwrap(), None);
+
+        run_indexed(
+            b"Message-ID: <m3@example.org>\r\nFrom: a@example.org\r\n\r\nbody\r\n",
+            &ext_dir,
+            &index,
+            true,
+        );
+        assert_eq!(index.message("m3@example.org").unwrap(), None);
     }
 
     #[test]
@@ -1532,6 +1687,7 @@ Content-Type: application/pdf; name=\"invoice.pdf\"\r\n\
                 trusted_forwarders: &[],
                 recorder: &stats::Recorder::Disabled,
                 seen: None,
+                message_index: None,
             },
             DkimPolicy::Skip,
             false,
