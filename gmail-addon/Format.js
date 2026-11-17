@@ -273,6 +273,64 @@ function summarizeRecord(kind, data) {
   }
 }
 
+const LIST_PATHS = {
+  event: '/events',
+  reservation: '/reservations',
+  bill: '/bills',
+  parcel: '/parcels',
+  receipt: '/receipts',
+  ticket: '/tickets',
+  subscription: '/subscriptions',
+};
+
+/**
+ * Format a DTSTART or DTEND as `GET /api/messages` returns it: `{ date }`
+ * for a whole day, or `{ datetime }` (with `tzid` when zoned, or a
+ * trailing `Z` for UTC).
+ *
+ * @param {{date?: string, datetime?: string}} time
+ * @return {string}
+ */
+function formatEventTime(time) {
+  if (time.date) {
+    return formatWhen(time.date, false);
+  }
+  const when = formatWhen(time.datetime, true);
+  return time.datetime.endsWith('Z') ? `${when} UTC` : when;
+}
+
+/**
+ * Summarize one record from `GET /api/messages`: a calendar event, a
+ * JSON record (see `summarizeRecord`), or a file without parsed
+ * contents, such as a ticket PDF.
+ *
+ * @param {{kind: string, filename: string, data?: Object}} record
+ * @return {{label: string, icon: string, title: string, subtitle: string,
+ *   path: string}} as for `summarizeRecord`
+ */
+function summarizeProduced(record) {
+  if (!record.data) {
+    return {
+      label: humanizeEnum(record.kind),
+      icon: 'DESCRIPTION',
+      title: record.filename,
+      subtitle: '',
+      path: LIST_PATHS[record.kind] || '/all',
+    };
+  }
+  if (record.kind === 'event') {
+    const data = record.data;
+    return {
+      label: 'Event',
+      icon: 'INVITE',
+      title: data.summary || 'Event',
+      subtitle: joinParts([data.start && formatEventTime(data.start), data.location]),
+      path: '/events',
+    };
+  }
+  return summarizeRecord(record.kind, record.data);
+}
+
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { summarizeRecord, formatWhen };
+  module.exports = { summarizeRecord, summarizeProduced, formatWhen };
 }
