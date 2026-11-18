@@ -194,8 +194,7 @@ function summarizeReservation(data) {
 }
 
 /**
- * Summarise one record from the `records` of a `POST /api/messages`
- * response.
+ * Summarise one record from a `GET /api/messages` response.
  *
  * @param {string} kind `reservation`, `bill`, `parcel`, `receipt`,
  *   `ticket` or `subscription`

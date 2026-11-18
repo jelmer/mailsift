@@ -19,15 +19,14 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, State};
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use bytes::Bytes;
 use chrono::{NaiveDate, NaiveDateTime, Utc};
 use iso_currency::Currency;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::info;
 use utoipa::OpenApi;
@@ -249,7 +248,7 @@ async fn serve_unix(path: &Path, app: Router, mode: u32) -> Result<()> {
     tags(
         (name = "artifacts", description = "Extracted artifact records (bills, parcels, receipts, subscriptions, reservations)."),
         (name = "stats", description = "Pipeline event-log aggregates."),
-        (name = "ingest", description = "Extractor discovery and message submission."),
+        (name = "ingest", description = "Extractor discovery."),
     ),
 )]
 struct ApiDoc;
@@ -264,11 +263,7 @@ fn router(state: Arc<AppState>) -> Router {
         .routes(routes!(api_stats))
         .routes(routes!(api_recent_failures))
         .routes(routes!(api_extractors))
-        .merge(
-            OpenApiRouter::new()
-                .routes(routes!(api_get_message, api_post_message))
-                .layer(DefaultBodyLimit::max(crate::pipeline::MAX_MESSAGE_BYTES)),
-        )
+        .routes(routes!(api_get_message))
         .split_for_parts();
 
     Router::new()
@@ -3366,9 +3361,7 @@ fn extractors_dirs(config: &Config) -> Vec<PathBuf> {
     }
 }
 
-/// Serve the discovered extractor manifests as JSON so external clients
-/// (such as the Gmail Add-on) can prefilter messages locally before
-/// uploading them to `POST /api/messages`.
+/// Serve the discovered extractor manifests as JSON.
 #[utoipa::path(
     get,
     path = "/api/extractors",
@@ -3476,7 +3469,7 @@ struct GetMessageQuery {
     tag = "ingest",
     params(GetMessageQuery),
     responses(
-        (status = 200, description = "`message_id`, `processed_at` (unix timestamp) and `extractors`: per extractor that ran, either its `records` (as in `POST /api/messages`) or its `error`.", body = Object),
+        (status = 200, description = "`message_id`, `processed_at` (unix timestamp) and `extractors`: per extractor that ran, either its `records` or its `error`.", body = Object),
         (status = 400, description = "Empty `message_id`."),
         (status = 404, description = "No extractor has run on this message."),
     ),
@@ -3511,228 +3504,6 @@ async fn api_get_message(
         .context("seen.db: stored message entry is not an object")?
         .insert("message_id".to_string(), Value::String(message_id));
     Ok(Json(entry).into_response())
-}
-
-#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-struct PostMessageQuery {
-    /// Label recorded as the message's source. Defaults to `web-api`.
-    source: Option<String>,
-    /// When the message was received, as a unix timestamp. Used to
-    /// apply an extractor's `unsigned_before` cutoff.
-    received_at: Option<i64>,
-    /// Run the extractors without writing any artifacts.
-    dry_run: Option<bool>,
-}
-
-#[derive(Serialize, utoipa::ToSchema)]
-struct PostMessageResponse {
-    ok: bool,
-    dry_run: bool,
-    /// Extractors that produced output, with per-kind artifact counts.
-    matched: Vec<MatchedExtractor>,
-    /// Extractors that matched the message but failed.
-    failed: Vec<FailedExtractor>,
-}
-
-#[derive(Serialize, utoipa::ToSchema)]
-struct MatchedExtractor {
-    extractor: String,
-    events: u32,
-    reservations: u32,
-    bills: u32,
-    parcels: u32,
-    receipts: u32,
-    tickets: u32,
-    subscriptions: u32,
-    /// Every artifact the extractor produced, as written before filing.
-    records: Vec<crate::pipeline::ProducedRecord>,
-}
-
-#[derive(Serialize, utoipa::ToSchema)]
-struct FailedExtractor {
-    extractor: String,
-    error: String,
-}
-
-/// Accept a raw RFC822 email message in the request body and run the
-/// extraction pipeline over it.
-#[utoipa::path(
-    post,
-    path = "/api/messages",
-    tag = "ingest",
-    params(PostMessageQuery),
-    request_body(content = String, content_type = "message/rfc822", description = "Raw RFC822 message."),
-    responses(
-        (status = 200, description = "Pipeline outcome per extractor.", body = PostMessageResponse),
-        (status = 400, description = "Empty message body."),
-        (status = 413, description = "Message larger than `MAX_MESSAGE_BYTES`."),
-        (status = 500, description = "Pipeline or sink configuration error."),
-    ),
-)]
-async fn api_post_message(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<PostMessageQuery>,
-    body: Bytes,
-) -> Result<Json<PostMessageResponse>, AppError> {
-    if body.is_empty() {
-        return Err(AppError::bad_request("empty message body"));
-    }
-
-    let config = Arc::clone(&state.config);
-    let seen_db = state.seen_db.clone();
-    let source = query.source.unwrap_or_else(|| "web-api".to_string());
-    let received_at = query.received_at;
-    let dry_run = query.dry_run.unwrap_or(false);
-    let raw = body.to_vec();
-
-    let outcome = tokio::task::spawn_blocking(move || -> Result<PostMessageResponse> {
-        let runtime = tokio::runtime::Handle::current();
-        let dirs = extractors_dirs(&config);
-        let extractors = crate::extractor::discover(&dirs)?;
-
-        let event_sink = match (&config.events_dir, &config.caldav) {
-            (Some(dir), _) => crate::targets::EventSinkKind::LocalDir(dir.clone()),
-            (None, Some(cal)) => {
-                let target = crate::cli::parse_caldav_url(&cal.url)?;
-                let user = target.user.or_else(|| cal.user.clone());
-                let password = cal
-                    .password_file
-                    .as_deref()
-                    .map(|p| -> Result<String> { Ok(fs::read_to_string(p)?.trim().to_string()) })
-                    .transpose()?;
-                crate::targets::EventSinkKind::Caldav(crate::targets::caldav::CaldavSink::new(
-                    target.url,
-                    user,
-                    password,
-                    runtime.clone(),
-                )?)
-            }
-            (None, None) => crate::targets::EventSinkKind::Disabled,
-        };
-
-        let receipts_sink = if let Some(dir) = &config.receipts_dir {
-            Some(crate::targets::receipts::ReceiptSink::LocalDir(dir.clone()))
-        } else if let Some(dav) = &config.receipts_webdav {
-            let target = crate::cli::parse_caldav_url(&dav.url)?;
-            let user = target.user.or_else(|| dav.user.clone());
-            let password = dav
-                .password_file
-                .as_deref()
-                .map(|p| -> Result<String> { Ok(fs::read_to_string(p)?.trim().to_string()) })
-                .transpose()?;
-            Some(crate::targets::receipts::ReceiptSink::Webdav(
-                crate::targets::webdav::WebdavSink::new(
-                    target.url,
-                    user,
-                    password,
-                    runtime.clone(),
-                )?,
-            ))
-        } else {
-            None
-        };
-
-        let tickets_sink = if let Some(dir) = &config.tickets_dir {
-            Some(crate::targets::tickets::TicketSink::LocalDir(dir.clone()))
-        } else if let Some(dav) = &config.tickets_webdav {
-            let target = crate::cli::parse_caldav_url(&dav.url)?;
-            let user = target.user.or_else(|| dav.user.clone());
-            let password = dav
-                .password_file
-                .as_deref()
-                .map(|p| -> Result<String> { Ok(fs::read_to_string(p)?.trim().to_string()) })
-                .transpose()?;
-            Some(crate::targets::tickets::TicketSink::Webdav(
-                crate::targets::webdav::WebdavSink::new(
-                    target.url,
-                    user,
-                    password,
-                    runtime.clone(),
-                )?,
-            ))
-        } else {
-            None
-        };
-
-        let recorder = crate::stats::Recorder::default_file();
-        // The router only consults the dedup store for CalDAV events.
-        let store = seen_db
-            .filter(|_| !dry_run)
-            .and_then(|p| crate::seen::Store::open_or_warn(&p));
-
-        let mut explain_buf = Vec::new();
-        crate::pipeline::run(
-            &raw,
-            &source,
-            &extractors,
-            crate::pipeline::PipelineTargets {
-                event_sink: &event_sink,
-                bills_dir: config.bills_dir.as_deref(),
-                parcels_dir: config.parcels_dir.as_deref(),
-                subscriptions_dir: config.subscriptions_dir.as_deref(),
-                reservations_dir: config.reservations_dir.as_deref(),
-                receipts: receipts_sink.as_ref(),
-                tickets: tickets_sink.as_ref(),
-                firefly: None,
-                trackers: None,
-                trusted_forwarders: &config.trusted_forwarders,
-                recorder: &recorder,
-                seen: store.as_ref(),
-                message_index: store.as_ref(),
-            },
-            crate::pipeline::DkimPolicy::Enforce { received_at },
-            dry_run,
-            Some(&mut explain_buf),
-        )?;
-
-        let mut matched = Vec::new();
-        let mut failed = Vec::new();
-        for rec in explain_buf {
-            match rec.outcome {
-                crate::pipeline::ExplainOutcome::Produced {
-                    events,
-                    reservations,
-                    bills,
-                    parcels,
-                    receipts,
-                    tickets,
-                    subscriptions,
-                    records,
-                } => {
-                    matched.push(MatchedExtractor {
-                        extractor: rec.extractor,
-                        events,
-                        reservations,
-                        bills,
-                        parcels,
-                        receipts,
-                        tickets,
-                        subscriptions,
-                        records,
-                    });
-                }
-                crate::pipeline::ExplainOutcome::Failed { error } => {
-                    failed.push(FailedExtractor {
-                        extractor: rec.extractor,
-                        error,
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        Ok(PostMessageResponse {
-            ok: true,
-            dry_run,
-            matched,
-            failed,
-        })
-    })
-    .await
-    .context("joining pipeline task")??;
-
-    Ok(Json(outcome))
 }
 
 /// (filename, parsed JSON) for every `*.json` directly under `dir`.
@@ -4193,13 +3964,7 @@ mod tests {
         let schemas = spec["components"]["schemas"]
             .as_object()
             .expect("no schemas");
-        for schema in [
-            "Artifact",
-            "ExtractorStats",
-            "RecentFailure",
-            "Manifest",
-            "PostMessageResponse",
-        ] {
+        for schema in ["Artifact", "ExtractorStats", "RecentFailure", "Manifest"] {
             assert!(schemas.contains_key(schema), "missing schema {schema}");
         }
         assert!(
@@ -6035,79 +5800,6 @@ tickets_dir = "/var/mailsift/tickets"
         assert_ne!(changed.as_deref(), Some(etag.as_str()));
     }
 
-    /// A config with one `dhl` extractor that emits a parcel and a
-    /// ticket for mail from `dhl.example`, filing parcels under
-    /// `<tmp>/parcels`.
-    fn dhl_config(tmp: &Path) -> Config {
-        let ext_dir = tmp.join("extractors");
-        let parcels_dir = tmp.join("parcels");
-        fs::create_dir_all(&ext_dir).unwrap();
-        fs::create_dir_all(&parcels_dir).unwrap();
-
-        fs::write(
-            ext_dir.join("dhl.yaml"),
-            "name: dhl\nfrom_domains:\n  - dhl.example\n",
-        )
-        .unwrap();
-        let script = ext_dir.join("dhl.py");
-        fs::write(
-            &script,
-            "#!/bin/sh\ncat > /dev/null\nprintf '{\"trackingNumber\":\"DHL999\",\"deliveryStatus\":\"OnItsWay\"}' > dhl.parcel.json\nprintf '%%PDF-1.4' > label.ticket.pdf\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&script).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&script, perms).unwrap();
-        }
-
-        Config {
-            extractors_dir: Some(crate::config::ExtractorsDir::Single(ext_dir)),
-            parcels_dir: Some(parcels_dir),
-            ..Config::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn post_messages_runs_pipeline_and_files_artifacts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let parcels_dir = tmp.path().join("parcels");
-        let app = router(state_with(dhl_config(tmp.path()), ""));
-        let raw_email = "From: notify@dhl.example\r\nSubject: Your parcel\r\nDate: Wed, 10 Apr 2026 12:00:00 +0000\r\n\r\nYour parcel DHL999 is on its way.\r\n";
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/messages?source=gmail-test")
-            .header(header::CONTENT_TYPE, "message/rfc822")
-            .body(axum::body::Body::from(raw_email))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(parsed["ok"], true);
-        assert_eq!(parsed["matched"][0]["extractor"], "dhl");
-        assert_eq!(parsed["matched"][0]["parcels"], 1);
-        assert_eq!(
-            parsed["matched"][0]["records"],
-            serde_json::json!([
-                {
-                    "kind": "parcel",
-                    "filename": "dhl.parcel.json",
-                    "content_type": "application/json",
-                    "data": {"trackingNumber": "DHL999", "deliveryStatus": "OnItsWay"},
-                },
-                {
-                    "kind": "ticket",
-                    "filename": "label.ticket.pdf",
-                    "content_type": "application/pdf",
-                },
-            ])
-        );
-        assert!(parcels_dir.join("DHL999.json").exists());
-    }
-
     async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
         let resp = app
             .clone()
@@ -6125,57 +5817,58 @@ tickets_dir = "/var/mailsift/tickets"
     }
 
     #[tokio::test]
-    async fn get_messages_returns_what_post_extracted() {
+    async fn get_messages_returns_what_was_recorded() {
         let tmp = tempfile::tempdir().unwrap();
+        let seen_path = tmp.path().join("state").join("seen.db");
+        fs::create_dir_all(seen_path.parent().unwrap()).unwrap();
+        let run = serde_json::json!({
+            "extractor": "dhl",
+            "records": [
+                {
+                    "kind": "parcel",
+                    "filename": "dhl.parcel.json",
+                    "content_type": "application/json",
+                    "data": {"trackingNumber": "DHL999", "deliveryStatus": "OnItsWay"},
+                },
+                {
+                    "kind": "ticket",
+                    "filename": "label.ticket.pdf",
+                    "content_type": "application/pdf",
+                },
+            ],
+        });
+        crate::seen::Store::open(&seen_path)
+            .unwrap()
+            .record_message("<p1@dhl.example>", 42, vec![run.clone()])
+            .unwrap();
+
         let mut state = AppState {
-            config: Arc::new(dhl_config(tmp.path())),
+            config: Arc::new(Config::default()),
             base_path: String::new(),
-            seen_db: Some(tmp.path().join("state").join("seen.db")),
+            seen_db: Some(seen_path),
         };
         let app = router(Arc::new(state.clone()));
 
         let (status, body) =
             get_json(&app, "/api/messages?message_id=%3Cp1%40dhl.example%3E").await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body, serde_json::json!({"message_id": "p1@dhl.example"}));
-
-        let raw = "Message-ID: <p1@dhl.example>\r\nFrom: notify@dhl.example\r\nSubject: Your parcel\r\n\r\nOn its way.\r\n";
-        let resp = app
-            .clone()
-            .oneshot(post_message_request(raw.as_bytes().to_vec()))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let (status, mut body) =
-            get_json(&app, "/api/messages?message_id=%3Cp1%40dhl.example%3E").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body["processed_at"].as_i64().unwrap() > 0);
-        body.as_object_mut().unwrap().remove("processed_at");
         assert_eq!(
             body,
             serde_json::json!({
                 "message_id": "p1@dhl.example",
-                "extractors": [{
-                    "extractor": "dhl",
-                    "records": [
-                        {
-                            "kind": "parcel",
-                            "filename": "dhl.parcel.json",
-                            "content_type": "application/json",
-                            "data": {"trackingNumber": "DHL999", "deliveryStatus": "OnItsWay"},
-                        },
-                        {
-                            "kind": "ticket",
-                            "filename": "label.ticket.pdf",
-                            "content_type": "application/pdf",
-                        },
-                    ],
-                }],
+                "processed_at": 42,
+                "extractors": [run],
             })
         );
 
-        // Without a seen.db there is nothing to look up in.
+        let (status, body) =
+            get_json(&app, "/api/messages?message_id=%3Cmissing%40dhl.example%3E").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body,
+            serde_json::json!({"message_id": "missing@dhl.example"})
+        );
+
         state.seen_db = None;
         let resp = router(Arc::new(state))
             .oneshot(
@@ -6187,29 +5880,6 @@ tickets_dir = "/var/mailsift/tickets"
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn dry_run_post_messages_records_nothing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = AppState {
-            config: Arc::new(dhl_config(tmp.path())),
-            base_path: String::new(),
-            seen_db: Some(tmp.path().join("seen.db")),
-        };
-        let app = router(Arc::new(state));
-        let raw = "Message-ID: <p2@dhl.example>\r\nFrom: notify@dhl.example\r\nSubject: Your parcel\r\n\r\nOn its way.\r\n";
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/messages?dry_run=true")
-            .header(header::CONTENT_TYPE, "message/rfc822")
-            .body(axum::body::Body::from(raw))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let (status, _) = get_json(&app, "/api/messages?message_id=p2%40dhl.example").await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -6230,43 +5900,5 @@ tickets_dir = "/var/mailsift/tickets"
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    fn post_message_request(body: Vec<u8>) -> Request<axum::body::Body> {
-        Request::builder()
-            .method("POST")
-            .uri("/api/messages")
-            .header(header::CONTENT_TYPE, "message/rfc822")
-            .body(axum::body::Body::from(body))
-            .unwrap()
-    }
-
-    fn app_without_extractors(tmp: &Path) -> Router {
-        let ext_dir = tmp.join("extractors");
-        fs::create_dir_all(&ext_dir).unwrap();
-        let config = Config {
-            extractors_dir: Some(crate::config::ExtractorsDir::Single(ext_dir)),
-            ..Config::default()
-        };
-        router(state_with(config, ""))
-    }
-
-    #[tokio::test]
-    async fn post_messages_accepts_bodies_beyond_axum_default_limit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let app = app_without_extractors(tmp.path());
-        let mut raw = b"From: someone@example.com\r\nSubject: big\r\n\r\n".to_vec();
-        raw.resize(3 * 1024 * 1024, b'x');
-        let resp = app.oneshot(post_message_request(raw)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn post_messages_rejects_bodies_over_max_message_bytes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let app = app_without_extractors(tmp.path());
-        let raw = vec![b'x'; crate::pipeline::MAX_MESSAGE_BYTES + 1];
-        let resp = app.oneshot(post_message_request(raw)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
