@@ -1163,7 +1163,11 @@ mod tests {
             script.display()
         );
         Extractor {
-            name: name.trim_end_matches(".py").into(),
+            name: Path::new(name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("fixture script name has a stem")
+                .into(),
             script,
             order: 100,
             require_dkim: Vec::new(),
@@ -1489,34 +1493,20 @@ mod tests {
         assert!(msg.contains("fails-with-stderr"), "got: {msg}");
     }
 
-    /// Write `body` as an executable shell script in `dir` and wrap it
-    /// in an `Extractor`.
+    /// The fixture scripts that start background children read the path
+    /// to record the child's pid in from the first line of stdin.
     #[cfg(unix)]
-    fn shell_extractor(dir: &Path, name: &str, body: &str) -> Extractor {
-        use std::os::unix::fs::PermissionsExt;
-        let script = dir.join(name);
-        fs::write(&script, format!("#!/bin/sh\n{body}")).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        Extractor {
-            name: name.into(),
-            script,
-            order: 100,
-            require_dkim: Vec::new(),
-            unsigned_before: None,
-            fingerprint: String::new(),
-            from_domains: Vec::new(),
-            subject_regex: None,
-            body_requirements: Vec::new(),
-        }
+    fn pidfile_input(pidfile: &Path) -> Vec<u8> {
+        format!("{}\n", pidfile.display()).into_bytes()
     }
 
     /// Run `run_one` on another thread so a hang fails the test instead
     /// of wedging the suite.
     #[cfg(unix)]
-    fn run_one_bounded(ex: Extractor, timeout: Duration) -> Result<ExtractorRun> {
+    fn run_one_bounded(ex: Extractor, input: Vec<u8>, timeout: Duration) -> Result<ExtractorRun> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(run_one(&ex, b"From: x\r\n\r\n", timeout));
+            let _ = tx.send(run_one(&ex, &input, timeout));
         });
         rx.recv_timeout(timeout + Duration::from_secs(10))
             .expect("run_one did not return")
@@ -1542,12 +1532,9 @@ mod tests {
     fn run_one_does_not_wait_for_background_children_holding_stdout() {
         let dir = tempfile::TempDir::new().unwrap();
         let pidfile = dir.path().join("pid");
-        let ex = shell_extractor(
-            dir.path(),
-            "leaves-helper",
-            &format!("sleep 60 &\necho $! > {}\nexit 0\n", pidfile.display()),
-        );
-        run_one_bounded(ex, Duration::from_secs(5)).expect("extractor exited cleanly");
+        let ex = script_fixture("leaves-helper.sh");
+        run_one_bounded(ex, pidfile_input(&pidfile), Duration::from_secs(5))
+            .expect("extractor exited cleanly");
         wait_for_pid_gone(&pidfile);
     }
 
@@ -1556,15 +1543,8 @@ mod tests {
     fn run_one_timeout_kills_whole_process_group_and_reports_stderr() {
         let dir = tempfile::TempDir::new().unwrap();
         let pidfile = dir.path().join("pid");
-        let ex = shell_extractor(
-            dir.path(),
-            "stuck",
-            &format!(
-                "sleep 60 &\necho $! > {}\necho stuck on step 3 >&2\nsleep 60\n",
-                pidfile.display()
-            ),
-        );
-        let err = match run_one_bounded(ex, Duration::from_secs(1)) {
+        let ex = script_fixture("stuck.sh");
+        let err = match run_one_bounded(ex, pidfile_input(&pidfile), Duration::from_secs(1)) {
             Err(e) => e,
             Ok(_) => panic!("timeout must be an error"),
         };
