@@ -377,6 +377,7 @@ struct ScanArgs {
 struct ScanSetup {
     sink: EventSinkKind,
     seen: Option<mailsift::seen::Store>,
+    message_index: Option<mailsift::seen::Store>,
     extractors: Vec<mailsift::extractor::Extractor>,
     dirs: ResolvedArtifactTargets,
     trackers: mailsift::targets::trackers::Trackers,
@@ -395,6 +396,11 @@ impl ScanArgs {
     ) -> Result<ScanSetup> {
         let sink = self.target.build_sink(config, runtime)?;
         let seen = scan_seen_store(&sink, self.no_dedup, self.dry_run);
+        let message_index = if self.dry_run {
+            None
+        } else {
+            seen.clone().or_else(open_seen_store)
+        };
         let extractors_dir = resolve_extractors(self.extractors.clone(), config);
         let extractors = select_extractors(discover_required(&extractors_dir)?, only)?;
         let dirs = self.artifacts.resolve(config, runtime)?;
@@ -411,6 +417,7 @@ impl ScanArgs {
         Ok(ScanSetup {
             sink,
             seen,
+            message_index,
             extractors,
             dirs,
             trackers,
@@ -435,6 +442,7 @@ impl ScanSetup {
             trusted_forwarders: &config.trusted_forwarders,
             recorder: &self.recorder,
             seen: self.seen.as_ref(),
+            message_index: self.message_index.as_ref(),
         }
     }
 }
@@ -1276,6 +1284,7 @@ fn print_explain(
                     receipts,
                     tickets,
                     subscriptions,
+                    records: _,
                 } => {
                     let total = events
                         + reservations
@@ -1364,18 +1373,7 @@ fn parse_received_at(s: &str) -> Result<i64, String> {
 /// can't be opened we warn and run without it. The sinks stay correct
 /// either way; we just pay the network cost.
 fn open_seen_store() -> Option<mailsift::seen::Store> {
-    let path = mailsift::seen::Store::default_path()?;
-    match mailsift::seen::Store::open(&path) {
-        Ok(store) => Some(store),
-        Err(e) => {
-            tracing::warn!(
-                error = format!("{e:#}"),
-                path = %path.display(),
-                "seen.db open failed; running without dedup"
-            );
-            None
-        }
-    }
+    mailsift::seen::Store::open_or_warn(&mailsift::seen::Store::default_path()?)
 }
 
 /// The dedup store for a scan, so a rescan doesn't send CalDAV every
@@ -1664,6 +1662,7 @@ fn run() -> Result<()> {
                     // call so the user can see exactly what would
                     // happen. Dedup belongs to the daemon.
                     seen: None,
+                    message_index: None,
                 },
                 DkimPolicy::Enforce { received_at },
                 dry_run,
@@ -1846,6 +1845,7 @@ fn run() -> Result<()> {
             let firefly_sink =
                 build_firefly(&firefly, &config, runtime.handle())?.map(std::sync::Arc::new);
             let receipts_sink = dirs.receipts.map(std::sync::Arc::new);
+            let seen_store = open_seen_store();
             let config = milter::MilterConfig {
                 extractors: std::sync::Arc::new(extractors),
                 targets: pipeline::OwnedTargets {
@@ -1862,7 +1862,8 @@ fn run() -> Result<()> {
                     // Long-running daemon: record every extractor
                     // decision so `mailsift stats` has useful data.
                     recorder: mailsift::stats::Recorder::default_file(),
-                    seen: open_seen_store(),
+                    seen: seen_store.clone(),
+                    message_index: seen_store,
                 },
                 deadline: Duration::from_secs(deadline_secs),
             };

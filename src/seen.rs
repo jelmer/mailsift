@@ -1,5 +1,8 @@
 //! `seen.db`: the dedup store described in DESIGN.md §"Implementation".
 //!
+//! It also keeps what was extracted from each message, by Message-ID;
+//! see [`Store::record_message`].
+//!
 //! Keyed by `(kind, dedup_key)` (e.g. `(event, <iCalendar UID>)` or
 //! `(parcel, <trackingNumber>)`), value is the content hash of the
 //! last-filed payload. The pipeline checks the store before re-issuing
@@ -34,7 +37,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use redb::{Database, ReadableDatabase, ReadableTableMetadata, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
@@ -49,6 +52,40 @@ use crate::targets::sink::lock_dir;
 /// we ever want a `seen list` debugging subcommand. Collision across
 /// kinds is impossible because `kind` strings are disjoint.
 const TABLE: TableDefinition<&str, &str> = TableDefinition::new("seen_v1");
+
+/// What the pipeline extracted from each message, keyed by its
+/// Message-ID (see [`normalize_message_id`]), as JSON. Lets the web UI
+/// and the Gmail add-on show what came out of a message without
+/// sending it to mailsift again.
+const MESSAGES: TableDefinition<&str, &str> = TableDefinition::new("messages_v1");
+
+/// The `extractor` a run stored by [`Store::record_message`] belongs to.
+fn run_extractor(run: &serde_json::Value) -> Result<&str> {
+    run.get("extractor")
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| format!("extractor run without an extractor name: {run}"))
+}
+
+/// The runs in a stored [`MESSAGES`] entry.
+fn stored_runs(stored: &str) -> Result<Vec<serde_json::Value>> {
+    let mut entry: serde_json::Value =
+        serde_json::from_str(stored).context("seen.db: parsing stored message entry")?;
+    match entry.get_mut("extractors").map(serde_json::Value::take) {
+        Some(serde_json::Value::Array(runs)) => Ok(runs),
+        _ => anyhow::bail!("seen.db: stored message entry has no extractors list: {stored}"),
+    }
+}
+
+/// The form of a Message-ID used as a [`MESSAGES`] key: without
+/// surrounding whitespace and angle brackets, which some clients
+/// (Gmail's Apps Script among them) keep and others drop.
+pub fn normalize_message_id(message_id: &str) -> &str {
+    let id = message_id.trim();
+    id.strip_prefix('<')
+        .and_then(|i| i.strip_suffix('>'))
+        .unwrap_or(id)
+        .trim()
+}
 
 /// Artifact kinds the dedup store distinguishes. Used as the
 /// composite-key prefix; new kinds get a new variant rather than a
@@ -109,9 +146,25 @@ impl Store {
         store.with_db(|db| {
             let txn = db.begin_write().context("seen.db: begin_write")?;
             txn.open_table(TABLE).context("seen.db: open_table")?;
+            txn.open_table(MESSAGES)
+                .context("seen.db: open_table messages")?;
             txn.commit().context("seen.db: commit init txn")
         })?;
         Ok(store)
+    }
+
+    /// [`Self::open`], but on failure warn and return `None`: callers
+    /// run without the store rather than fail.
+    pub fn open_or_warn(path: &Path) -> Option<Self> {
+        Self::open(path)
+            .inspect_err(|e| {
+                warn!(
+                    error = format!("{e:#}"),
+                    path = %path.display(),
+                    "seen.db open failed; running without it"
+                )
+            })
+            .ok()
     }
 
     /// Run `f` against the database, holding it open (and its
@@ -204,6 +257,72 @@ impl Store {
         })
     }
 
+    /// Record what extractors did with the message with `message_id`:
+    /// `runs` holds one object per extractor, named by its `extractor`
+    /// field. A run replaces what an earlier one of the same extractor
+    /// stored; other extractors' runs are kept, so a scan limited to
+    /// some extractors doesn't wipe out the others.
+    pub fn record_message(
+        &self,
+        message_id: &str,
+        processed_at: i64,
+        runs: Vec<serde_json::Value>,
+    ) -> Result<()> {
+        let key = normalize_message_id(message_id);
+        self.with_db(|db| {
+            let txn = db.begin_write().context("seen.db: begin_write")?;
+            {
+                let mut table = txn
+                    .open_table(MESSAGES)
+                    .context("seen.db: open_table messages")?;
+                let stored = table
+                    .get(key)
+                    .context("seen.db: lookup message")?
+                    .map(|v| v.value().to_string());
+                let mut merged = match stored {
+                    Some(s) => stored_runs(&s)?,
+                    None => Vec::new(),
+                };
+                for run in runs {
+                    let name = run_extractor(&run)?.to_string();
+                    match merged
+                        .iter_mut()
+                        .find(|r| run_extractor(r).is_ok_and(|n| n == name))
+                    {
+                        Some(slot) => *slot = run,
+                        None => merged.push(run),
+                    }
+                }
+                let entry = serde_json::json!({
+                    "processed_at": processed_at,
+                    "extractors": merged,
+                });
+                table
+                    .insert(key, serde_json::to_string(&entry)?.as_str())
+                    .context("seen.db: insert message")?;
+            }
+            txn.commit().context("seen.db: commit")
+        })
+    }
+
+    /// What [`Self::record_message`] last stored for `message_id`.
+    pub fn message(&self, message_id: &str) -> Result<Option<serde_json::Value>> {
+        let key = normalize_message_id(message_id);
+        let stored = self.with_db(|db| {
+            let txn = db.begin_read().context("seen.db: begin_read")?;
+            let table = txn
+                .open_table(MESSAGES)
+                .context("seen.db: open_table messages")?;
+            Ok(table
+                .get(key)
+                .context("seen.db: lookup message")?
+                .map(|v| v.value().to_string()))
+        })?;
+        stored
+            .map(|s| serde_json::from_str(&s).context("seen.db: parsing stored message entry"))
+            .transpose()
+    }
+
     /// Number of rows. Cheap because redb keeps a length counter per
     /// table; we don't iterate. Used by the `stats` subcommand to
     /// report `seen.db` size.
@@ -265,6 +384,69 @@ mod tests {
             }
         });
         assert_eq!(s.len().unwrap(), 8);
+    }
+
+    #[test]
+    fn message_round_trips_whatever_the_brackets() {
+        let (_d, s) = store();
+        assert_eq!(s.message("<a@example.org>").unwrap(), None);
+        let run = serde_json::json!({"extractor": "x", "records": []});
+        s.record_message(" <a@example.org>\r\n", 7, vec![run.clone()])
+            .unwrap();
+        let entry = serde_json::json!({"processed_at": 7, "extractors": [run]});
+        assert_eq!(s.message("a@example.org").unwrap(), Some(entry.clone()));
+        assert_eq!(s.message("<a@example.org>").unwrap(), Some(entry));
+    }
+
+    #[test]
+    fn record_message_replaces_only_the_extractors_that_ran() {
+        let (_d, s) = store();
+        s.record_message(
+            "a@example.org",
+            1,
+            vec![
+                serde_json::json!({"extractor": "x", "records": [1]}),
+                serde_json::json!({"extractor": "y", "records": [2]}),
+            ],
+        )
+        .unwrap();
+        s.record_message(
+            "a@example.org",
+            2,
+            vec![
+                serde_json::json!({"extractor": "y", "error": "oops"}),
+                serde_json::json!({"extractor": "z", "records": []}),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            s.message("a@example.org").unwrap(),
+            Some(serde_json::json!({
+                "processed_at": 2,
+                "extractors": [
+                    {"extractor": "x", "records": [1]},
+                    {"extractor": "y", "error": "oops"},
+                    {"extractor": "z", "records": []},
+                ],
+            }))
+        );
+    }
+
+    #[test]
+    fn record_message_rejects_runs_without_an_extractor() {
+        let (_d, s) = store();
+        assert!(
+            s.record_message("a@example.org", 1, vec![serde_json::json!({})])
+                .is_err()
+        );
+        assert_eq!(s.message("a@example.org").unwrap(), None);
+    }
+
+    #[test]
+    fn messages_do_not_count_as_seen_entries() {
+        let (_d, s) = store();
+        s.record_message("a@example.org", 1, Vec::new()).unwrap();
+        assert_eq!(s.len().unwrap(), 0);
     }
 
     #[test]

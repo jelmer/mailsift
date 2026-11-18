@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, FixedOffset};
+use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use crate::artifacts::{Artifact, Kind};
@@ -78,6 +79,10 @@ pub struct PipelineTargets<'a> {
     /// back to the original "always issue, server figures it out"
     /// behaviour; fine for one-off replays and tests.
     pub seen: Option<&'a SeenStore>,
+    /// Where to keep what was extracted from each message, by
+    /// Message-ID, for the web UI to look up. Only written for messages
+    /// at least one extractor ran on, and never on a dry run.
+    pub message_index: Option<&'a SeenStore>,
 }
 
 /// Long-lived counterpart to [`PipelineTargets`] for callers that hand
@@ -101,6 +106,8 @@ pub struct OwnedTargets {
     pub recorder: Recorder,
     /// See [`PipelineTargets::seen`].
     pub seen: Option<SeenStore>,
+    /// See [`PipelineTargets::message_index`].
+    pub message_index: Option<SeenStore>,
 }
 
 impl OwnedTargets {
@@ -118,6 +125,7 @@ impl OwnedTargets {
             trusted_forwarders: &self.trusted_forwarders,
             recorder: &self.recorder,
             seen: self.seen.as_ref(),
+            message_index: self.message_index.as_ref(),
         }
     }
 }
@@ -174,7 +182,172 @@ pub enum ExplainOutcome {
         receipts: u32,
         tickets: u32,
         subscriptions: u32,
+        /// Every artifact among them, with its parsed contents where
+        /// it has any.
+        records: Vec<ProducedRecord>,
     },
+}
+
+/// One artifact an extractor produced, for callers that show what was
+/// extracted. An `.event.ics` yields one record per VEVENT in it.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web", derive(utoipa::ToSchema))]
+pub struct ProducedRecord {
+    pub kind: Kind,
+    /// File name as the extractor wrote it.
+    pub filename: String,
+    pub content_type: &'static str,
+    /// The parsed contents, for JSON and iCalendar artifacts. Absent for
+    /// opaque blobs and for files that couldn't be parsed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<RecordData>,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum RecordData {
+    Event(EventSummary),
+    /// A JSON artifact as the extractor wrote it.
+    #[cfg_attr(feature = "web", schema(value_type = Object))]
+    Json(serde_json::Value),
+}
+
+/// The main fields of a VEVENT.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web", derive(utoipa::ToSchema))]
+pub struct EventSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<EventTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<EventTime>,
+}
+
+/// A DTSTART or DTEND: a whole day, or a date-time in UTC, floating
+/// local time, or local time in a named zone.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum EventTime {
+    Date {
+        date: chrono::NaiveDate,
+    },
+    Utc {
+        datetime: chrono::DateTime<chrono::Utc>,
+    },
+    Floating {
+        datetime: chrono::NaiveDateTime,
+    },
+    Zoned {
+        datetime: chrono::NaiveDateTime,
+        tzid: String,
+    },
+}
+
+impl From<icalendar::DatePerhapsTime> for EventTime {
+    fn from(value: icalendar::DatePerhapsTime) -> Self {
+        use icalendar::{CalendarDateTime, DatePerhapsTime};
+        match value {
+            DatePerhapsTime::Date(date) => EventTime::Date { date },
+            DatePerhapsTime::DateTime(CalendarDateTime::Utc(datetime)) => {
+                EventTime::Utc { datetime }
+            }
+            DatePerhapsTime::DateTime(CalendarDateTime::Floating(datetime)) => {
+                EventTime::Floating { datetime }
+            }
+            DatePerhapsTime::DateTime(CalendarDateTime::WithTimezone { date_time, tzid }) => {
+                EventTime::Zoned {
+                    datetime: date_time,
+                    tzid,
+                }
+            }
+        }
+    }
+}
+
+impl From<&icalendar::Event> for EventSummary {
+    fn from(ev: &icalendar::Event) -> Self {
+        use icalendar::{Component, EventLike};
+        EventSummary {
+            uid: ev.get_uid().map(str::to_owned),
+            summary: ev.get_summary().map(str::to_owned),
+            location: ev.get_location().map(str::to_owned),
+            start: ev.get_start().map(EventTime::from),
+            end: ev.get_end().map(EventTime::from),
+        }
+    }
+}
+
+/// Describe every artifact in `artifacts` for an [`ExplainRecord`],
+/// ordered by file name. One that can't be read or parsed is still
+/// listed, without `data`, and logged; filing it fails (and is logged)
+/// the same way.
+fn produced_records(extractor: &str, artifacts: &[Artifact]) -> Vec<ProducedRecord> {
+    let mut sorted: Vec<&Artifact> = artifacts.iter().collect();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path));
+    sorted
+        .into_iter()
+        .flat_map(|a| {
+            artifact_records(a).unwrap_or_else(|e| {
+                warn!(
+                    extractor,
+                    path = %a.path.display(),
+                    error = format!("{e:#}"),
+                    "unreadable artifact"
+                );
+                vec![artifact_record(a, None)]
+            })
+        })
+        .collect()
+}
+
+fn artifact_record(a: &Artifact, data: Option<RecordData>) -> ProducedRecord {
+    ProducedRecord {
+        kind: a.kind,
+        filename: a
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        content_type: crate::artifacts::content_type_for(&a.ext),
+        data,
+    }
+}
+
+fn artifact_records(a: &Artifact) -> Result<Vec<ProducedRecord>> {
+    match a.ext.as_str() {
+        "json" => {
+            let value = serde_json::from_slice(&std::fs::read(&a.path)?)?;
+            Ok(vec![artifact_record(a, Some(RecordData::Json(value)))])
+        }
+        "ics" => {
+            let body = std::fs::read_to_string(&a.path)?;
+            let calendar: icalendar::Calendar = body.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let records: Vec<_> = calendar
+                .components
+                .iter()
+                .filter_map(|c| match c {
+                    icalendar::CalendarComponent::Event(ev) => Some(artifact_record(
+                        a,
+                        Some(RecordData::Event(EventSummary::from(ev))),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            if records.is_empty() {
+                Ok(vec![artifact_record(a, None)])
+            } else {
+                Ok(records)
+            }
+        }
+        _ => Ok(vec![artifact_record(a, None)]),
+    }
 }
 
 /// Run every discovered extractor against `raw` and route the artifacts
@@ -212,6 +385,7 @@ pub fn run(
         trusted_forwarders,
         recorder,
         seen,
+        message_index,
     } = targets;
 
     if raw.len() > MAX_MESSAGE_BYTES {
@@ -228,6 +402,13 @@ pub fn run(
         warn!("no extractors configured; nothing to do");
         return Ok(());
     }
+
+    // The outer message's ID even when a trusted forward is unwrapped
+    // below: that is the message the mailbox shows.
+    let index_key = message_index
+        .filter(|_| !dry_run)
+        .and_then(|store| Some((store, message_id_header(raw)?)));
+    let mut indexed: Vec<serde_json::Value> = Vec::new();
 
     // If the message is a forward from a trusted sender, swap `raw`
     // for the inner RFC822 bytes so DKIM checks, prefilter matching,
@@ -366,6 +547,12 @@ pub fn run(
                         },
                     });
                 }
+                if index_key.is_some() {
+                    indexed.push(serde_json::json!({
+                        "extractor": ex.name,
+                        "error": format!("{e:#}"),
+                    }));
+                }
                 let err_snippet = stats::error_snippet(&format!("{e:#}"));
                 recorder.record(&stats::Event {
                     ts: now_ts,
@@ -435,6 +622,17 @@ pub fn run(
             + receipt_blob_arts.len()
             + ticket_arts.len()
             + subscription_arts.len();
+        let records = if explain.is_some() || index_key.is_some() {
+            produced_records(&run.extractor, &run.result.artifacts)
+        } else {
+            Vec::new()
+        };
+        if index_key.is_some() {
+            indexed.push(serde_json::json!({
+                "extractor": run.extractor,
+                "records": records,
+            }));
+        }
         if let Some(buf) = explain.as_deref_mut() {
             buf.push(ExplainRecord {
                 extractor: run.extractor.clone(),
@@ -446,6 +644,7 @@ pub fn run(
                     receipts: (receipt_arts.len() + receipt_blob_arts.len()) as u32,
                     tickets: ticket_arts.len() as u32,
                     subscriptions: subscription_arts.len() as u32,
+                    records,
                 },
             });
         }
@@ -675,6 +874,17 @@ pub fn run(
         );
     }
 
+    if let Some((store, message_id)) = index_key
+        && !indexed.is_empty()
+        && let Err(e) = store.record_message(&message_id, now_ts, indexed)
+    {
+        warn!(
+            source,
+            error = format!("{e:#}"),
+            "seen.db: failed to record what was extracted from the message"
+        );
+    }
+
     if !summary.is_empty() {
         if dry_run {
             info!(
@@ -687,6 +897,15 @@ pub fn run(
     }
 
     Ok(())
+}
+
+/// The message's `Message-ID`, unless it has none (or an empty one).
+fn message_id_header(raw: &[u8]) -> Option<String> {
+    use mailparse::MailHeaderMap;
+    let (headers, _) = mailparse::parse_headers(raw).ok()?;
+    headers
+        .get_first_value("Message-ID")
+        .filter(|id| !crate::seen::normalize_message_id(id).is_empty())
 }
 
 /// Same as [`parse_match_headers_from_parsed`] but accepts raw RFC822
@@ -916,6 +1135,101 @@ fn file_or_drop<S: Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn artifact_in(dir: &Path, name: &str, kind: Kind, ext: &str, body: &[u8]) -> Artifact {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        Artifact {
+            kind,
+            path,
+            slug: name.split('.').next().unwrap().to_owned(),
+            ext: ext.to_owned(),
+        }
+    }
+
+    #[test]
+    fn produced_records_describe_every_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifacts = vec![
+            artifact_in(
+                tmp.path(),
+                "trip.event.ics",
+                Kind::Event,
+                "ics",
+                b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n\
+                  BEGIN:VEVENT\r\nUID:leg1@example.org\r\nSUMMARY:XY100 AAA-BBB\r\n\
+                  LOCATION:Airport A\r\nDTSTAMP:20260101T000000Z\r\n\
+                  DTSTART;TZID=Europe/Dublin:20261201T070500\r\n\
+                  DTEND:20261201T093000Z\r\nEND:VEVENT\r\n\
+                  BEGIN:VEVENT\r\nUID:day@example.org\r\nDTSTAMP:20260101T000000Z\r\n\
+                  DTSTART;VALUE=DATE:20261203\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+            ),
+            artifact_in(
+                tmp.path(),
+                "x1.parcel.json",
+                Kind::Parcel,
+                "json",
+                br#"{"trackingNumber":"X1"}"#,
+            ),
+            artifact_in(
+                tmp.path(),
+                "pass.ticket.PDF",
+                Kind::Ticket,
+                "PDF",
+                b"%PDF-1.4",
+            ),
+        ];
+        let records = serde_json::to_value(produced_records("test", &artifacts)).unwrap();
+        assert_eq!(
+            records,
+            serde_json::json!([
+                {"kind": "ticket", "filename": "pass.ticket.PDF", "content_type": "application/pdf"},
+                {
+                    "kind": "event",
+                    "filename": "trip.event.ics",
+                    "content_type": "text/calendar",
+                    "data": {
+                        "uid": "leg1@example.org",
+                        "summary": "XY100 AAA-BBB",
+                        "location": "Airport A",
+                        "start": {"datetime": "2026-12-01T07:05:00", "tzid": "Europe/Dublin"},
+                        "end": {"datetime": "2026-12-01T09:30:00Z"},
+                    },
+                },
+                {
+                    "kind": "event",
+                    "filename": "trip.event.ics",
+                    "content_type": "text/calendar",
+                    "data": {"uid": "day@example.org", "start": {"date": "2026-12-03"}},
+                },
+                {
+                    "kind": "parcel",
+                    "filename": "x1.parcel.json",
+                    "content_type": "application/json",
+                    "data": {"trackingNumber": "X1"},
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn produced_records_keep_unparseable_artifacts_without_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifacts = vec![artifact_in(
+            tmp.path(),
+            "broken.bill.json",
+            Kind::Bill,
+            "json",
+            b"{not json",
+        )];
+        let records = serde_json::to_value(produced_records("test", &artifacts)).unwrap();
+        assert_eq!(
+            records,
+            serde_json::json!([
+                {"kind": "bill", "filename": "broken.bill.json", "content_type": "application/json"},
+            ])
+        );
+    }
 
     #[test]
     fn pipeline_parse_from_domain_bare_address() {
@@ -1223,6 +1537,7 @@ Content-Type: application/pdf; name=\"invoice.pdf\"\r\n\
                 trusted_forwarders: &[],
                 recorder: &recorder,
                 seen: None,
+                message_index: None,
             },
             DkimPolicy::Skip,
             false,
@@ -1242,6 +1557,108 @@ Content-Type: application/pdf; name=\"invoice.pdf\"\r\n\
             .expect("read events dir")
             .collect();
         assert!(events.is_empty(), "no artifacts should have been filed");
+    }
+
+    /// Write an executable extractor `name` matching mail from
+    /// `example.org`, whose script is `body`.
+    fn write_extractor(dir: &Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            dir.join(format!("{name}.yaml")),
+            format!("name: {name}\nfrom_domains:\n  - example.org\n"),
+        )
+        .unwrap();
+        let script = dir.join(format!("{name}.py"));
+        std::fs::write(&script, format!("#!/bin/sh\ncat > /dev/null\n{body}")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn run_indexed(raw: &[u8], extractors_dir: &Path, index: &SeenStore, dry_run: bool) {
+        let extractors = extractor::discover(&[extractors_dir.to_path_buf()]).unwrap();
+        let sink = EventSinkKind::Disabled;
+        run(
+            raw,
+            "test",
+            &extractors,
+            PipelineTargets {
+                event_sink: &sink,
+                bills_dir: None,
+                parcels_dir: None,
+                subscriptions_dir: None,
+                reservations_dir: None,
+                receipts: None,
+                tickets: None,
+                firefly: None,
+                trackers: None,
+                trusted_forwarders: &[],
+                recorder: &stats::Recorder::Disabled,
+                seen: None,
+                message_index: Some(index),
+            },
+            DkimPolicy::Skip,
+            dry_run,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn run_indexes_what_each_extractor_did_by_message_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ext_dir = tmp.path().join("extractors");
+        std::fs::create_dir(&ext_dir).unwrap();
+        write_extractor(&ext_dir, "broken", "echo oops >&2\nexit 3\n");
+        write_extractor(&ext_dir, "quiet", "");
+        let index = SeenStore::open(&tmp.path().join("seen.db")).unwrap();
+
+        run_indexed(
+            b"Message-ID: <m1@example.org>\r\nFrom: a@example.org\r\nSubject: hi\r\n\r\nbody\r\n",
+            &ext_dir,
+            &index,
+            false,
+        );
+
+        let mut entry = index.message("m1@example.org").unwrap().unwrap();
+        let entry = entry.as_object_mut().unwrap();
+        assert!(entry.remove("processed_at").unwrap().as_i64().unwrap() > 0);
+        let extractors = entry.remove("extractors").unwrap();
+        assert!(entry.is_empty(), "unexpected fields: {entry:?}");
+        let extractors = extractors.as_array().unwrap();
+        assert_eq!(extractors.len(), 2);
+        assert_eq!(extractors[0]["extractor"], "broken");
+        assert!(
+            extractors[0]["error"].as_str().unwrap().contains("oops"),
+            "{extractors:?}"
+        );
+        assert_eq!(
+            extractors[1],
+            serde_json::json!({"extractor": "quiet", "records": []})
+        );
+    }
+
+    #[test]
+    fn run_indexes_nothing_without_a_run_extractor_or_on_a_dry_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ext_dir = tmp.path().join("extractors");
+        std::fs::create_dir(&ext_dir).unwrap();
+        write_extractor(&ext_dir, "quiet", "");
+        let index = SeenStore::open(&tmp.path().join("seen.db")).unwrap();
+
+        run_indexed(
+            b"Message-ID: <m2@elsewhere.example>\r\nFrom: a@elsewhere.example\r\n\r\nbody\r\n",
+            &ext_dir,
+            &index,
+            false,
+        );
+        assert_eq!(index.message("m2@elsewhere.example").unwrap(), None);
+
+        run_indexed(
+            b"Message-ID: <m3@example.org>\r\nFrom: a@example.org\r\n\r\nbody\r\n",
+            &ext_dir,
+            &index,
+            true,
+        );
+        assert_eq!(index.message("m3@example.org").unwrap(), None);
     }
 
     #[test]
@@ -1270,6 +1687,7 @@ Content-Type: application/pdf; name=\"invoice.pdf\"\r\n\
                 trusted_forwarders: &[],
                 recorder: &stats::Recorder::Disabled,
                 seen: None,
+                message_index: None,
             },
             DkimPolicy::Skip,
             false,
