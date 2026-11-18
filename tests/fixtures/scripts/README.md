@@ -1,6 +1,6 @@
 Scripts for the `run_one` tests in `src/extractor.rs`, which exercise
-process handling (pipe pressure, stdin, stderr, exit codes) rather than
-extraction itself.
+process handling (pipe pressure, stdin, stderr, exit codes, timeouts,
+background children) rather than extraction itself.
 
 They live here, committed with the executable bit set, rather than being
 written into a tempdir by each test. `execve` fails with `ETXTBSY` if any
