@@ -87,7 +87,10 @@ mailsift replay /path/to/message.eml
 mailsift replay - < message.eml          # stdin
 ```
 
-Useful for testing extractors against a saved message.
+Useful for testing extractors against a saved message. For repeatable
+checks, `mailsift test-extractor` compares an extractor's output for
+saved messages against expected files kept next to them; see
+[README.extractors.md](README.extractors.md#golden-file-tests).
 
 ### `imap-scan`: walk an IMAP mailbox
 
